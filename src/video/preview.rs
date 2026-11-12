@@ -43,16 +43,29 @@ pub fn rows_to_rgba_into(
     }
     rgba.clear();
     rgba.resize(row * height as usize, 0);
-    for y in 0..height as usize {
-        let sy = if stride < 0 { height as usize - 1 - y } else { y };
-        let s = &src[sy * pitch..sy * pitch + row];
-        let d = &mut rgba[y * row..(y + 1) * row];
-        for (d, s) in d.as_chunks_mut::<4>().0.iter_mut().zip(s.as_chunks::<4>().0.iter()) {
-            let (r, b) = if swap_rb { (s[2], s[0]) } else { (s[0], s[2]) };
-            d[0] = r;
-            d[1] = s[1];
-            d[2] = b;
-            d[3] = 255;
+    if swap_rb {
+        for y in 0..height as usize {
+            let sy = if stride < 0 { height as usize - 1 - y } else { y };
+            let s = &src[sy * pitch..sy * pitch + row];
+            let d = &mut rgba[y * row..(y + 1) * row];
+            for (d, s) in d.as_chunks_mut::<4>().0.iter_mut().zip(s.as_chunks::<4>().0.iter()) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = 255;
+            }
+        }
+    } else {
+        for y in 0..height as usize {
+            let sy = if stride < 0 { height as usize - 1 - y } else { y };
+            let s = &src[sy * pitch..sy * pitch + row];
+            let d = &mut rgba[y * row..(y + 1) * row];
+            for (d, s) in d.as_chunks_mut::<4>().0.iter_mut().zip(s.as_chunks::<4>().0.iter()) {
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+                d[3] = 255;
+            }
         }
     }
     Some(PreviewImage { width, height, rgba })
@@ -94,15 +107,27 @@ impl Previewer {
         rgba.clear();
         rgba.resize(row * h as usize, 0);
         let swap = frame.format == PixelFormat::Bgra;
-        for y in 0..h as usize {
-            let src = &frame.data[y * stride..y * stride + row];
-            let dst = &mut rgba[y * row..(y + 1) * row];
-            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
-                let (r, b) = if swap { (s[2], s[0]) } else { (s[0], s[2]) };
-                d[0] = r;
-                d[1] = s[1];
-                d[2] = b;
-                d[3] = 255;
+        if swap {
+            for y in 0..h as usize {
+                let src = &frame.data[y * stride..y * stride + row];
+                let dst = &mut rgba[y * row..(y + 1) * row];
+                for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    d[3] = 255;
+                }
+            }
+        } else {
+            for y in 0..h as usize {
+                let src = &frame.data[y * stride..y * stride + row];
+                let dst = &mut rgba[y * row..(y + 1) * row];
+                for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
+                    d[0] = s[0];
+                    d[1] = s[1];
+                    d[2] = s[2];
+                    d[3] = 255;
+                }
             }
         }
         PreviewImage { width: w, height: h, rgba }

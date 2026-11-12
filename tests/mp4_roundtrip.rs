@@ -435,3 +435,139 @@ fn aac_sample_entry() {
     );
     assert!(err.is_err());
 }
+
+#[test]
+fn multi_audio_tracks_roundtrip() {
+    let shared = Shared::new();
+    let mut converter = Converter::new(W, H, InputLayout::I420).unwrap();
+    let mut video = H264Encoder::new(&EncoderRequest::simple(W, H, FPS, 800_000)).unwrap();
+    let mut enc0 = Mp3Encoder::new(RATE, 2, 128).unwrap();
+    let mut enc1 = Mp3Encoder::new(RATE, 2, 128).unwrap();
+    let mut enc2 = Mp3Encoder::new(RATE, 2, 128).unwrap();
+    let cfg = |e: &Mp3Encoder| AudioTrackConfig {
+        sample_rate: RATE,
+        channels: 2,
+        bitrate_bps: e.bitrate_bps(),
+        samples_per_frame: e.samples_per_frame(),
+        codec: e.codec_config(),
+    };
+    let mut mux = Mp4Writer::with_audio_tracks(
+        shared.clone(),
+        Some(VideoTrackConfig { width: W, height: H, fps: FPS as f64, codec: VideoCodecConfig::H264 }),
+        vec![cfg(&enc0), cfg(&enc1), cfg(&enc2)],
+    )
+    .unwrap();
+    assert_eq!(mux.audio_track_count(), 3);
+
+    let mut frame = RawFrame {
+        data: vec![128u8; (W * H * 4) as usize],
+        width: W,
+        height: H,
+        stride: W * 4,
+        format: PixelFormat::Bgra,
+        pts: Duration::ZERO,
+        mouse: None,
+    };
+    let mut track_samples = [0usize; 3];
+    let mut pcm0 = Vec::new();
+    let mut pcm1 = Vec::new();
+    let mut pcm2 = Vec::new();
+    for i in 0..30u32 {
+        frame.pts = Duration::from_secs_f64(i as f64 / FPS as f64);
+        converter.convert(&frame).unwrap();
+        for f in video.encode(converter.frame(), frame.pts).unwrap() {
+            if let Some(p) = video.codec_params() {
+                mux.set_codec_params(p);
+            }
+            mux.push_video(&f.data, f.pts, f.keyframe).unwrap();
+        }
+        pcm0.clear();
+        pcm1.clear();
+        pcm2.clear();
+        for s in 0..(RATE / FPS) {
+            let t = (i * (RATE / FPS) + s) as f32 / RATE as f32;
+            let a = (t * 220.0 * std::f32::consts::TAU).sin() * 0.25;
+            let b = (t * 660.0 * std::f32::consts::TAU).sin() * 0.25;
+            pcm0.extend_from_slice(&[a + b, a + b]);
+            pcm1.extend_from_slice(&[a, a]);
+            pcm2.extend_from_slice(&[b, b]);
+        }
+        for (idx, (enc, pcm)) in
+            [(&mut enc0, &pcm0), (&mut enc1, &pcm1), (&mut enc2, &pcm2)].into_iter().enumerate()
+        {
+            for f in AudioEncoder::encode(enc, pcm).unwrap() {
+                mux.push_audio_track(idx, &f.data).unwrap();
+                track_samples[idx] += 1;
+            }
+        }
+    }
+    for (idx, enc) in [&mut enc0, &mut enc1, &mut enc2].into_iter().enumerate() {
+        for f in AudioEncoder::flush(enc).unwrap() {
+            mux.push_audio_track(idx, &f.data).unwrap();
+            track_samples[idx] += 1;
+        }
+        assert_eq!(mux.audio_track_samples(idx), track_samples[idx]);
+    }
+    mux.finalize().unwrap();
+
+    let bytes = shared.bytes();
+    let atoms = parse(&bytes);
+    let moov = atoms.iter().find_map(|a| if let Any::Moov(m) = a { Some(m) } else { None }).unwrap();
+    assert_eq!(moov.trak.len(), 4, "1 video + 3 audio tracks");
+    assert_eq!(moov.trak[0].tkhd.track_id, 1);
+    for (idx, &expected_samples) in track_samples.iter().enumerate() {
+        let trak = &moov.trak[idx + 1];
+        assert_eq!(trak.tkhd.track_id, idx as u32 + 2);
+        assert_eq!(trak.mdia.hdlr.handler, FourCC::new(b"soun"));
+        let stbl = &trak.mdia.minf.stbl;
+        assert!(matches!(&stbl.stsd.codecs[0], Codec::Mp4a(_)));
+        let sizes = sample_sizes(&stbl.stsz.samples);
+        assert_eq!(sizes.len(), expected_samples);
+        let stco = stbl.stco.as_ref().unwrap();
+        let counts = chunk_sample_counts(stbl, stco.entries.len());
+        let mut sidx = 0usize;
+        for (ci, off) in stco.entries.iter().enumerate() {
+            let mut pos = *off as usize;
+            for _ in 0..counts[ci] {
+                assert_eq!(bytes[pos], 0xFF, "track {idx} sample {sidx} lacks MP3 sync");
+                assert_eq!(bytes[pos + 1] & 0xE0, 0xE0);
+                pos += sizes[sidx] as usize;
+                sidx += 1;
+            }
+        }
+        assert_eq!(sidx, expected_samples);
+    }
+}
+
+#[test]
+fn finish_video_extends_final_frame_duration_for_vfr() {
+    let shared = Shared::new();
+    let mut mux = Mp4Writer::new(
+        shared.clone(),
+        Some(VideoTrackConfig { width: W, height: H, fps: 120.0, codec: VideoCodecConfig::H264 }),
+        None,
+    )
+    .unwrap();
+    let sps = vec![0x67, 0x64, 0x00, 0x1F, 0xAC];
+    let pps = vec![0x68, 0xEE, 0x3C, 0x80];
+    mux.set_codec_params(&openclip::video::CodecParams::H264 { sps, pps });
+    // Two frames at 0 ms and 100 ms, then screen stays static until stop at 3100 ms.
+    let idr = [0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21];
+    let slice = [0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x22, 0x11];
+    mux.push_video(&idr, Duration::from_millis(0), true).unwrap();
+    mux.push_video(&slice, Duration::from_millis(100), false).unwrap();
+    mux.finish_video(Duration::from_millis(3100));
+    mux.finalize().unwrap();
+
+    let bytes = shared.bytes();
+    let atoms = parse(&bytes);
+    let moov = atoms.iter().find_map(|a| if let Any::Moov(m) = a { Some(m) } else { None }).unwrap();
+    let mdhd = &moov.trak[0].mdia.mdhd;
+    assert_eq!(mdhd.timescale, VIDEO_TIMESCALE);
+    // 3.1 s * 90_000 = 279_000 ticks, so the static tail is preserved without duplicate frames.
+    assert_eq!(mdhd.duration, 3100 * VIDEO_TIMESCALE as u64 / 1000);
+    let stts = &moov.trak[0].mdia.minf.stbl.stts;
+    assert_eq!(stts.entries.len(), 2);
+    assert_eq!(stts.entries[0].sample_delta, 9_000);
+    assert_eq!(stts.entries[1].sample_delta, 270_000);
+}

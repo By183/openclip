@@ -272,6 +272,10 @@ impl Reader {
         self.audio.is_some()
     }
 
+    pub fn has_live_audio(&self) -> bool {
+        self.audio.is_some() && !self.audio_eos
+    }
+
     fn finished(&self) -> bool {
         self.video_eos && self.audio_eos
     }

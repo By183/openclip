@@ -7,8 +7,10 @@ use eframe::egui::{self, Align, Layout, RichText, Vec2};
 use super::theme::*;
 use super::widgets::*;
 use crate::settings::{
-    AudioCodec, Container, FormatSettings, H264Profile, HevcProfile, RateControl, SizeMode, VideoCodec,
-    AAC_BITRATES, FPS_PRESETS, QUALITY_STEPS, SAMPLE_RATES, SIZE_PRESETS,
+    approx_mb_per_min, normalize_bitrate_presets, upsert_bitrate_preset, AudioCodec, BitratePreset, Container,
+    FormatSettings, H264Profile, HevcProfile, RateControl, SizeMode, VideoCodec, AAC_BITRATES, AUTO_FPS,
+    BUILTIN_BITRATE_PRESETS, FPS_PRESETS, MAX_BITRATE_KBPS, MAX_FPS, MIN_BITRATE_KBPS, MIN_FPS, QUALITY_STEPS,
+    SAMPLE_RATES, SIZE_PRESETS,
 };
 use crate::t;
 use crate::video::encoder::EncoderInfo;
@@ -17,13 +19,14 @@ use crate::video::encoder::EncoderInfo;
 const DIALOG_W: f32 = 480.0;
 /// Fixed label column and field widths so every row lines up.
 const LABEL_W: f32 = 110.0;
+const ADV_LABEL_W: f32 = 152.0;
 const FIELD_W: f32 = 200.0;
 /// Trailing column (…, ?, units, hints) right of the field.
 const TRAIL_W: f32 = 96.0;
 
 pub enum DialogOutcome {
     None,
-    Ok(FormatSettings),
+    Ok(FormatSettings, Vec<BitratePreset>),
     Cancel,
 }
 
@@ -44,7 +47,9 @@ pub struct FormatDialog {
     open: bool,
     section: FormatSection,
     draft: FormatSettings,
-    /// The FPS combo shows a free-form field after "Custom…" was picked.
+    bitrate_presets: Vec<BitratePreset>,
+    preset_name: String,
+    /// The FPS combo shows a free-form field + slider after "Custom…" was picked.
     custom_fps: bool,
     advanced: Option<Advanced>,
     notes: Vec<String>,
@@ -63,6 +68,8 @@ impl FormatDialog {
             open: false,
             section: FormatSection::Video,
             draft: FormatSettings::default(),
+            bitrate_presets: Vec::new(),
+            preset_name: String::new(),
             custom_fps: false,
             advanced: None,
             notes: Vec::new(),
@@ -70,11 +77,20 @@ impl FormatDialog {
         }
     }
 
-    pub fn open(&mut self, current: &FormatSettings, encoders: &[EncoderInfo], section: FormatSection) {
+    pub fn open(
+        &mut self,
+        current: &FormatSettings,
+        bitrate_presets: &[BitratePreset],
+        encoders: &[EncoderInfo],
+        section: FormatSection,
+    ) {
         self.section = section;
         self.draft = current.clone();
+        self.bitrate_presets = bitrate_presets.to_vec();
+        normalize_bitrate_presets(&mut self.bitrate_presets);
+        self.preset_name.clear();
         self.notes = self.draft.normalize(encoders);
-        self.custom_fps = !FPS_PRESETS.contains(&self.draft.fps);
+        self.custom_fps = self.draft.fps != AUTO_FPS && !FPS_PRESETS.contains(&self.draft.fps);
         self.advanced = None;
         self.open = true;
     }
@@ -106,8 +122,8 @@ impl FormatDialog {
         let mut outcome = DialogOutcome::None;
         if compact {
             let size = match self.section {
-                FormatSection::Video => [DIALOG_W + 40.0, 470.0],
-                FormatSection::Audio => [DIALOG_W + 40.0, 420.0],
+                FormatSection::Video => [DIALOG_W + 60.0, 520.0],
+                FormatSection::Audio => [DIALOG_W + 60.0, 420.0],
             };
             let builder = egui::ViewportBuilder::default()
                 .with_title(self.title())
@@ -193,7 +209,8 @@ impl FormatDialog {
             ui.add_enabled_ui(!recording, |ui| {
                 if primary_button_min(ui, t!(OK), 110.0).clicked() {
                     self.notes = self.draft.normalize(encoders);
-                    outcome = DialogOutcome::Ok(self.draft.clone());
+                    normalize_bitrate_presets(&mut self.bitrate_presets);
+                    outcome = DialogOutcome::Ok(self.draft.clone(), self.bitrate_presets.clone());
                 }
             });
             if gray_button_min(ui, t!(CANCEL), 110.0).clicked() {
@@ -245,36 +262,72 @@ impl FormatDialog {
         }
 
         let custom_fps = &mut self.custom_fps;
-        let show_custom = *custom_fps;
-        let mut fps_edit = d.fps;
+        let is_auto = d.fps == AUTO_FPS;
+        let show_custom = *custom_fps && !is_auto;
+        let mut fps_edit = if is_auto { 60 } else { d.fps.clamp(MIN_FPS, MAX_FPS) };
         row(
             ui,
             t!(FMT_ROW_FPS),
             |ui| {
-                let label = if *custom_fps { t!(FMT_CUSTOM_FPS, d.fps) } else { d.fps.to_string() };
+                let label = if is_auto {
+                    t!(AUTO).to_string()
+                } else if *custom_fps {
+                    t!(FMT_CUSTOM_FPS, d.fps)
+                } else {
+                    format!("{} {}", d.fps, t!(UNIT_FPS))
+                };
                 egui::ComboBox::from_id_salt("fmt-fps").width(FIELD_W).truncate().selected_text(label).show_ui(ui, |ui| {
+                    if ui.selectable_label(is_auto, t!(AUTO)).clicked() {
+                        d.fps = AUTO_FPS;
+                        *custom_fps = false;
+                    }
                     for f in FPS_PRESETS {
-                        if ui.selectable_label(!*custom_fps && d.fps == f, f.to_string()).clicked() {
+                        if ui.selectable_label(!*custom_fps && !is_auto && d.fps == f, format!("{f} {}", t!(UNIT_FPS))).clicked() {
                             d.fps = f;
                             *custom_fps = false;
                         }
                     }
-                    if ui.selectable_label(*custom_fps, t!(FMT_CUSTOM)).clicked() {
+                    if ui.selectable_label(*custom_fps && !is_auto, t!(FMT_CUSTOM)).clicked() {
+                        if is_auto {
+                            d.fps = 60;
+                        }
                         *custom_fps = true;
                     }
                 });
             },
             |ui| {
                 if show_custom {
-                    ui.add(egui::DragValue::new(&mut fps_edit).range(1..=240).suffix(" fps"));
+                    ui.add(
+                        egui::DragValue::new(&mut fps_edit)
+                            .range(MIN_FPS..=MAX_FPS)
+                            .suffix(format!(" {}", t!(UNIT_FPS))),
+                    )
+                    .on_hover_text(t!(FMT_FPS_RANGE));
                 }
             },
         );
-        if show_custom && fps_edit != d.fps {
-            d.fps = fps_edit;
+        if show_custom {
+            let range_short = format!("{MIN_FPS}–{MAX_FPS} {}", t!(UNIT_FPS));
+            row(
+                ui,
+                "",
+                |ui| {
+                    ui.spacing_mut().slider_width = FIELD_W;
+                    ui.add(egui::Slider::new(&mut fps_edit, MIN_FPS..=MAX_FPS).show_value(false))
+                        .on_hover_text(t!(FMT_FPS_RANGE));
+                },
+                |ui| {
+                    ui.label(RichText::new(range_short).color(LABEL_2).small())
+                        .on_hover_text(t!(FMT_FPS_RANGE));
+                },
+            );
+            if fps_edit != d.fps {
+                d.fps = fps_edit;
+            }
         }
 
         let advanced = &mut self.advanced;
+        let presets = &self.bitrate_presets;
         row(
             ui,
             t!(FMT_ROW_CODEC),
@@ -315,13 +368,23 @@ impl FormatDialog {
             },
         );
 
+        let mut adv_combo = false;
+        let mut adv_btn = false;
         row(
             ui,
             t!(FMT_ROW_QUALITY),
             |ui| {
                 let label = match d.rate_control {
                     RateControl::Quality(q) => q.to_string(),
-                    RateControl::ConstantBitrate { kbps } => t!(CBR_LABEL, kbps),
+                    RateControl::ConstantBitrate { kbps } => {
+                        if let Some(p) = presets.iter().find(|p| p.kbps == kbps) {
+                            format!("{} ({} {})", p.name, kbps, t!(UNIT_KBPS))
+                        } else if let Some(b) = BUILTIN_BITRATE_PRESETS.iter().find(|b| b.kbps == kbps) {
+                            format!("{} ({} {})", b.label(), kbps, t!(UNIT_KBPS))
+                        } else {
+                            t!(CBR_LABEL, kbps)
+                        }
+                    }
                 };
                 egui::ComboBox::from_id_salt("fmt-quality").width(FIELD_W).truncate().selected_text(label).show_ui(ui, |ui| {
                     for q in QUALITY_STEPS {
@@ -332,14 +395,35 @@ impl FormatDialog {
                         };
                         ui.selectable_value(&mut d.rate_control, RateControl::Quality(q), text);
                     }
+                    ui.separator();
+                    ui.label(RichText::new(t!(FMT_BUILTIN_PRESETS)).color(LABEL_2).small());
+                    for b in BUILTIN_BITRATE_PRESETS {
+                        let text = format!("{} · {} {}", b.label(), b.kbps, t!(UNIT_KBPS));
+                        ui.selectable_value(&mut d.rate_control, RateControl::ConstantBitrate { kbps: b.kbps }, text);
+                    }
+                    if !presets.is_empty() {
+                        ui.separator();
+                        ui.label(RichText::new(t!(FMT_CUSTOM_PRESETS)).color(LABEL_2).small());
+                        for p in presets {
+                            let text = format!("{} · {} {}", p.name, p.kbps, t!(UNIT_KBPS));
+                            ui.selectable_value(&mut d.rate_control, RateControl::ConstantBitrate { kbps: p.kbps }, text);
+                        }
+                    }
+                    ui.separator();
+                    if ui.selectable_label(false, t!(FMT_CUSTOM)).clicked() {
+                        adv_combo = true;
+                    }
                 });
             },
             |ui| {
                 if tinted_button_small(ui, "…").on_hover_text(t!(FMT_BITRATE_TIP)).clicked() {
-                    *advanced = Some(Advanced::Quality);
+                    adv_btn = true;
                 }
             },
         );
+        if adv_combo || adv_btn {
+            *advanced = Some(Advanced::Quality);
+        }
 
         row(
             ui,
@@ -419,7 +503,7 @@ impl FormatDialog {
                 });
             },
             |ui| {
-                ui.label(RichText::new("kbps").color(LABEL_2));
+                ui.label(RichText::new(t!(UNIT_KBPS)).color(LABEL_2));
             },
         );
         row(
@@ -449,53 +533,176 @@ impl FormatDialog {
                     });
             },
             |ui| {
-                ui.label(RichText::new("Hz").color(LABEL_2));
+                ui.label(RichText::new(t!(UNIT_HZ)).color(LABEL_2));
             },
         );
     }
 
     fn show_advanced(&mut self, ctx: &egui::Context, which: Advanced, encoders: &[EncoderInfo], source: Option<(u32, u32)>) {
         let mut close = false;
+        let modal_w = match which {
+            Advanced::Quality => 470.0,
+            Advanced::Codec => 420.0,
+        };
         let modal = egui::Modal::new(egui::Id::new("format-settings-advanced")).frame(sheet_frame()).show(ctx, |ui| {
-            ui.set_width(420.0);
+            ui.set_width(modal_w);
             match which {
                 Advanced::Quality => {
                     ui.label(heading(t!(FMT_ROW_BITRATE)));
                     ui.add_space(8.0);
                     let d = &mut self.draft;
+                    let presets = &mut self.bitrate_presets;
+                    let preset_name = &mut self.preset_name;
                     let mut quality_mode = matches!(d.rate_control, RateControl::Quality(_));
                     let items = [(true, None, t!(FMT_QUALITY_MODE)), (false, None, t!(FMT_CBR_MODE))];
                     if segmented(ui, "fmt-rate-mode", &items, &mut quality_mode) {
                         d.rate_control = if quality_mode {
                             RateControl::Quality(80)
                         } else {
-                            let kbps = source.map(|(w, h)| d.target_bitrate_kbps(w, h)).unwrap_or(6000);
+                            let kbps = source
+                                .map(|(w, h)| d.target_bitrate_kbps(w, h))
+                                .unwrap_or(6_000)
+                                .clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
                             RateControl::ConstantBitrate { kbps }
                         };
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     match &mut d.rate_control {
                         RateControl::Quality(q) => {
-                            row_wide(ui, t!(FMT_ROW_QUALITY), |ui| {
+                            adv_row(ui, t!(FMT_ROW_QUALITY), |ui| {
+                                ui.spacing_mut().slider_width = 180.0;
                                 ui.add(egui::Slider::new(q, 10..=100).step_by(10.0));
                             });
                         }
                         RateControl::ConstantBitrate { kbps } => {
-                            row_wide(ui, t!(FMT_ROW_BITRATE), |ui| {
-                                ui.add(egui::DragValue::new(kbps).range(200..=100_000).suffix(" kbps").speed(50));
+                            adv_row(ui, t!(FMT_ROW_BITRATE), |ui| {
+                                ui.spacing_mut().slider_width = 165.0;
+                                ui.add(
+                                    egui::Slider::new(kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS)
+                                        .logarithmic(true)
+                                        .show_value(false),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(kbps)
+                                        .range(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS)
+                                        .suffix(format!(" {}", t!(UNIT_KBPS)))
+                                        .speed(100),
+                                );
                             });
                         }
                     }
+
+                    // Preset selector & custom CBR preset manager.
+                    let active_kbps = match d.rate_control {
+                        RateControl::ConstantBitrate { kbps } => Some(kbps),
+                        RateControl::Quality(_) => None,
+                    };
+                    let mut picked_kbps: Option<u32> = None;
+                    let mut remove_idx: Option<usize> = None;
+                    let mut clear_custom = false;
+                    let mut save_preset: Option<u32> = None;
+
+                    ui.add_space(4.0);
+                    Card::show_with(ui, FILL, |card| {
+                        card.custom(|ui| {
+                            ui.label(RichText::new(t!(FMT_BUILTIN_PRESETS)).color(LABEL_2).small());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                                for b in BUILTIN_BITRATE_PRESETS {
+                                    let text = format!("{} · {} {}", b.label(), b.kbps, t!(UNIT_KBPS));
+                                    if preset_chip(ui, &text, active_kbps == Some(b.kbps)).clicked() {
+                                        picked_kbps = Some(b.kbps);
+                                    }
+                                }
+                            });
+
+                            if !presets.is_empty() {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(t!(FMT_CUSTOM_PRESETS)).color(LABEL_2).small());
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if tinted_button_small(ui, t!(FMT_PRESET_RESET)).clicked() {
+                                            clear_custom = true;
+                                        }
+                                    });
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                                    for (idx, preset) in presets.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 3.0;
+                                            let text = format!("{} ({} {})", preset.name, preset.kbps, t!(UNIT_KBPS));
+                                            if preset_chip(ui, &text, active_kbps == Some(preset.kbps)).clicked() {
+                                                picked_kbps = Some(preset.kbps);
+                                            }
+                                            if tinted_button_small(ui, "×")
+                                                .on_hover_text(t!(FMT_PRESET_DELETE_TIP))
+                                                .clicked()
+                                            {
+                                                remove_idx = Some(idx);
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+
+                            if let Some(current_kbps) = active_kbps {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    let edit = ui.add(
+                                        egui::TextEdit::singleline(preset_name)
+                                            .hint_text(t!(FMT_PRESET_NAME_HINT))
+                                            .desired_width(220.0),
+                                    );
+                                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let can_save = !preset_name.trim().is_empty();
+                                    ui.add_enabled_ui(can_save, |ui| {
+                                        if (tinted_button_small(ui, t!(FMT_PRESET_SAVE)).clicked() || enter) && can_save {
+                                            save_preset = Some(current_kbps);
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                    });
+
+                    if let Some(kbps) = picked_kbps {
+                        d.rate_control = RateControl::ConstantBitrate { kbps };
+                    }
+                    if let Some(idx) = remove_idx
+                        && idx < presets.len()
+                    {
+                        presets.remove(idx);
+                    }
+                    if clear_custom {
+                        presets.clear();
+                    }
+                    if let Some(kbps) = save_preset {
+                        upsert_bitrate_preset(presets, preset_name, kbps);
+                        preset_name.clear();
+                    }
+
                     if let Some((w, h)) = source {
                         let (ow, oh) = d.size.resolve(w, h);
-                        ui.label(
-                            RichText::new(t!(FMT_BITRATE_ESTIMATE, d.target_bitrate_kbps(ow, oh), ow, oh, d.fps))
-                                .color(LABEL_2)
-                                .small(),
-                        );
+                        let est = d.target_bitrate_kbps(ow, oh);
+                        let mb_min = format!("{:.1}", approx_mb_per_min(est));
+                        let summary = format!("{} · {}", t!(FMT_BITRATE_ESTIMATE, est, ow, oh, d.fps), t!(FMT_MB_PER_MIN, mb_min));
+                        ui.label(RichText::new(summary).color(LABEL_2).small());
+                    } else if let RateControl::ConstantBitrate { kbps } = d.rate_control {
+                        let mb_min = format!("{:.1}", approx_mb_per_min(kbps));
+                        let summary = format!("{kbps} {} · {}", t!(UNIT_KBPS), t!(FMT_MB_PER_MIN, mb_min));
+                        ui.label(RichText::new(summary).color(LABEL_2).small());
                     }
-                    row_wide(ui, t!(FMT_ROW_KEYFRAME), |ui| {
-                        ui.add(egui::DragValue::new(&mut d.keyframe_interval_s).range(0.5..=10.0).suffix(" s").speed(0.1));
+
+                    adv_row(ui, t!(FMT_ROW_KEYFRAME), |ui| {
+                        ui.spacing_mut().slider_width = 165.0;
+                        ui.add(egui::Slider::new(&mut d.keyframe_interval_s, 0.5..=10.0).step_by(0.5).show_value(false));
+                        ui.add(
+                            egui::DragValue::new(&mut d.keyframe_interval_s)
+                                .range(0.5..=10.0)
+                                .suffix(format!(" {}", t!(UNIT_SEC)))
+                                .speed(0.1),
+                        );
                     });
                     ui.label(RichText::new(t!(FMT_RATE_CONTROL_NOTE)).color(LABEL_2).small());
                 }
@@ -571,15 +778,42 @@ fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 /// Label column followed by free-flowing controls (file type, advanced dialogs).
 fn row_wide(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    row_wide_w(ui, LABEL_W, label, add);
+}
+
+/// Wider label column for translated bitrate/keyframe labels in `Advanced::Quality`.
+fn adv_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    row_wide_w(ui, ADV_LABEL_W, label, add);
+}
+
+fn row_wide_w(ui: &mut egui::Ui, label_w: f32, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     let width = ui.available_width();
     ui.allocate_ui_with_layout(Vec2::new(width, 36.0), Layout::left_to_right(Align::Center), |ui| {
         ui.set_min_height(36.0);
         ui.add_space(PAD);
-        ui.allocate_ui_with_layout(Vec2::new(LABEL_W, 24.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.allocate_ui_with_layout(Vec2::new(label_w, 24.0), Layout::left_to_right(Align::Center), |ui| {
             ui.label(RichText::new(label).color(LABEL));
         });
         add(ui);
     });
+}
+
+fn preset_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let font = if selected { semibold(12.0) } else { egui::FontId::proportional(12.0) };
+    let fg = if selected { egui::Color32::WHITE } else { LABEL };
+    let (fill, hover) = if selected {
+        (BLUE, BLUE_HOVER)
+    } else {
+        (FILL_STRONG, mix(FILL_STRONG, LABEL, 0.14))
+    };
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, fg);
+    let size = Vec2::new(galley.size().x + 16.0, 24.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let c = if resp.hovered() && ui.is_enabled() { hover } else { fill };
+    let p = ui.painter();
+    p.rect_filled(rect, egui::CornerRadius::same(7), c);
+    p.galley(rect.center() - galley.size() / 2.0, galley, fg);
+    resp
 }
 
 /// Three fixed columns — label | field | trailing — so every row starts and

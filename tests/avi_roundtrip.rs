@@ -404,3 +404,111 @@ fn video_only() {
     let avih = find(&hdrl, b"avih", None).unwrap();
     assert_eq!(u32(&b.bytes, avih.start + 24), 1);
 }
+
+#[test]
+fn multi_audio_tracks_and_avix_roundtrip() {
+    let shared = Shared::new();
+    let mut converter = Converter::new(W, H, InputLayout::I420).unwrap();
+    let mut video = H264Encoder::new(&EncoderRequest::simple(W, H, FPS, 800_000)).unwrap();
+    let mut enc0 = PcmEncoder::new(RATE, 2);
+    let mut enc1 = Mp3Encoder::new(RATE, 2, 128).unwrap();
+    let mut enc2 = Mp3Encoder::new(RATE, 2, 128).unwrap();
+    let cfg = |e: &dyn AudioEncoder| AudioTrackConfig {
+        sample_rate: e.sample_rate(),
+        channels: e.channels(),
+        bitrate_bps: e.bitrate_bps(),
+        samples_per_frame: e.samples_per_frame(),
+        codec: e.codec_config(),
+    };
+    let mut mux = AviWriter::with_audio_tracks(
+        shared.clone(),
+        VideoTrackConfig { width: W, height: H, fps: FPS as f64, codec: VideoCodecConfig::H264 },
+        vec![cfg(&enc0), cfg(&enc1), cfg(&enc2)],
+    )
+    .unwrap();
+    assert_eq!(mux.audio_track_count(), 3);
+    mux.set_max_riff_for_tests(64 * 1024);
+
+    let mut frame = RawFrame {
+        data: vec![64u8; (W * H * 4) as usize],
+        width: W,
+        height: H,
+        stride: W * 4,
+        format: PixelFormat::Bgra,
+        pts: Duration::ZERO,
+        mouse: None,
+    };
+    let mut pcm0 = Vec::new();
+    let mut pcm1 = Vec::new();
+    let mut audio_chunks = [0usize; 3];
+    for i in 0..40u32 {
+        frame.pts = Duration::from_secs_f64(i as f64 / FPS as f64);
+        converter.convert(&frame).unwrap();
+        for f in video.encode(converter.frame(), frame.pts).unwrap() {
+            assert!(mux.push_video(&f.data, f.pts, f.keyframe).unwrap());
+        }
+        pcm0.clear();
+        pcm1.clear();
+        for s in 0..(RATE / FPS) {
+            let t = (i * (RATE / FPS) + s) as f32 / RATE as f32;
+            let v0 = (t * 440.0 * std::f32::consts::TAU).sin() * 0.3;
+            let v1 = (t * 880.0 * std::f32::consts::TAU).sin() * 0.2;
+            pcm0.extend_from_slice(&[v0, v0]);
+            pcm1.extend_from_slice(&[v1, v1]);
+        }
+        for f in enc0.encode(&pcm0).unwrap() {
+            mux.push_audio_track(0, &f.data, f.samples).unwrap();
+            audio_chunks[0] += 1;
+        }
+        for f in enc1.encode(&pcm0).unwrap() {
+            mux.push_audio_track(1, &f.data, f.samples).unwrap();
+            audio_chunks[1] += 1;
+        }
+        for f in enc2.encode(&pcm1).unwrap() {
+            mux.push_audio_track(2, &f.data, f.samples).unwrap();
+            audio_chunks[2] += 1;
+        }
+    }
+    for (idx, enc) in [&mut enc0 as &mut dyn AudioEncoder, &mut enc1, &mut enc2].into_iter().enumerate() {
+        for f in enc.flush().unwrap() {
+            mux.push_audio_track(idx, &f.data, f.samples).unwrap();
+            audio_chunks[idx] += 1;
+        }
+    }
+    mux.finalize().unwrap();
+
+    let bytes = shared.bytes();
+    let p = parse(&bytes);
+    assert!(p.riffs.len() >= 2, "expected AVIX rollover with 3 audio tracks, got {}", p.riffs.len());
+    let hdrl = chunks(&bytes, p.hdrl_start, p.hdrl_end);
+    let avih = find(&hdrl, b"avih", None).unwrap();
+    assert_eq!(u32(&bytes, avih.start + 24), 4, "dwStreams = 1 video + 3 audio");
+    let strls: Vec<&Chunk> = hdrl.iter().filter(|c| c.kind.as_ref() == Some(b"strl")).collect();
+    assert_eq!(strls.len(), 4);
+
+    let mut total_per_id = [0usize; 4]; // 00dc, 01wb, 02wb, 03wb
+    for r in &p.riffs {
+        let inner = chunks(&bytes, r.start, r.start + r.size);
+        let movi = find(&inner, b"LIST", Some(b"movi")).unwrap();
+        let cs = chunks(&bytes, movi.start, movi.start + movi.size);
+        total_per_id[0] += cs.iter().filter(|c| &c.id == b"00dc").count();
+        total_per_id[1] += cs.iter().filter(|c| &c.id == b"01wb").count();
+        total_per_id[2] += cs.iter().filter(|c| &c.id == b"02wb").count();
+        total_per_id[3] += cs.iter().filter(|c| &c.id == b"03wb").count();
+    }
+    assert_eq!(total_per_id[0], 40);
+    assert_eq!(total_per_id[1], audio_chunks[0]);
+    assert_eq!(total_per_id[2], audio_chunks[1]);
+    assert_eq!(total_per_id[3], audio_chunks[2]);
+
+    // First RIFF idx1 covers every chunk inside RIFF 0 across all 4 streams.
+    let top = chunks(&bytes, p.riffs[0].start, p.riffs[0].start + p.riffs[0].size);
+    let idx1 = find(&top, b"idx1", None).expect("idx1");
+    let movi0 = find(&top, b"LIST", Some(b"movi")).unwrap();
+    let cs0 = chunks(&bytes, movi0.start, movi0.start + movi0.size);
+    let riff0_media = cs0
+        .iter()
+        .filter(|c| matches!(&c.id, b"00dc" | b"01wb" | b"02wb" | b"03wb"))
+        .count();
+    assert_eq!(idx1.size / 16, riff0_media);
+}

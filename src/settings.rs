@@ -206,6 +206,131 @@ impl SizeMode {
     }
 }
 
+/// Video CBR bounds supported in Format settings (kbps).
+pub const MIN_BITRATE_KBPS: u32 = 200;
+pub const MAX_BITRATE_KBPS: u32 = 100_000;
+
+/// User-saved custom constant-bitrate preset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BitratePreset {
+    pub name: String,
+    pub kbps: u32,
+}
+
+impl BitratePreset {
+    pub fn new(name: impl Into<String>, kbps: u32) -> Self {
+        Self {
+            name: name.into().trim().to_string(),
+            kbps: kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS),
+        }
+    }
+}
+
+/// Built-in bitrate preset with localized label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinBitratePreset {
+    pub i18n_key: &'static str,
+    pub kbps: u32,
+}
+
+impl BuiltinBitratePreset {
+    pub fn label(self) -> &'static str {
+        crate::i18n::t(self.i18n_key)
+    }
+}
+
+pub const BUILTIN_BITRATE_PRESETS: [BuiltinBitratePreset; 6] = [
+    BuiltinBitratePreset { i18n_key: crate::i18n::key::PRESET_720P_STREAM, kbps: 4_500 },
+    BuiltinBitratePreset { i18n_key: crate::i18n::key::PRESET_1080P_STANDARD, kbps: 8_000 },
+    BuiltinBitratePreset { i18n_key: crate::i18n::key::PRESET_1080P_HIGH, kbps: 12_000 },
+    BuiltinBitratePreset { i18n_key: crate::i18n::key::PRESET_1440P_HIGH, kbps: 20_000 },
+    BuiltinBitratePreset { i18n_key: crate::i18n::key::PRESET_144HZ_GAMING, kbps: 35_000 },
+    BuiltinBitratePreset { i18n_key: crate::i18n::key::PRESET_4K_MASTER, kbps: 50_000 },
+];
+
+/// Cleans user bitrate presets: trims names, drops blanks, clamps bitrates and
+/// deduplicates case-insensitively.
+pub fn normalize_bitrate_presets(presets: &mut Vec<BitratePreset>) {
+    let mut seen: Vec<String> = Vec::with_capacity(presets.len());
+    let mut cleaned = Vec::with_capacity(presets.len());
+    for p in presets.drain(..) {
+        let name = p.name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if seen.contains(&lower) {
+            continue;
+        }
+        seen.push(lower);
+        cleaned.push(BitratePreset { name, kbps: p.kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS) });
+    }
+    *presets = cleaned;
+}
+
+/// Inserts or updates a named user bitrate preset (case-insensitive match).
+pub fn upsert_bitrate_preset(presets: &mut Vec<BitratePreset>, name: &str, kbps: u32) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let kbps = kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
+    if let Some(existing) = presets.iter_mut().find(|p| p.name.eq_ignore_ascii_case(trimmed)) {
+        existing.name = trimmed.to_string();
+        existing.kbps = kbps;
+    } else {
+        presets.push(BitratePreset { name: trimmed.to_string(), kbps });
+    }
+    true
+}
+
+/// Approximate video size in MiB/minute for a bitrate in kbps.
+pub fn approx_mb_per_min(kbps: u32) -> f64 {
+    kbps as f64 * 60.0 / 8.0 / 1024.0
+}
+
+/// How captured audio sources are mapped to container audio streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AudioTrackMode {
+    /// One mixed audio track combining all enabled sources.
+    #[default]
+    Mixed,
+    /// Separate tracks when both System audio and Microphone are active
+    /// (Track 1: System audio, Track 2: Microphone).
+    Separate,
+    /// Track 1 keeps the full mix (so players always hear everything), while
+    /// Track 2 (System audio) and Track 3 (Microphone) are saved separately.
+    MixedAndSeparate,
+}
+
+impl AudioTrackMode {
+    pub const ALL: [AudioTrackMode; 3] = [
+        AudioTrackMode::Mixed,
+        AudioTrackMode::Separate,
+        AudioTrackMode::MixedAndSeparate,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioTrackMode::Mixed => t!(TRACKS_MIXED),
+            AudioTrackMode::Separate => t!(TRACKS_SEPARATE),
+            AudioTrackMode::MixedAndSeparate => t!(TRACKS_MIXED_AND_SEPARATE),
+        }
+    }
+
+    pub fn track_count(self, has_system: bool, has_mic: bool) -> usize {
+        match (has_system, has_mic) {
+            (false, false) => 0,
+            (true, false) | (false, true) => 1,
+            (true, true) => match self {
+                AudioTrackMode::Mixed => 1,
+                AudioTrackMode::Separate => 2,
+                AudioTrackMode::MixedAndSeparate => 3,
+            },
+        }
+    }
+}
+
 /// How the video bitrate is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RateControl {
@@ -251,7 +376,10 @@ impl AudioCodec {
     }
 }
 
-pub const FPS_PRESETS: [u32; 10] = [10, 15, 20, 24, 25, 30, 48, 50, 60, 120];
+pub const AUTO_FPS: u32 = 0;
+pub const MIN_FPS: u32 = 1;
+pub const MAX_FPS: u32 = 144;
+pub const FPS_PRESETS: [u32; 13] = [10, 15, 20, 24, 25, 30, 48, 50, 60, 75, 90, 120, 144];
 pub const MP3_BITRATES: [u32; 8] = [64, 96, 128, 160, 192, 224, 256, 320];
 /// The only rates the Microsoft AAC encoder accepts (12/16/20/24 kB/s).
 pub const AAC_BITRATES: [u32; 4] = [96, 128, 160, 192];
@@ -339,14 +467,16 @@ impl FormatSettings {
         if !SAMPLE_RATES.contains(&self.audio_sample_rate) {
             self.audio_sample_rate = 48_000;
         }
-        self.fps = self.fps.clamp(1, 240);
+        if self.fps != AUTO_FPS {
+            self.fps = self.fps.clamp(MIN_FPS, MAX_FPS);
+        }
         if let SizeMode::Percent { x, y } = &mut self.size {
             *x = (*x).clamp(10, 100);
             *y = (*y).clamp(10, 100);
         }
         match &mut self.rate_control {
             RateControl::Quality(q) => *q = ((*q as u32).clamp(10, 100) as f32 / 10.0).round() as u8 * 10,
-            RateControl::ConstantBitrate { kbps } => *kbps = (*kbps).clamp(200, 100_000),
+            RateControl::ConstantBitrate { kbps } => *kbps = (*kbps).clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS),
         }
         if !self.keyframe_interval_s.is_finite() {
             self.keyframe_interval_s = 2.0;
@@ -355,15 +485,39 @@ impl FormatSettings {
         notes
     }
 
-    /// Bitrate for an output of `w`×`h` at the configured frame rate.
-    pub fn target_bitrate_kbps(&self, w: u32, h: u32) -> u32 {
+    pub const fn is_auto_fps(&self) -> bool {
+        self.fps == AUTO_FPS
+    }
+
+    /// Nominal frame rate when the active monitor's refresh rate is known,
+    /// capped at 120 fps for smooth Auto grid pacing (falling back to 120 fps
+    /// if the refresh rate cannot be determined).
+    pub fn effective_fps_for(&self, monitor_hz: Option<u32>) -> u32 {
+        if self.fps == AUTO_FPS {
+            monitor_hz.filter(|&hz| hz >= 15).map(|hz| hz.min(120)).unwrap_or(120)
+        } else {
+            self.fps
+        }
+    }
+
+    /// Nominal frame rate for encoding rate-control, muxer headers, and keyframes.
+    pub const fn effective_fps(&self) -> u32 {
+        if self.fps == AUTO_FPS {
+            120
+        } else {
+            self.fps
+        }
+    }
+
+    /// Bitrate for an output of `w`×`h` at an explicit nominal `fps`.
+    pub fn target_bitrate_kbps_at(&self, w: u32, h: u32, fps: u32) -> u32 {
         match self.rate_control {
             RateControl::ConstantBitrate { kbps } => kbps,
             RateControl::Quality(q) => {
                 let q = q.clamp(10, 100) as f64;
                 // Bits per pixel per frame: 0.02 at q=10 … 0.20 at q=100.
                 let bpp = 0.02 + (q - 10.0) / 90.0 * 0.18;
-                let mut bps = w as f64 * h as f64 * self.fps.max(1) as f64 * bpp;
+                let mut bps = w as f64 * h as f64 * fps.max(1) as f64 * bpp;
                 if self.video_codec.is_hevc() {
                     bps *= 0.65;
                 }
@@ -372,8 +526,17 @@ impl FormatSettings {
         }
     }
 
+    /// Bitrate for an output of `w`×`h` at the configured frame rate.
+    pub fn target_bitrate_kbps(&self, w: u32, h: u32) -> u32 {
+        self.target_bitrate_kbps_at(w, h, self.effective_fps())
+    }
+
+    pub fn keyframe_interval_frames_at(&self, fps: u32) -> u32 {
+        (self.keyframe_interval_s.max(0.1) * fps.max(1) as f32).round().max(1.0) as u32
+    }
+
     pub fn keyframe_interval_frames(&self) -> u32 {
-        (self.keyframe_interval_s.max(0.1) * self.fps.max(1) as f32).round().max(1.0) as u32
+        self.keyframe_interval_frames_at(self.effective_fps())
     }
 
     pub fn quality_label(&self) -> String {
@@ -403,9 +566,14 @@ impl FormatSettings {
             }
             _ => String::new(),
         };
+        let fps_label = if self.fps == AUTO_FPS {
+            t!(AUTO).to_string()
+        } else {
+            self.fps.to_string()
+        };
         (
             self.video_codec.label(available),
-            t!(VIDEO_SUMMARY, size, self.fps, self.quality_label(), bitrate, self.profile_label()),
+            t!(VIDEO_SUMMARY, size, fps_label, self.quality_label(), bitrate, self.profile_label()),
         )
     }
 
@@ -421,6 +589,10 @@ impl FormatSettings {
     }
 }
 
+fn default_volume() -> u8 {
+    100
+}
+
 /// Root of `settings.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -430,9 +602,21 @@ pub struct Settings {
     pub output_dir: Option<PathBuf>,
     pub file_prefix: String,
     pub system_audio: bool,
+    /// Specific playback endpoint for loopback capture, `None` → system default.
+    pub system_audio_device: Option<String>,
+    /// System audio capture volume in percent (`0..=200`, 100 = unity gain).
+    #[serde(default = "default_volume")]
+    pub system_audio_volume: u8,
     pub mic_enabled: bool,
     /// Microphone by name (re-resolved to a device index at load).
     pub mic_name: Option<String>,
+    /// Microphone capture volume in percent (`0..=200`, 100 = unity gain).
+    #[serde(default = "default_volume")]
+    pub mic_volume: u8,
+    /// Multi-track layout when recording both system audio and microphone.
+    pub audio_track_mode: AudioTrackMode,
+    /// User-saved custom video CBR presets shown in Format settings.
+    pub bitrate_presets: Vec<BitratePreset>,
     pub mouse_fx: MouseFx,
     /// The openclip badge burned into recordings and snapshots.
     pub watermark: Watermark,
@@ -459,8 +643,13 @@ impl Default for Settings {
             output_dir: None,
             file_prefix: "openclip".into(),
             system_audio: true,
+            system_audio_device: None,
+            system_audio_volume: default_volume(),
             mic_enabled: false,
             mic_name: None,
+            mic_volume: default_volume(),
+            audio_track_mode: AudioTrackMode::default(),
+            bitrate_presets: Vec::new(),
             mouse_fx: MouseFx::default(),
             watermark: Watermark::default(),
             fps_overlay: FpsOverlay::default(),
@@ -471,6 +660,15 @@ impl Default for Settings {
             language: Lang::default(),
             check_updates: true,
         }
+    }
+}
+
+impl Settings {
+    /// Clamps standalone scalar preferences and cleans up custom bitrate presets.
+    pub fn normalize_fields(&mut self) {
+        self.system_audio_volume = self.system_audio_volume.clamp(0, 200);
+        self.mic_volume = self.mic_volume.clamp(0, 200);
+        normalize_bitrate_presets(&mut self.bitrate_presets);
     }
 }
 
@@ -538,9 +736,10 @@ impl Settings {
         for path in candidates {
             match std::fs::read(&path) {
                 Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
-                    // Not normalized here: the codec list is only known once the
-                    // encoders have been enumerated; the app normalizes then.
-                    Ok(s) => {
+                    // Format codec normalization runs once the app enumerates
+                    // encoders, while standalone fields are clamped right away.
+                    Ok(mut s) => {
+                        s.normalize_fields();
                         log::info!("settings loaded from {}", path.display());
                         return s;
                     }
@@ -690,5 +889,96 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"format":{"fps":60}}"#).unwrap();
         assert_eq!(partial.format.fps, 60);
         assert_eq!(partial.format.container, Container::Mp4);
+    }
+
+    #[test]
+    fn fps_presets_reach_144_and_normalize_clamps() {
+        assert!(FPS_PRESETS.contains(&75));
+        assert!(FPS_PRESETS.contains(&90));
+        assert!(FPS_PRESETS.contains(&120));
+        assert_eq!(FPS_PRESETS.last().copied(), Some(144));
+
+        let mut f = FormatSettings {
+            fps: 240,
+            rate_control: RateControl::ConstantBitrate { kbps: 500_000 },
+            ..Default::default()
+        };
+        f.normalize(&[]);
+        assert_eq!(f.fps, 144);
+        assert_eq!(f.rate_control, RateControl::ConstantBitrate { kbps: MAX_BITRATE_KBPS });
+
+        let mut f = FormatSettings {
+            fps: 0,
+            rate_control: RateControl::ConstantBitrate { kbps: 10 },
+            ..Default::default()
+        };
+        f.normalize(&[]);
+        assert_eq!(f.fps, AUTO_FPS);
+        assert!(f.is_auto_fps());
+        assert_eq!(f.effective_fps(), 120);
+        assert_eq!(f.effective_fps_for(Some(144)), 120);
+        assert_eq!(f.effective_fps_for(Some(75)), 75);
+        assert_eq!(f.effective_fps_for(Some(60)), 60);
+        assert_eq!(f.effective_fps_for(None), 120);
+        assert_eq!(f.effective_fps_for(Some(0)), 120);
+        assert_eq!(f.rate_control, RateControl::ConstantBitrate { kbps: MIN_BITRATE_KBPS });
+    }
+
+    #[test]
+    fn audio_track_mode_counts() {
+        assert_eq!(AudioTrackMode::Mixed.track_count(false, false), 0);
+        assert_eq!(AudioTrackMode::Separate.track_count(true, false), 1);
+        assert_eq!(AudioTrackMode::MixedAndSeparate.track_count(false, true), 1);
+        assert_eq!(AudioTrackMode::Mixed.track_count(true, true), 1);
+        assert_eq!(AudioTrackMode::Separate.track_count(true, true), 2);
+        assert_eq!(AudioTrackMode::MixedAndSeparate.track_count(true, true), 3);
+    }
+
+    #[test]
+    fn bitrate_presets_normalize_and_upsert() {
+        let mut presets = vec![
+            BitratePreset { name: "  Stream ".into(), kbps: 50 },
+            BitratePreset { name: "   ".into(), kbps: 5000 },
+            BitratePreset { name: "stream".into(), kbps: 9000 },
+            BitratePreset { name: "Ultra".into(), kbps: 999_999 },
+        ];
+        normalize_bitrate_presets(&mut presets);
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0], BitratePreset { name: "Stream".into(), kbps: MIN_BITRATE_KBPS });
+        assert_eq!(presets[1], BitratePreset { name: "Ultra".into(), kbps: MAX_BITRATE_KBPS });
+
+        assert!(!upsert_bitrate_preset(&mut presets, "   ", 8000));
+        assert!(upsert_bitrate_preset(&mut presets, "stream", 6500));
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0], BitratePreset { name: "stream".into(), kbps: 6500 });
+        assert!(upsert_bitrate_preset(&mut presets, "144 Hz", 35_000));
+        assert_eq!(presets.len(), 3);
+    }
+
+    #[test]
+    fn settings_backward_compat_and_new_fields() {
+        // Legacy JSON missing new audio/bitrate fields still defaults to unity volume,
+        // mixed tracks, empty custom presets, and parses new Ukrainian language code.
+        let mut legacy: Settings = serde_json::from_str(
+            r#"{"format":{"fps":120,"rate_control":{"Quality":100}},"system_audio":true,"language":"uk"}"#,
+        )
+        .unwrap();
+        legacy.normalize_fields();
+        assert_eq!(legacy.format.fps, 120);
+        assert_eq!(legacy.system_audio_volume, 100);
+        assert_eq!(legacy.mic_volume, 100);
+        assert_eq!(legacy.system_audio_device, None);
+        assert_eq!(legacy.audio_track_mode, AudioTrackMode::Mixed);
+        assert!(legacy.bitrate_presets.is_empty());
+        assert_eq!(legacy.language, Lang::Uk);
+
+        let mut clamped: Settings = serde_json::from_str(
+            r#"{"system_audio_volume":255,"mic_volume":220,"audio_track_mode":"Separate"}"#,
+        )
+        .unwrap();
+        clamped.normalize_fields();
+        assert_eq!(clamped.system_audio_volume, 200);
+        assert_eq!(clamped.mic_volume, 200);
+        assert_eq!(clamped.audio_track_mode, AudioTrackMode::Separate);
     }
 }

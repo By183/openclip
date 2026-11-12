@@ -24,14 +24,14 @@ use eframe::egui::{
     RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 
-use crate::audio::capture::list_input_devices;
+use crate::audio::capture::{list_input_devices, list_output_devices};
 use crate::capture::monitors::{
     list_monitors, list_windows, screenshot_source, source_origin, MonitorInfo, WindowInfo,
 };
 use crate::capture::{self as cap, CaptureConfig, CaptureHandle, Rect, Source};
 use crate::i18n::{self, Lang};
 use crate::pipeline::{RecordConfig, Recorder, Stats};
-use crate::settings::{FormatSettings, Settings};
+use crate::settings::{AudioTrackMode, BitratePreset, FormatSettings, Settings};
 use crate::t;
 use crate::video::encoder::{available_encoders, refresh_encoders, EncoderInfo};
 use crate::video::mouse_fx::{MouseFx, MouseSampler, ARROW, CLICK_DURATION};
@@ -127,7 +127,7 @@ enum VideoTab {
 enum GeneralTab {
     Output,
     Recording,
-    Appearance,
+    Language,
     Sources,
 }
 
@@ -247,6 +247,7 @@ impl LivePreview {
 pub struct App {
     monitors: Vec<MonitorInfo>,
     windows: Vec<WindowInfo>,
+    outputs: Vec<String>,
     mics: Vec<String>,
     source_kind: SourceKind,
     monitor_idx: usize,
@@ -254,6 +255,7 @@ pub struct App {
     region: Option<(u32, Rect)>,
     /// Container / codec / size / quality settings (the Format dialog).
     format: FormatSettings,
+    bitrate_presets: Vec<BitratePreset>,
     format_dialog: FormatDialog,
     /// Encoders found on this machine (Media Foundation); empty until the scan finishes.
     encoders: Vec<EncoderInfo>,
@@ -282,20 +284,21 @@ pub struct App {
     game_consent_open: bool,
     game_ignored: Vec<String>,
     system_audio: bool,
+    system_audio_device: Option<String>,
+    system_audio_volume: u8,
     mic_enabled: bool,
     mic_idx: usize,
+    mic_volume: u8,
+    audio_track_mode: AudioTrackMode,
     output_dir: PathBuf,
     file_prefix: String,
     countdown_enabled: bool,
     countdown_secs: u32,
     language: Lang,
-    /// Look for a newer release on GitHub at start-up.
+    /// Preserved from settings.json for compatibility; update checks are disabled.
     check_updates: bool,
-    update: updater::UpdateState,
-    /// Whether the game-capture sidecar is where it should be, and what is
-    /// being done about it if not.
+    /// Whether the game-capture sidecar is where it should be.
     repair: updater::RepairState,
-    update_modal: bool,
     tab: Tab,
     home_tab: HomeTab,
     video_tab: VideoTab,
@@ -356,6 +359,7 @@ impl App {
         install_fonts(&cc.egui_ctx);
         let monitors = list_monitors().unwrap_or_default();
         let windows = list_windows().unwrap_or_default();
+        let outputs = list_output_devices();
         let mics = list_input_devices();
         let settings = Settings::load();
         let output_dir = settings.output_dir.clone().filter(|d| d.is_dir()).unwrap_or_else(default_output_dir);
@@ -378,15 +382,17 @@ impl App {
             .flatten()
             .and_then(|s| parse_region(&s))
             .and_then(|r| Some((monitors.first()?.id, r)));
-        let mut app = Self {
+        Self {
             monitors,
             windows,
+            outputs,
             mics,
             source_kind: if start_region.is_some() { SourceKind::Region } else { SourceKind::Monitor },
             monitor_idx: 0,
             window_idx: 0,
             region: start_region,
             format: settings.format,
+            bitrate_presets: settings.bitrate_presets,
             format_dialog: FormatDialog::new(),
             encoders: Vec::new(),
             encoder_rx: Some(encoder_rx),
@@ -405,15 +411,18 @@ impl App {
             game_consent_open: false,
             game_ignored: settings.game_ignored.clone(),
             system_audio: settings.system_audio,
+            system_audio_device: settings.system_audio_device,
+            system_audio_volume: settings.system_audio_volume.clamp(0, 200),
             mic_enabled: settings.mic_enabled,
             mic_idx,
+            mic_volume: settings.mic_volume.clamp(0, 200),
+            audio_track_mode: settings.audio_track_mode,
             output_dir,
             file_prefix: settings.file_prefix,
             countdown_enabled: settings.countdown_enabled,
             countdown_secs: settings.countdown_secs.clamp(1, 10),
             language: settings.language,
             check_updates: settings.check_updates,
-            update: updater::UpdateState::Idle,
             repair: match crate::update::sidecar_missing() {
                 Some(name) => {
                     log::warn!("{name} is not beside the executable; Game mode needs it restored");
@@ -421,7 +430,6 @@ impl App {
                 }
                 None => updater::RepairState::Present,
             },
-            update_modal: false,
             tab: Tab::Home,
             home_tab: HomeTab::Videos,
             video_tab: VideoTab::Record,
@@ -452,14 +460,7 @@ impl App {
             start_viewer: cfg!(debug_assertions)
                 .then(|| std::env::var_os("OPENCLIP_OPEN_VIEWER").map(PathBuf::from))
                 .flatten(),
-        };
-        // A missing sidecar needs the release list too, and getting Game mode
-        // working again is not something to hold back until the user happens to
-        // turn update checks on.
-        if app.check_updates || app.repair.wanted() {
-            app.start_update_check(&cc.egui_ctx);
         }
-        app
     }
 
     fn selected_source(&self) -> Option<Source> {
@@ -504,8 +505,13 @@ impl App {
             output_dir: Some(self.output_dir.clone()),
             file_prefix: self.file_prefix.clone(),
             system_audio: self.system_audio,
+            system_audio_device: self.system_audio_device.clone(),
+            system_audio_volume: self.system_audio_volume,
             mic_enabled: self.mic_enabled,
             mic_name: self.mics.get(self.mic_idx).cloned(),
+            mic_volume: self.mic_volume,
+            audio_track_mode: self.audio_track_mode,
+            bitrate_presets: self.bitrate_presets.clone(),
             mouse_fx: self.mouse_fx.read().unwrap().clone(),
             watermark: *self.watermark.read().unwrap(),
             fps_overlay: self.fps_overlay,
@@ -523,15 +529,16 @@ impl App {
 
     pub(super) fn open_format_dialog(&mut self, section: FormatSection) {
         self.wait_for_encoders(Duration::from_millis(1500));
-        self.format_dialog.open(&self.format, &self.encoders, section);
+        self.format_dialog.open(&self.format, &self.bitrate_presets, &self.encoders, section);
     }
 
     /// Runs the Format dialog (both layouts call this last, like the delete dialog).
     fn show_format_dialog(&mut self, ctx: &egui::Context) {
         let recording = self.is_recording();
         match self.format_dialog.show(ctx, &self.encoders, self.source_size(), recording, self.compact) {
-            DialogOutcome::Ok(f) => {
+            DialogOutcome::Ok(f, presets) => {
                 self.format = f;
+                self.bitrate_presets = presets;
                 self.save_settings();
             }
             DialogOutcome::Cancel | DialogOutcome::None => {}
@@ -640,6 +647,7 @@ impl App {
     fn refresh_sources(&mut self) {
         self.monitors = list_monitors().unwrap_or_default();
         self.windows = list_windows().unwrap_or_default();
+        self.outputs = list_output_devices();
         self.mics = list_input_devices();
         self.monitor_idx = self.monitor_idx.min(self.monitors.len().saturating_sub(1));
         self.window_idx = self.window_idx.min(self.windows.len().saturating_sub(1));
@@ -744,7 +752,11 @@ impl App {
             mouse_fx: if game { MouseFx::default_off() } else { self.mouse_fx.read().unwrap().clone() },
             watermark: *self.watermark.read().unwrap(),
             system_audio: self.system_audio,
+            system_audio_device: self.system_audio_device.clone(),
+            system_audio_gain: self.system_audio_volume as f32 / 100.0,
             microphone: self.mic_enabled.then(|| self.mics.get(self.mic_idx).cloned()),
+            mic_gain: self.mic_volume as f32 / 100.0,
+            audio_track_mode: self.audio_track_mode,
             output,
         };
         let ctx2 = ctx.clone();
@@ -857,8 +869,20 @@ impl App {
                     self.select_mode(kind, ctx);
                 }
                 ui.add_space(12.0);
-                icon_toggle(ui, icons::SPEAKER, t!(SYSTEM_AUDIO), &mut self.system_audio);
-                icon_toggle(ui, icons::MIC, t!(MICROPHONE), &mut self.mic_enabled);
+                let before_audio = (self.system_audio, self.mic_enabled);
+                let sys_label = match &self.system_audio_device {
+                    Some(dev) => format!("{} ({dev})", t!(SYSTEM_AUDIO)),
+                    None => t!(SYSTEM_AUDIO).to_string(),
+                };
+                icon_toggle(ui, icons::SPEAKER, &sys_label, &mut self.system_audio);
+                let mic_label = match self.mics.get(self.mic_idx) {
+                    Some(dev) => format!("{} ({dev})", t!(MICROPHONE)),
+                    None => t!(MICROPHONE).to_string(),
+                };
+                icon_toggle(ui, icons::MIC, &mic_label, &mut self.mic_enabled);
+                if (self.system_audio, self.mic_enabled) != before_audio {
+                    self.save_settings();
+                }
                 let mut show_cursor = self.mouse_fx.read().unwrap().show_cursor;
                 let before = show_cursor;
                 icon_toggle(ui, icons::CURSOR, t!(SHOW_CURSOR), &mut show_cursor);
@@ -1197,12 +1221,18 @@ impl App {
                         .on_hover_ui(|ui| counters_tooltip(ui, s, elapsed));
                     // A slot costing more than its budget is why the frame rate
                     // is low; show it while it lasts rather than as a sticky note.
-                    let budget_us = 1_000_000 / s.target_fps.load(Ordering::Relaxed).max(1);
-                    let slot_us = s.slot_us.load(Ordering::Relaxed);
-                    if elapsed.as_secs_f64() > 2.0 && slot_us > budget_us {
-                        vdivider(ui, 16.0);
-                        let behind = t!(STATUS_ENCODER_BEHIND, format!("{:.1}", slot_us as f64 / 1e3), budget_us / 1000);
-                        ui.label(RichText::new(behind).color(ORANGE));
+                    let target_fps = s.target_fps.load(Ordering::Relaxed);
+                    if let Some(budget_us) = 1_000_000u64.checked_div(target_fps) {
+                        let slot_us = s.slot_us.load(Ordering::Relaxed);
+                        if elapsed.as_secs_f64() > 2.0 && slot_us > budget_us {
+                            vdivider(ui, 16.0);
+                            let behind = t!(
+                                STATUS_ENCODER_BEHIND,
+                                format!("{:.1}", slot_us as f64 / 1e3),
+                                format!("{:.1}", budget_us as f64 / 1e3)
+                            );
+                            ui.label(RichText::new(behind).color(ORANGE));
+                        }
                     }
                     for note in [s.note(), s.audio_note.lock().unwrap().clone()].into_iter().flatten() {
                         vdivider(ui, 16.0);
@@ -1238,7 +1268,6 @@ impl App {
                         if tinted_button_small(ui, t!(STATUS_CHANGE)).on_hover_text(t!(STATUS_CHANGE_TIP)).clicked() {
                             self.show_preview_tab();
                         }
-                        self.update_chip(ui);
                     });
                 }
             }
@@ -1560,7 +1589,7 @@ impl App {
             &[
                 (GeneralTab::Output, None, t!(SECTION_OUTPUT)),
                 (GeneralTab::Recording, None, t!(SECTION_RECORDING)),
-                (GeneralTab::Appearance, None, t!(SECTION_APPEARANCE)),
+                (GeneralTab::Language, None, t!(LANGUAGE)),
                 (GeneralTab::Sources, None, t!(SECTION_SOURCES)),
             ],
             &mut tab,
@@ -1601,7 +1630,11 @@ impl App {
                     switch_row(card, t!(COUNTDOWN_CHECKBOX), &mut self.countdown_enabled);
                     card.row(t!(ROW_COUNTDOWN), |ui| {
                         ui.add_enabled_ui(self.countdown_enabled, |ui| {
-                            ui.add(egui::DragValue::new(&mut self.countdown_secs).range(1..=10).suffix(" s"));
+                            ui.add(
+                                egui::DragValue::new(&mut self.countdown_secs)
+                                    .range(1..=10)
+                                    .suffix(format!(" {}", t!(UNIT_SEC))),
+                            );
                         });
                     });
                 });
@@ -1610,8 +1643,8 @@ impl App {
                     self.save_settings();
                 }
             }
-            GeneralTab::Appearance => {
-                section_header(ui, t!(SECTION_APPEARANCE));
+            GeneralTab::Language => {
+                section_header(ui, t!(LANGUAGE));
                 Card::show(ui, |card| {
                     card.row(t!(LANGUAGE), |ui| {
                         let mut lang = self.language;
@@ -1707,36 +1740,18 @@ impl App {
     fn game_status_card(&mut self, ui: &mut egui::Ui) {
         section_header(ui, t!(SECTION_GAME_CAPTURE));
         let armed = self.game_armed();
-        let ctx = ui.ctx().clone();
         Card::show(ui, |card| {
             card.text_row(t!(GAME_STATUS), &self.game_label());
             #[cfg(windows)]
             if let Some(session) = self.game_session_info() {
                 card.text_row(t!(GAME_HOOK_VERSION), &session);
             }
-            // An install that self-updated from a build older than the hook has
-            // no DLL at all, and being up to date is never offered another
-            // download. This row is the way back.
-            //
-            // `custom` + `horizontal_wrapped`, not `row_inline`: these strings
-            // are whole sentences and the localized ones are longer still. A
-            // fixed-height row would size itself to the text and push the card
-            // — and, through `set_width(available_width)`, every other card on
-            // the page — off the right-hand edge of the window.
             if let Some((text, colour)) = self.repair_status() {
-                let offer = self.repair.wanted();
-                let mut fix = false;
                 card.custom(|ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(text).color(colour));
-                        if offer {
-                            fix = tinted_button_small(ui, t!(HOOK_REPAIR_BUTTON)).clicked();
-                        }
                     });
                 });
-                if fix {
-                    self.retry_sidecar_repair(&ctx);
-                }
             }
             card.row(t!(GAME_MODE_ROW), |ui| {
                 if tinted_button_small(ui, if armed { t!(GAME_DISARM) } else { t!(GAME_ARM) }).clicked() {
@@ -1771,10 +1786,54 @@ impl App {
 
     fn video_record_tab(&mut self, ui: &mut egui::Ui) {
         let recording = self.is_recording();
+        let before = (
+            self.system_audio,
+            self.system_audio_device.clone(),
+            self.system_audio_volume,
+            self.mic_enabled,
+            self.mic_idx,
+            self.mic_volume,
+            self.audio_track_mode,
+        );
+
         section_header(ui, t!(BOX_AUDIO));
         ui.add_enabled_ui(!recording, |ui| {
             Card::show(ui, |card| {
                 switch_row(card, t!(CHK_SYSTEM_AUDIO), &mut self.system_audio);
+                card.row(t!(ROW_PLAYBACK_DEVICE), |ui| {
+                    ui.add_enabled_ui(self.system_audio, |ui| {
+                        let label = self.system_audio_device.as_deref().unwrap_or_else(|| t!(DEFAULT_DEVICE));
+                        let w = combo_width(ui);
+                        egui::ComboBox::from_id_salt("sys-output")
+                            .width(w)
+                            .truncate()
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                truncate_items(ui);
+                                ui.selectable_value(&mut self.system_audio_device, None, t!(DEFAULT_DEVICE));
+                                if self.outputs.is_empty() {
+                                    ui.label(secondary(t!(NO_OUTPUT_DEVICES)).small());
+                                } else {
+                                    for dev in &self.outputs {
+                                        ui.selectable_value(
+                                            &mut self.system_audio_device,
+                                            Some(dev.clone()),
+                                            dev,
+                                        );
+                                    }
+                                }
+                            });
+                    });
+                });
+                card.row(t!(ROW_VOLUME), |ui| {
+                    ui.add_enabled_ui(self.system_audio, |ui| {
+                        ui.add(egui::DragValue::new(&mut self.system_audio_volume).range(0..=200).suffix(" %"));
+                        ui.add(egui::Slider::new(&mut self.system_audio_volume, 0..=200).show_value(false));
+                    });
+                });
+            });
+
+            Card::show(ui, |card| {
                 switch_row(card, t!(CHK_MICROPHONE), &mut self.mic_enabled);
                 card.row(t!(ROW_DEVICE), |ui| {
                     ui.add_enabled_ui(self.mic_enabled && !self.mics.is_empty(), |ui| {
@@ -1788,12 +1847,46 @@ impl App {
                         });
                     });
                 });
+                card.row(t!(ROW_VOLUME), |ui| {
+                    ui.add_enabled_ui(self.mic_enabled, |ui| {
+                        ui.add(egui::DragValue::new(&mut self.mic_volume).range(0..=200).suffix(" %"));
+                        ui.add(egui::Slider::new(&mut self.mic_volume, 0..=200).show_value(false));
+                    });
+                });
+                card.row(t!(ROW_AUDIO_TRACKS), |ui| {
+                    let w = combo_width(ui);
+                    egui::ComboBox::from_id_salt("audio-tracks")
+                        .width(w)
+                        .truncate()
+                        .selected_text(self.audio_track_mode.label())
+                        .show_ui(ui, |ui| {
+                            truncate_items(ui);
+                            for mode in AudioTrackMode::ALL {
+                                ui.selectable_value(&mut self.audio_track_mode, mode, mode.label());
+                            }
+                        });
+                });
             });
         });
+        if (
+            self.system_audio,
+            self.system_audio_device.clone(),
+            self.system_audio_volume,
+            self.mic_enabled,
+            self.mic_idx,
+            self.mic_volume,
+            self.audio_track_mode,
+        ) != before
+        {
+            self.save_settings();
+        }
+        if self.audio_track_mode != AudioTrackMode::Mixed || (self.system_audio && self.mic_enabled) {
+            footnote(ui, t!(TRACKS_NOTE));
+        }
 
         section_header(ui, &t!(SECTION_FORMAT, self.format.container.label()));
         let (video_title, video_detail) = self.format.video_summary(&self.encoders, self.source_size());
-        let (audio_title, audio_detail) = self.format.audio_summary(self.audio_sources_label());
+        let (audio_title, audio_detail) = self.format.audio_summary(&self.audio_sources_label());
         let mut open: Option<FormatSection> = None;
         ui.add_enabled_ui(!recording, |ui| {
             Card::show(ui, |card| {
@@ -1818,12 +1911,18 @@ impl App {
         footnote(ui, &note);
     }
 
-    pub(super) fn audio_sources_label(&self) -> &'static str {
-        match (self.system_audio, self.mic_enabled) {
+    pub(super) fn audio_sources_label(&self) -> String {
+        let base = match (self.system_audio, self.mic_enabled) {
             (true, true) => t!(SRC_SYSTEM_AND_MIC),
             (true, false) => t!(SRC_SYSTEM),
             (false, true) => t!(SRC_MIC),
             (false, false) => t!(SRC_NO_AUDIO),
+        };
+        let tracks = self.audio_track_mode.track_count(self.system_audio, self.mic_enabled);
+        if tracks > 1 {
+            t!(SRC_WITH_TRACKS, base, tracks)
+        } else {
+            base.to_string()
         }
     }
 
@@ -2122,13 +2221,23 @@ impl App {
             ui.add_space(14.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if destructive_button(ui, t!(DELETE)).clicked() {
+                    // Close the viewer *before* deleting so Media Foundation
+                    // releases its file handle synchronously first; also clears
+                    // cached thumbnail/footer links and surfaces errors in footer.
+                    if self.viewer.as_ref().is_some_and(|v| v.path == path) {
+                        self.close_viewer();
+                    }
+                    self.thumbs.remove(&path);
+                    if self.last_file.as_deref() == Some(path.as_path()) {
+                        self.last_file = None;
+                    }
                     match self.library.delete(&path, &self.output_dir) {
                         Ok(()) => {
-                        if self.viewer.as_ref().is_some_and(|v| v.path == path) {
-                            self.close_viewer();
+                            self.message = Some((t!(MSG_DELETED, path.display()), false));
                         }
-                        self.message = Some((t!(MSG_DELETED, path.display()), false));
-                    }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.message = Some((t!(MSG_DELETED, path.display()), false));
+                        }
                         Err(e) => self.message = Some((t!(MSG_DELETE_FAILED, e), true)),
                     }
                     close = true;
@@ -2148,7 +2257,6 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_encoders();
-        self.poll_update(&ctx);
         if self.thumbs.poll(&ctx) {
             ctx.request_repaint();
         }
@@ -2225,7 +2333,6 @@ impl eframe::App for App {
         self.delete_dialog(&ctx);
         self.show_format_dialog(&ctx);
         self.game_consent_dialog(&ctx);
-        self.update_dialog(&ctx);
     }
 
     fn on_exit(&mut self) {
@@ -2233,7 +2340,6 @@ impl eframe::App for App {
         // Let go of any hooked game, so its counter goes away with us rather
         // than waiting for the hook to notice we died.
         self.disarm_game_mode();
-        self.cancel_update_download();
         self.save_settings();
         self.live.stop();
         if let State::Recording(rec) = std::mem::replace(&mut self.state, State::Idle) {
@@ -2252,9 +2358,8 @@ impl eframe::App for App {
 fn counters_tooltip(ui: &mut egui::Ui, s: &Stats, elapsed: Duration) {
     let secs = elapsed.as_secs_f64().max(0.001);
     let get = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
-    let target = get(&s.target_fps).max(1);
-    let budget_us = 1_000_000 / target;
-    let ms = |us: u64| format!("{:.1} ms", us as f64 / 1e3);
+    let target = get(&s.target_fps);
+    let ms = |us: u64| format!("{:.1} {}", us as f64 / 1e3, t!(UNIT_MS));
 
     egui::Grid::new("rec-counters").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
         let mut row = |label: String, value: String| {
@@ -2265,11 +2370,21 @@ fn counters_tooltip(ui: &mut egui::Ui, s: &Stats, elapsed: Duration) {
         if let Some(enc) = s.encoder() {
             row(t!(COUNTER_ENCODER).to_string(), enc);
         }
-        row(t!(COUNTER_SCREEN_FPS).to_string(), format!("{:.1} fps", get(&s.frames_captured) as f64 / secs));
         row(
-            t!(COUNTER_FILE_FPS).to_string(),
-            format!("{:.1} / {target} fps", get(&s.frames_encoded) as f64 / secs),
+            t!(COUNTER_SCREEN_FPS).to_string(),
+            format!("{:.1} {}", get(&s.frames_captured) as f64 / secs, t!(UNIT_FPS)),
         );
+        if target > 0 {
+            row(
+                t!(COUNTER_FILE_FPS).to_string(),
+                format!("{:.1} / {target} {}", get(&s.frames_encoded) as f64 / secs, t!(UNIT_FPS)),
+            );
+        } else {
+            row(
+                t!(COUNTER_FILE_FPS).to_string(),
+                format!("{:.1} ({})", get(&s.frames_encoded) as f64 / secs, t!(AUTO)),
+            );
+        }
         row(t!(COUNTER_CAPTURED).to_string(), get(&s.frames_captured).to_string());
         row(t!(COUNTER_ENCODED).to_string(), get(&s.frames_encoded).to_string());
         row(t!(COUNTER_REPEATED).to_string(), get(&s.frames_repeated).to_string());
@@ -2279,10 +2394,18 @@ fn counters_tooltip(ui: &mut egui::Ui, s: &Stats, elapsed: Duration) {
         row(t!(COUNTER_SKIPPED).to_string(), get(&s.frames_skipped).to_string());
         row(t!(COUNTER_ENCODE_MS).to_string(), ms(get(&s.encode_us)));
         row(t!(COUNTER_MUX_MS).to_string(), ms(get(&s.mux_us)));
-        row(
-            t!(COUNTER_SLOT_MS).to_string(),
-            t!(COUNTER_OF_BUDGET, format!("{:.1}", get(&s.slot_us) as f64 / 1e3), budget_us / 1000),
-        );
+        if let Some(budget_us) = 1_000_000u64.checked_div(target) {
+            row(
+                t!(COUNTER_SLOT_MS).to_string(),
+                t!(
+                    COUNTER_OF_BUDGET,
+                    format!("{:.1}", get(&s.slot_us) as f64 / 1e3),
+                    format!("{:.1}", budget_us as f64 / 1e3)
+                ),
+            );
+        } else {
+            row(t!(COUNTER_SLOT_MS).to_string(), ms(get(&s.slot_us)));
+        }
     });
 }
 

@@ -9,22 +9,25 @@
 //! buffers are pooled, the watermark and mouse effects are painted in place and
 //! restored, and previews are only produced while the GUI shows them.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::audio::capture::{open_microphone, open_system_loopback, AudioSource};
+use crate::audio::capture::{
+    open_microphone, open_system_loopback_device, AudioSource, Chunk, Queue, SharedQueue,
+};
 use crate::audio::mixer::Mixer;
-use crate::audio::{create_audio_encoder, AudioFrame};
-use crate::capture::monitors::source_origin;
+use crate::audio::{create_audio_encoder, AudioEncoder, AudioFrame};
+use crate::capture::monitors::{source_origin, source_refresh_hz};
 use crate::capture::{self, CaptureConfig, CaptureHandle, FramePool, LiveRect, Rect, Source};
 use crate::mux::{AudioTrackConfig, Muxer, VideoCodecConfig, VideoTrackConfig};
-use crate::settings::{FormatSettings, SizeMode};
+use crate::settings::{AudioTrackMode, FormatSettings, SizeMode};
 use crate::video::convert::even_dims;
 use crate::video::mouse_fx::{FrameClick, MouseFx, MouseSampler, Patch};
 use crate::video::preview::{PreviewImage, Previewer};
@@ -36,9 +39,11 @@ const PREVIEW_MAX_SIDE: u32 = 640;
 /// Minimum time between two preview images.
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(200);
 /// Audio is mixed this far behind wall-clock so device latency never causes gaps.
-const AUDIO_LAG: Duration = Duration::from_millis(150);
-/// Frame buffers kept in circulation (channel + in flight + last frame).
+const AUDIO_LAG: Duration = Duration::from_millis(200);
+/// Frame buffers kept in circulation (queue + in flight + last frame + pool headroom).
 const POOL_SIZE: usize = 6;
+/// Bounded queue inside [`FrameInbox`] so WGC does not take pool locks on transient bursts.
+const FRAME_QUEUE_CAP: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct RecordConfig {
@@ -47,8 +52,16 @@ pub struct RecordConfig {
     pub mouse_fx: MouseFx,
     pub watermark: Watermark,
     pub system_audio: bool,
+    /// Playback endpoint for loopback capture; `None` picks the system default.
+    pub system_audio_device: Option<String>,
+    /// Linear gain applied to system audio (`1.0` = 100%).
+    pub system_audio_gain: f32,
     /// `Some(None)` = default microphone, `Some(Some(name))` = named device.
     pub microphone: Option<Option<String>>,
+    /// Linear gain applied to the microphone (`1.0` = 100%).
+    pub mic_gain: f32,
+    /// Track layout when recording both system audio and microphone.
+    pub audio_track_mode: AudioTrackMode,
     pub output: PathBuf,
 }
 
@@ -57,8 +70,35 @@ impl RecordConfig {
         self.system_audio || self.microphone.is_some()
     }
 
+    pub fn is_auto_fps(&self) -> bool {
+        self.format.is_auto_fps()
+    }
+
     pub fn fps(&self) -> u32 {
-        self.format.fps.max(1)
+        self.format.effective_fps()
+    }
+}
+
+/// Role assigned to an output audio stream in the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackRole {
+    Mixed,
+    System,
+    Mic,
+}
+
+/// Resolves which audio streams should be created in the container for the
+/// given open sources and multi-track preference.
+pub fn resolve_audio_tracks(has_sys: bool, has_mic: bool, mode: AudioTrackMode) -> Vec<TrackRole> {
+    match (has_sys, has_mic) {
+        (false, false) => Vec::new(),
+        (true, false) => vec![TrackRole::System],
+        (false, true) => vec![TrackRole::Mic],
+        (true, true) => match mode {
+            AudioTrackMode::Mixed => vec![TrackRole::Mixed],
+            AudioTrackMode::Separate => vec![TrackRole::System, TrackRole::Mic],
+            AudioTrackMode::MixedAndSeparate => vec![TrackRole::Mixed, TrackRole::System, TrackRole::Mic],
+        },
     }
 }
 
@@ -90,6 +130,8 @@ impl Origin {
 #[derive(Debug, Default)]
 pub struct Stats {
     pub frames_captured: AtomicU64,
+    /// Frames submitted to the video encoder.
+    pub frames_to_encoder: AtomicU64,
     pub frames_encoded: AtomicU64,
     /// Frames lost because the capture channel was full.
     pub frames_dropped: AtomicU64,
@@ -117,6 +159,8 @@ pub struct Stats {
     pub height: AtomicU64,
     /// Where the output file's timeline starts, in the recording timebase.
     pub stream_start: Origin,
+    /// Recording timestamp when Stop was requested, used to extend the final Auto frame duration.
+    pub stop_pts: Origin,
     pub error: Mutex<Option<String>>,
     pub audio_note: Mutex<Option<String>>,
     /// Encoder / container notes (e.g. a hardware encoder fell back to OpenH264).
@@ -163,7 +207,7 @@ impl Stats {
     /// Zeroes the counters accumulated before the timeline existed (capture
     /// warm-up), so every number the GUI shows describes the recorded file.
     fn reset_pre_roll(&self) {
-        for c in [&self.frames_captured, &self.frames_dropped, &self.frames_superseded] {
+        for c in [&self.frames_captured, &self.frames_to_encoder, &self.frames_dropped, &self.frames_superseded] {
             c.store(0, Ordering::Relaxed);
         }
     }
@@ -230,6 +274,125 @@ impl Drop for TimerResolution {
     }
 }
 
+struct FrameInboxState {
+    queue: VecDeque<RawFrame>,
+    closed: bool,
+}
+
+struct FrameInbox {
+    state: Mutex<FrameInboxState>,
+    cv: Condvar,
+    pool: Arc<FramePool>,
+    stats: Arc<Stats>,
+}
+
+struct FrameSender {
+    inbox: Arc<FrameInbox>,
+}
+
+struct FrameReceiver {
+    inbox: Arc<FrameInbox>,
+}
+
+fn frame_mailbox(pool: Arc<FramePool>, stats: Arc<Stats>) -> (FrameSender, FrameReceiver) {
+    let inbox = Arc::new(FrameInbox {
+        state: Mutex::new(FrameInboxState { queue: VecDeque::with_capacity(FRAME_QUEUE_CAP), closed: false }),
+        cv: Condvar::new(),
+        pool,
+        stats,
+    });
+    (FrameSender { inbox: inbox.clone() }, FrameReceiver { inbox })
+}
+
+impl FrameSender {
+    /// Enqueues `frame`. Only when the bounded queue reaches `FRAME_QUEUE_CAP`
+    /// is the oldest unconsumed frame evicted and recycled, keeping WGC free of
+    /// pool mutex contention during normal bursts while never dropping newer
+    /// incoming frames. Returns `false` once the receiver has hung up.
+    fn send(&self, frame: RawFrame) -> bool {
+        let mut guard = self.inbox.state.lock().unwrap();
+        if guard.closed {
+            drop(guard);
+            self.inbox.pool.recycle(frame.data);
+            return false;
+        }
+        let evicted = (guard.queue.len() >= FRAME_QUEUE_CAP).then(|| guard.queue.pop_front()).flatten();
+        guard.queue.push_back(frame);
+        drop(guard);
+        if let Some(old) = evicted {
+            self.inbox.stats.frames_superseded.fetch_add(1, Ordering::Relaxed);
+            self.inbox.pool.recycle(old.data);
+        }
+        self.inbox.cv.notify_one();
+        true
+    }
+}
+
+impl Drop for FrameSender {
+    fn drop(&mut self) {
+        let mut guard = self.inbox.state.lock().unwrap();
+        guard.closed = true;
+        drop(guard);
+        self.inbox.cv.notify_all();
+    }
+}
+
+impl FrameReceiver {
+    fn try_recv(&self) -> std::result::Result<RawFrame, TryRecvError> {
+        let mut guard = self.inbox.state.lock().unwrap();
+        if let Some(f) = guard.queue.pop_front() {
+            Ok(f)
+        } else if guard.closed {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> std::result::Result<RawFrame, RecvTimeoutError> {
+        let mut guard = self.inbox.state.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(f) = guard.queue.pop_front() {
+                return Ok(f);
+            }
+            if guard.closed {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            let (next_guard, res) = self.inbox.cv.wait_timeout(guard, rem).unwrap();
+            guard = next_guard;
+            if res.timed_out() && guard.queue.is_empty() && !guard.closed {
+                return Err(RecvTimeoutError::Timeout);
+            }
+        }
+    }
+}
+
+impl Drop for FrameReceiver {
+    fn drop(&mut self) {
+        let mut guard = self.inbox.state.lock().unwrap();
+        guard.closed = true;
+        let leftovers: Vec<_> = guard.queue.drain(..).collect();
+        drop(guard);
+        for f in leftovers {
+            self.inbox.pool.recycle(f.data);
+        }
+        self.inbox.cv.notify_all();
+    }
+}
+
+/// Ensures presentation timestamps are strictly monotonic (`pts > prev`).
+fn monotonic_pts(prev: Option<Duration>, pts: Duration) -> Duration {
+    match prev {
+        Some(p) if pts <= p => p + Duration::from_micros(100),
+        _ => pts,
+    }
+}
+
 pub struct Recorder {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -268,8 +431,18 @@ impl Recorder {
         let preview_visible = Arc::new(AtomicBool::new(false));
         let pool = FramePool::new(POOL_SIZE);
 
-        let (video_tx, video_rx) = mpsc::sync_channel::<RawFrame>(4);
-        let (audio_tx, audio_rx) = mpsc::sync_channel::<AudioFrame>(256);
+        let monitor_hz = config.is_auto_fps().then(|| source_refresh_hz(&config.source)).flatten();
+        let nominal_fps = if config.is_auto_fps() {
+            config.format.effective_fps_for(monitor_hz)
+        } else {
+            config.fps()
+        };
+        if config.is_auto_fps() {
+            log::info!("auto fps: monitor refresh {monitor_hz:?} Hz -> nominal encoder fps {nominal_fps}");
+        }
+
+        let (video_tx, video_rx) = frame_mailbox(pool.clone(), stats.clone());
+        let (audio_tx, audio_rx) = mpsc::sync_channel::<(usize, AudioFrame)>(512);
 
         let sampler = config.mouse_fx.any_overlay().then(|| Arc::new(Mutex::new(MouseSampler::new())));
         // A region recording keeps its crop rect shared so `set_region` can move
@@ -282,11 +455,19 @@ impl Recorder {
         // overlap opening the audio devices instead of following them, so the
         // file starts sooner after the button press. On any error below the
         // handle drops and its `Drop` stops the backend.
-        let capture =
-            start_capture(&config, epoch, video_tx, stats.clone(), sampler.clone(), pool.clone(), region.clone())?;
+        let capture = start_capture(
+            &config,
+            nominal_fps,
+            epoch,
+            video_tx,
+            stats.clone(),
+            sampler.clone(),
+            pool.clone(),
+            region.clone(),
+        )?;
 
-        let (audio_thread, audio_cfg) = if config.wants_audio() {
-            let (handle, cfg) = spawn_audio_thread(AudioArgs {
+        let (audio_thread, audio_cfgs) = if config.wants_audio() {
+            let (handle, cfgs) = spawn_audio_thread(AudioArgs {
                 config: config.clone(),
                 epoch,
                 stop: stop.clone(),
@@ -295,18 +476,19 @@ impl Recorder {
                 tx: audio_tx,
                 stats: stats.clone(),
             })?;
-            (Some(handle), Some(cfg))
+            (Some(handle), cfgs)
         } else {
             drop(audio_tx);
-            (None, None)
+            (None, Vec::new())
         };
 
         let encode_thread = spawn_encode_thread(EncodeArgs {
             config: config.clone(),
+            nominal_fps,
             epoch,
             video_rx,
             audio_rx,
-            audio_cfg,
+            audio_cfgs,
             stop: stop.clone(),
             paused: paused.clone(),
             paused_total: paused_total_us.clone(),
@@ -409,6 +591,7 @@ impl Recorder {
     /// Stops recording and finalizes the file.
     pub fn stop(mut self) -> Result<PathBuf> {
         self.resume();
+        self.stats.stop_pts.set(self.recording_now());
         self.stop.store(true, Ordering::SeqCst);
         if let Some(capture) = self.capture.take()
             && let Err(e) = capture.stop()
@@ -451,16 +634,17 @@ impl Drop for Recorder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_capture(
     config: &RecordConfig,
+    nominal_fps: u32,
     epoch: Instant,
-    tx: SyncSender<RawFrame>,
+    tx: FrameSender,
     stats: Arc<Stats>,
     sampler: Option<Arc<Mutex<MouseSampler>>>,
     pool: Arc<FramePool>,
     region: Option<LiveRect>,
 ) -> Result<CaptureHandle> {
-    let sink_pool = pool.clone();
     let note_stats = stats.clone();
     let sink: capture::FrameSink = Box::new(move |mut frame| {
         stats.frames_captured.fetch_add(1, Ordering::Relaxed);
@@ -469,20 +653,20 @@ fn start_capture(
         if let Some(s) = &sampler {
             frame.mouse = Some(s.lock().unwrap().snapshot());
         }
-        match tx.try_send(frame) {
-            Ok(()) => true,
-            Err(TrySendError::Full(f)) => {
-                stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
-                sink_pool.recycle(f.data);
-                true
-            }
-            Err(TrySendError::Disconnected(_)) => false,
-        }
+        tx.send(frame)
     });
+    let capture_fps = if config.is_auto_fps() {
+        match config.source {
+            Source::Game { .. } => nominal_fps,
+            _ => 0,
+        }
+    } else {
+        config.fps()
+    };
     let mut handle = capture::start(
         CaptureConfig {
             source: config.source.clone(),
-            fps: config.fps(),
+            fps: capture_fps,
             show_cursor: config.mouse_fx.native_cursor(),
             pool: Some(pool),
             live_region: region,
@@ -562,20 +746,28 @@ impl FrameClock {
 
     /// After a pause: continue with the slot nearest to `now` (never backwards).
     pub fn resync(&mut self, now: Duration) {
-        let now = now.as_nanos() as u64;
-        if now > self.pts0_ns {
-            let k = ((now - self.pts0_ns) * self.fps + NS / 2) / NS;
-            self.next = self.next.max(k);
+        self.snap_to_pts(now);
+    }
+
+    /// Advances `next` to the slot nearest to `pts` without moving backwards,
+    /// so resuming after a static pause in Auto mode stays aligned to the grid
+    /// without counting idle time as skipped slots.
+    pub fn snap_to_pts(&mut self, pts: Duration) {
+        let pts_ns = pts.as_nanos() as u64;
+        if pts_ns > self.pts0_ns {
+            let k = ((pts_ns - self.pts0_ns) as u128 * self.fps as u128 + (NS / 2) as u128) / NS as u128;
+            self.next = self.next.max(k as u64);
         }
     }
 }
 
 struct EncodeArgs {
     config: RecordConfig,
+    nominal_fps: u32,
     epoch: Instant,
-    video_rx: Receiver<RawFrame>,
-    audio_rx: Receiver<AudioFrame>,
-    audio_cfg: Option<AudioTrackConfig>,
+    video_rx: FrameReceiver,
+    audio_rx: Receiver<(usize, AudioFrame)>,
+    audio_cfgs: Vec<AudioTrackConfig>,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     paused_total: Arc<AtomicU64>,
@@ -605,10 +797,11 @@ fn spawn_encode_thread(args: EncodeArgs) -> Result<JoinHandle<Result<()>>> {
 fn encode_loop(args: EncodeArgs) -> Result<()> {
     let EncodeArgs {
         config,
+        nominal_fps,
         epoch,
         video_rx,
         audio_rx,
-        mut audio_cfg,
+        audio_cfgs,
         stop,
         paused,
         paused_total,
@@ -620,32 +813,15 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
         pool,
         region,
     } = args;
+    let mut audio_cfgs = Some(audio_cfgs);
     // Recording-time clock: wall time since epoch minus paused time.
     let paused_dur = || Duration::from_micros(paused_total.load(Ordering::Relaxed));
     let rec_now = || epoch.elapsed().saturating_sub(paused_dur());
-    let fps = config.fps();
-
-    let mut state: Option<EncodeState> = None;
-    let mut clock: Option<FrameClock> = None;
-    // Newest captured frame waiting for its slot.
-    let mut newest: Option<RawFrame> = None;
-    let mut origin = source_origin(&config.source).unwrap_or((0, 0));
-    // A dragged region moves under us: resolve its monitor's corner once and add
-    // the live offset per frame instead of re-querying the monitor list.
-    let region_origin = match (&config.source, &region) {
-        (Source::Region { monitor_id, .. }, Some(_)) => source_origin(&Source::Monitor { id: *monitor_id }).ok(),
-        _ => None,
-    };
-    let mut frames_since_origin = 0u32;
-    let mut was_paused = false;
-    let mut last_preview = Instant::now() - PREVIEW_INTERVAL;
-    let mut last_report = Instant::now();
-    let mut disconnected = false;
 
     let push_audio = |mux: &mut Muxer, stats: &Stats| -> Result<()> {
         if mux.has_audio() {
-            while let Ok(f) = audio_rx.try_recv() {
-                mux.push_audio(&f)?;
+            while let Ok((track, f)) = audio_rx.try_recv() {
+                mux.push_audio_track(track, &f)?;
                 stats.audio_frames.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -658,268 +834,529 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
         }
     };
 
-    loop {
+    // Wait for the very first captured frame, which defines the timeline origin
+    // and the resolution everything downstream is built around.
+    let mut first_frame: Option<RawFrame> = None;
+    while first_frame.is_none() {
         let stopping = stop.load(Ordering::Relaxed);
-        // ----- pause: discard what arrives, keep the timeline frozen -----
         if paused.load(Ordering::Relaxed) && !stopping {
-            was_paused = true;
             match video_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(f) => pool.recycle(f.data),
-                Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            if let Some(st) = state.as_mut() {
-                push_audio(&mut st.mux, &stats)?;
-            }
-            if disconnected {
-                break;
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
             }
             continue;
         }
-        if was_paused {
-            was_paused = false;
-            // Frames queued before the pause ended belong to paused time.
-            while let Ok(f) = video_rx.try_recv() {
-                pool.recycle(f.data);
-            }
-            if let Some(f) = newest.take() {
-                pool.recycle(f.data);
-            }
-            if let Some(c) = clock.as_mut() {
-                c.resync(rec_now());
-            }
-        }
-
-        // ----- collect frames until the next slot deadline -----
-        let Some(c) = clock.as_ref() else {
-            // Waiting for the very first frame, which defines the timeline origin.
-            match video_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(mut f) => {
-                    // The channel may hold frames captured while the audio
-                    // devices were opening. Anchor on the newest: a stale pts0
-                    // would make `catch_up` skip slots on the first iteration.
-                    while let Ok(newer) = video_rx.try_recv() {
-                        pool.recycle(std::mem::take(&mut f.data));
-                        f = newer;
-                    }
-                    f.pts = f.pts.saturating_sub(paused_dur());
-                    log::info!(
-                        "timeline starts at {:.0} ms (capture latency {:.0} ms)",
-                        f.pts.as_secs_f64() * 1e3,
-                        rec_now().saturating_sub(f.pts).as_secs_f64() * 1e3
-                    );
-                    let st = EncodeState::new(&config, &f, audio_cfg.take(), &stats)?;
-                    stats.width.store(st.dims.0 as u64, Ordering::Relaxed);
-                    stats.height.store(st.dims.1 as u64, Ordering::Relaxed);
-                    stats.target_fps.store(fps as u64, Ordering::Relaxed);
-                    state = Some(st);
-                    clock = Some(FrameClock::new(fps, f.pts));
-                    // Counters so far describe the warm-up, not the file.
-                    stats.reset_pre_roll();
-                    stats.stream_start.set(f.pts);
-                    newest = Some(f);
+        match video_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(mut f) => {
+                // Drain if a newer frame arrived right as we woke up.
+                while let Ok(newer) = video_rx.try_recv() {
+                    pool.recycle(std::mem::take(&mut f.data));
+                    f = newer;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if stopping {
+                f.pts = f.pts.saturating_sub(paused_dur());
+                log::info!(
+                    "timeline starts at {:.0} ms (capture latency {:.0} ms)",
+                    f.pts.as_secs_f64() * 1e3,
+                    rec_now().saturating_sub(f.pts).as_secs_f64() * 1e3
+                );
+                first_frame = Some(f);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if stopping {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let Some(first) = first_frame else {
+        return Err(anyhow!("no frames were captured"));
+    };
+
+    let (mut prep, mut core, conv1, conv2, resolved_fps) =
+        init_encode_pipeline(&config, nominal_fps, &first, audio_cfgs.take().unwrap_or_default(), &stats)?;
+    let slot_interval = Duration::from_nanos(NS / resolved_fps.max(1) as u64);
+    stats.width.store(prep.dims.0 as u64, Ordering::Relaxed);
+    stats.height.store(prep.dims.1 as u64, Ordering::Relaxed);
+    let is_auto = config.is_auto_fps();
+    stats.target_fps.store(resolved_fps as u64, Ordering::Relaxed);
+    // Counters so far describe the warm-up, not the file.
+    stats.reset_pre_roll();
+    stats.stream_start.set(first.pts);
+
+    enum PreparedSlot {
+        Converted {
+            slot: u64,
+            pts: Duration,
+            prep_us: u64,
+            conv: Converter,
+        },
+        RepeatPrev {
+            slot: u64,
+            pts: Duration,
+            prep_us: u64,
+        },
+    }
+
+    let (prep_tx, prep_rx) = mpsc::sync_channel::<PreparedSlot>(1);
+    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Converter>(2);
+    recycle_tx.send(conv1).expect("recycle channel has capacity 2");
+    recycle_tx.send(conv2).expect("recycle channel has capacity 2");
+    let abort_prep = Arc::new(AtomicBool::new(false));
+    let mut clock = FrameClock::new(resolved_fps, first.pts);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut origin = source_origin(&config.source).unwrap_or((0, 0));
+        // A dragged region moves under us: resolve its monitor's corner once and add
+        // the live offset per frame instead of re-querying the monitor list.
+        let region_origin = match (&config.source, &region) {
+            (Source::Region { monitor_id, .. }, Some(_)) => source_origin(&Source::Monitor { id: *monitor_id }).ok(),
+            _ => None,
+        };
+        let prep_stop = stop.clone();
+        let prep_paused = paused.clone();
+        let prep_abort = abort_prep.clone();
+        let prep_stats = stats.clone();
+        let prep_config = &config;
+        let prep_preview = &preview;
+        let prep_preview_visible = &preview_visible;
+        let prep_on_preview = &on_preview;
+        let prep_sampler = &sampler;
+        let prep_pool = &pool;
+        let prep_region = &region;
+
+        let prep_handle = std::thread::Builder::new()
+            .name("openclip-prep".into())
+            .spawn_scoped(scope, move || -> Result<()> {
+                let mut newest: Option<RawFrame> = Some(first);
+                let mut frames_since_origin = 0u32;
+                let mut was_paused = false;
+                let mut auto_idle = false;
+                let mut last_preview = Instant::now() - PREVIEW_INTERVAL;
+                let mut disconnected = false;
+                let mut prep_err: Option<anyhow::Error> = None;
+
+                loop {
+                    let stopping = prep_stop.load(Ordering::Relaxed);
+                    if prep_abort.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // ----- pause: discard what arrives, keep the timeline frozen -----
+                    if prep_paused.load(Ordering::Relaxed) && !stopping {
+                        was_paused = true;
+                        match video_rx.recv_timeout(Duration::from_millis(20)) {
+                            Ok(f) => prep_pool.recycle(f.data),
+                            Err(RecvTimeoutError::Disconnected) => disconnected = true,
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
+                        if disconnected {
+                            break;
+                        }
+                        continue;
+                    }
+                    if was_paused {
+                        was_paused = false;
+                        auto_idle = false;
+                        // Frames queued before the pause ended belong to paused time.
+                        while let Ok(f) = video_rx.try_recv() {
+                            prep_pool.recycle(f.data);
+                        }
+                        if let Some(f) = newest.take() {
+                            prep_pool.recycle(f.data);
+                        }
+                        clock.resync(rec_now());
+                    }
+
+                    // ----- collect frames until ready -----
+                    let mut force_fx_frame = false;
+                    if is_auto && auto_idle {
+                        while let Ok(mut f) = video_rx.try_recv() {
+                            f.pts = f.pts.saturating_sub(paused_dur());
+                            take_newest(&mut newest, f, prep_pool, &prep_stats);
+                        }
+                        while newest.is_none()
+                            && !prep_stop.load(Ordering::Relaxed)
+                            && !disconnected
+                            && !prep_abort.load(Ordering::Relaxed)
+                        {
+                            let fx_animating = prep.frame.is_some()
+                                && prep_sampler.is_some()
+                                && (!prep_config.mouse_fx.native_cursor() || prep.has_active_clicks());
+                            let wait_dur = if fx_animating {
+                                Duration::from_millis(16)
+                            } else {
+                                Duration::from_millis(50)
+                            };
+                            match video_rx.recv_timeout(wait_dur) {
+                                Ok(mut f) => {
+                                    f.pts = f.pts.saturating_sub(paused_dur());
+                                    take_newest(&mut newest, f, prep_pool, &prep_stats);
+                                }
+                                Err(RecvTimeoutError::Timeout) => {
+                                    if prep_paused.load(Ordering::Relaxed) || prep_stop.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    // Keep non-native cursor or active click ripples animating even
+                                    // if WGC is idle, without duplicating static frames otherwise.
+                                    if fx_animating && let Some(s) = prep_sampler {
+                                        let snap = s.lock().unwrap().snapshot();
+                                        let (cursor, clicks) = snap.mapped(origin, prep.fx_scale);
+                                        if prep.fx_changed(cursor, &clicks) {
+                                            if let Some(frame) = prep.frame.as_mut() {
+                                                frame.mouse = Some(snap);
+                                            }
+                                            force_fx_frame = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(RecvTimeoutError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(f) = newest.as_ref() {
+                            let wake_now = rec_now();
+                            // If Readback flushed an older pre-idle staged frame, anchor at wall time
+                            // so returning from static idle does not trigger fake `slots_skipped`.
+                            let snap_pts = if wake_now.saturating_sub(f.pts) > slot_interval * 2 {
+                                wake_now
+                            } else {
+                                f.pts
+                            };
+                            clock.snap_to_pts(snap_pts);
+                            auto_idle = false;
+                        } else if force_fx_frame {
+                            clock.snap_to_pts(rec_now());
+                            auto_idle = false;
+                        }
+                    }
+                    if !is_auto || (!auto_idle && !force_fx_frame) {
+                        let deadline = clock.deadline(clock.next);
+                        loop {
+                            match video_rx.try_recv() {
+                                Ok(mut f) => {
+                                    f.pts = f.pts.saturating_sub(paused_dur());
+                                    take_newest(&mut newest, f, prep_pool, &prep_stats);
+                                }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        loop {
+                            let now = rec_now();
+                            if now >= deadline
+                                || stopping
+                                || prep_stop.load(Ordering::Relaxed)
+                                || disconnected
+                                || prep_abort.load(Ordering::Relaxed)
+                            {
+                                break;
+                            }
+                            let wait = (deadline - now).min(Duration::from_millis(50));
+                            match video_rx.recv_timeout(wait) {
+                                Ok(mut f) => {
+                                    f.pts = f.pts.saturating_sub(paused_dur());
+                                    take_newest(&mut newest, f, prep_pool, &prep_stats);
+                                }
+                                Err(RecvTimeoutError::Timeout) => {
+                                    if rec_now() >= deadline {
+                                        break;
+                                    }
+                                }
+                                Err(RecvTimeoutError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if prep_abort.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let stopping = stopping || prep_stop.load(Ordering::Relaxed);
+                    if stopping || disconnected {
+                        // Take whatever is still queued so the last captured frame is not lost.
+                        while let Ok(mut f) = video_rx.try_recv() {
+                            f.pts = f.pts.saturating_sub(paused_dur());
+                            take_newest(&mut newest, f, prep_pool, &prep_stats);
+                        }
+                        if is_auto && auto_idle && let Some(f) = newest.as_ref() {
+                            let wake_now = rec_now();
+                            let snap_pts = if wake_now.saturating_sub(f.pts) > slot_interval * 2 {
+                                wake_now
+                            } else {
+                                f.pts
+                            };
+                            clock.snap_to_pts(snap_pts);
+                            auto_idle = false;
+                        }
+                    }
+
+                    // ----- prepare one slot (scale + overlays + YUV conversion) -----
+                    let now = rec_now();
+                    let have_new = newest.is_some();
+                    if stopping && !have_new && !force_fx_frame {
+                        break;
+                    }
+                    if is_auto && !have_new && !force_fx_frame {
+                        auto_idle = true;
+                        continue;
+                    }
+                    let skipped = if is_auto && force_fx_frame { 0 } else { clock.catch_up(now) };
+                    if skipped > 0 {
+                        prep_stats.slots_skipped.fetch_add(skipped, Ordering::Relaxed);
+                    }
+                    if !have_new && clock.due(now) == 0 && !(is_auto && force_fx_frame) {
+                        continue;
+                    }
+
+                    let p0 = Instant::now();
+                    let slot = clock.next;
+                    let pts = clock.slot_pts(slot);
+                    if let Some(f) = newest.take() {
+                        prep.accept(f, prep_pool, &prep_stats);
+                    } else {
+                        prep_stats.frames_repeated.fetch_add(1, Ordering::Relaxed);
+                        // The screen is static but the pointer may move: sample now.
+                        if let (Some(s), Some(fx)) = (prep_sampler, prep.frame.as_mut()) {
+                            fx.mouse = Some(s.lock().unwrap().snapshot());
+                        }
+                    }
+                    let snap = prep.frame.as_mut().expect("frame present after accept").mouse.take();
+
+                    // Overlays: paint in place, convert, restore — no frame copy.
+                    let mut fx = None;
+                    if let Some(snap) = snap.filter(|_| prep_sampler.is_some()) {
+                        if let (Some(base), Some(live)) = (region_origin, prep_region) {
+                            let r = live.get();
+                            origin = (base.0 + r.x as i32, base.1 + r.y as i32);
+                        } else if matches!(prep_config.source, Source::Window { .. }) {
+                            frames_since_origin += 1;
+                            if frames_since_origin >= 30 {
+                                frames_since_origin = 0;
+                                if let Ok(o) = source_origin(&prep_config.source) {
+                                    origin = o;
+                                }
+                            }
+                        }
+                        let (cursor, clicks) = snap.mapped(origin, prep.fx_scale);
+                        let changed = prep.fx_changed(cursor, &clicks);
+                        fx = Some((cursor, clicks, changed));
+                    }
+                    let mut painted = false;
+                    if prep.converted_is_new || fx.as_ref().is_some_and(|(_, _, changed)| *changed) {
+                        let frame = prep.frame.as_mut().unwrap();
+                        if let Some(wm) = &mut prep.watermark {
+                            wm.paint(&prep_config.watermark, frame, &mut prep.patches);
+                        }
+                        if let Some((cursor, clicks, _)) = &fx {
+                            let scale = prep.fx_scale.0.min(prep.fx_scale.1);
+                            prep_config.mouse_fx.paint(frame, *cursor, clicks, scale, &mut prep.patches);
+                        }
+                        painted = !prep.patches.is_empty();
+                    }
+                    if let Some((cursor, clicks, _)) = fx {
+                        prep.last_fx = Some((cursor, clicks));
+                    }
+
+                    let need_convert = prep.converted_is_new || painted;
+                    let mut converted = None;
+                    if need_convert {
+                        let Ok(mut conv) = recycle_rx.recv() else {
+                            break;
+                        };
+                        if let Err(e) = conv.convert(prep.frame.as_ref().unwrap()) {
+                            prep_err = Some(e);
+                            break;
+                        }
+                        prep.converted_is_new = false;
+                        converted = Some(conv);
+                    }
+                    let convert_done = Instant::now();
+
+                    // Build GUI preview while overlays are still painted (skipped if behind).
+                    if prep_preview_visible.load(Ordering::Relaxed)
+                        && p0.duration_since(last_preview) >= PREVIEW_INTERVAL
+                        && (is_auto || clock.due(rec_now()) == 0)
+                    {
+                        last_preview = p0;
+                        let img = prep.previewer.make(prep.frame.as_ref().unwrap());
+                        *prep_preview.image.lock().unwrap() = Some(img);
+                        if let Some(cb) = prep_on_preview {
+                            cb();
+                        }
+                    }
+
+                    // Restore overlay patches immediately now that both YUV conversion
+                    // and preview took their snapshot, keeping the reusable frame clean.
+                    let r0 = Instant::now();
+                    if painted {
+                        MouseFx::restore(prep.frame.as_mut().unwrap(), &mut prep.patches);
+                    }
+                    let prep_us = (convert_done - p0 + r0.elapsed()).as_micros() as u64;
+
+                    let msg = match converted {
+                        Some(conv) => PreparedSlot::Converted { slot, pts, prep_us, conv },
+                        None => PreparedSlot::RepeatPrev { slot, pts, prep_us },
+                    };
+                    if prep_tx.send(msg).is_err() {
+                        break;
+                    }
+                    clock.next += 1;
+                    if disconnected && newest.is_none() {
                         break;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+
+                if let Some(f) = newest.take() {
+                    prep_pool.recycle(f.data);
+                }
+                if let Some(f) = prep.frame.take() {
+                    prep_pool.recycle(f.data);
+                }
+                drop(prep_tx);
+                match prep_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            })?;
+
+        let mut last_conv: Option<Converter> = None;
+        let mut last_report = Instant::now();
+        let mut last_sec_report = Instant::now();
+        let mut prev_cap = stats.frames_captured.load(Ordering::Relaxed);
+        let mut prev_enc_in = stats.frames_to_encoder.load(Ordering::Relaxed);
+        let mut prev_drop = stats.frames_dropped.load(Ordering::Relaxed);
+        let mut prev_sup = stats.frames_superseded.load(Ordering::Relaxed);
+        let mut maybe_log_sec = || {
+            let dt = last_sec_report.elapsed();
+            if dt >= Duration::from_secs(1) {
+                let cur_cap = stats.frames_captured.load(Ordering::Relaxed);
+                let cur_enc_in = stats.frames_to_encoder.load(Ordering::Relaxed);
+                let cur_drop = stats.frames_dropped.load(Ordering::Relaxed);
+                let cur_sup = stats.frames_superseded.load(Ordering::Relaxed);
+                log::info!(
+                    "1s rates ({:.2} s): wgc {} encoder_in {} dropped {} superseded {}",
+                    dt.as_secs_f64(),
+                    cur_cap.saturating_sub(prev_cap),
+                    cur_enc_in.saturating_sub(prev_enc_in),
+                    cur_drop.saturating_sub(prev_drop),
+                    cur_sup.saturating_sub(prev_sup),
+                );
+                prev_cap = cur_cap;
+                prev_enc_in = cur_enc_in;
+                prev_drop = cur_drop;
+                prev_sup = cur_sup;
+                last_sec_report = Instant::now();
             }
-            continue;
         };
-        let deadline = c.deadline(c.next);
-        // Frames that arrived while the previous slot was being encoded.
-        loop {
-            match video_rx.try_recv() {
-                Ok(mut f) => {
-                    f.pts = f.pts.saturating_sub(paused_dur());
-                    take_newest(&mut newest, f, &pool, &stats);
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        loop {
-            let now = rec_now();
-            if now >= deadline || stopping || disconnected {
-                break;
-            }
-            match video_rx.recv_timeout(deadline - now) {
-                Ok(mut f) => {
-                    f.pts = f.pts.saturating_sub(paused_dur());
-                    take_newest(&mut newest, f, &pool, &stats);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        if stopping || disconnected {
-            // Take whatever is still queued so the last captured frame is not lost.
-            while let Ok(mut f) = video_rx.try_recv() {
-                f.pts = f.pts.saturating_sub(paused_dur());
-                take_newest(&mut newest, f, &pool, &stats);
-            }
-        }
 
-        // ----- encode one slot -----
-        let st = state.as_mut().unwrap();
-        let c = clock.as_mut().unwrap();
-        let now = rec_now();
-        let skipped = c.catch_up(now);
-        if skipped > 0 {
-            stats.slots_skipped.fetch_add(skipped, Ordering::Relaxed);
-        }
-        let have_new = newest.is_some();
-        if stopping && !have_new {
-            break;
-        }
-        if !have_new && c.due(now) == 0 {
-            // Woken early (stop during pause etc.): nothing to do yet.
-            continue;
-        }
-        let t0 = Instant::now();
-        let slot = c.next;
-        let pts = c.slot_pts(slot);
-        if let Some(f) = newest.take() {
-            st.accept(f, &pool, &stats);
-        } else {
-            stats.frames_repeated.fetch_add(1, Ordering::Relaxed);
-            // The screen is static but the pointer may move: sample now.
-            if let (Some(s), Some(fx)) = (&sampler, st.frame.as_mut()) {
-                fx.mouse = Some(s.lock().unwrap().snapshot());
-            }
-        }
-        let snap = st.frame.as_mut().expect("frame present after accept").mouse.take();
+        let encode_res = (|| -> Result<()> {
+            loop {
+                match prep_rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(item) => {
+                        let (slot, pts, prep_us, new_conv) = match item {
+                            PreparedSlot::Converted { slot, pts, prep_us, conv } => (slot, pts, prep_us, Some(conv)),
+                            PreparedSlot::RepeatPrev { slot, pts, prep_us } => (slot, pts, prep_us, None),
+                        };
+                        let e0 = Instant::now();
+                        if let Some(conv) = new_conv
+                            && let Some(old) = last_conv.replace(conv)
+                        {
+                            // Return the previous converter before starting GPU encode
+                            // so `openclip-prep` can convert the next frame concurrently.
+                            let _ = recycle_tx.send(old);
+                        }
+                        let conv = last_conv.as_ref().expect("first prepared slot is converted");
+                        stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                        let encoded = core.encoder.encode(conv.frame(), pts)?;
+                        let e1 = Instant::now();
+                        if encoded.is_empty() {
+                            stats.frames_skipped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        for enc in encoded {
+                            core.push(&enc, &stats)?;
+                        }
+                        let e2 = Instant::now();
+                        stats.slots_done.fetch_add(1, Ordering::Relaxed);
+                        push_audio(&mut core.mux, &stats)?;
+                        let e3 = Instant::now();
 
-        // Overlays: paint in place, convert, restore — no frame copy. Deciding
-        // is kept apart from painting because the watermark has to be painted
-        // even when the mouse sampler is off (the common case).
-        let mut fx = None;
-        if let Some(snap) = snap.filter(|_| sampler.is_some()) {
-            if let (Some(base), Some(live)) = (region_origin, &region) {
-                let r = live.get();
-                origin = (base.0 + r.x as i32, base.1 + r.y as i32);
-            } else if matches!(config.source, Source::Window { .. }) {
-                frames_since_origin += 1;
-                if frames_since_origin >= 30 {
-                    frames_since_origin = 0;
-                    if let Ok(o) = source_origin(&config.source) {
-                        origin = o;
+                        let encode_us = (e1 - e0).as_micros() as u64;
+                        let mux_us = (e2 - e1).as_micros() as u64;
+                        let encode_stage_us = (e3 - e0).as_micros() as u64;
+                        let bottleneck_us = prep_us.max(encode_stage_us);
+                        Stats::rolling(&stats.encode_us, encode_us);
+                        Stats::rolling(&stats.mux_us, mux_us);
+                        Stats::rolling(&stats.slot_us, bottleneck_us);
+
+                        if Duration::from_micros(bottleneck_us) > slot_interval * 2 {
+                            log::warn!(
+                                "slow slot {slot}: prepare {:.1} ms, encode {:.1} ms, mux {:.1} ms",
+                                prep_us as f64 / 1e3,
+                                (e1 - e0).as_secs_f64() * 1e3,
+                                (e2 - e1).as_secs_f64() * 1e3
+                            );
+                        }
+                        maybe_log_sec();
+                        if last_report.elapsed() >= Duration::from_secs(5) {
+                            last_report = Instant::now();
+                            log::info!(
+                                "slot {slot}: captured {} encoded {} dropped {} slots skipped {} repeated {} superseded {} | encode {:.1} ms, slot {:.1} ms",
+                                stats.frames_captured.load(Ordering::Relaxed),
+                                stats.frames_encoded.load(Ordering::Relaxed),
+                                stats.frames_dropped.load(Ordering::Relaxed),
+                                stats.slots_skipped.load(Ordering::Relaxed),
+                                stats.frames_repeated.load(Ordering::Relaxed),
+                                stats.frames_superseded.load(Ordering::Relaxed),
+                                stats.encode_us.load(Ordering::Relaxed) as f64 / 1e3,
+                                stats.slot_us.load(Ordering::Relaxed) as f64 / 1e3
+                            );
+                        }
                     }
+                    Err(RecvTimeoutError::Timeout) => {
+                        push_audio(&mut core.mux, &stats)?;
+                        maybe_log_sec();
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            let (cursor, clicks) = snap.mapped(origin, st.fx_scale);
-            let changed = st.fx_changed(cursor, &clicks);
-            fx = Some((cursor, clicks, changed));
-        }
-        // An unchanged repeat needs neither: the converted frame still carries
-        // both overlays from the slot that produced it.
-        let mut painted = false;
-        if st.converted_is_new || fx.as_ref().is_some_and(|(_, _, changed)| *changed) {
-            let frame = st.frame.as_mut().unwrap();
-            if let Some(wm) = &mut st.watermark {
-                wm.paint(&config.watermark, frame, &mut st.patches);
-            }
-            if let Some((cursor, clicks, _)) = &fx {
-                let scale = st.fx_scale.0.min(st.fx_scale.1);
-                config.mouse_fx.paint(frame, *cursor, clicks, scale, &mut st.patches);
-            }
-            painted = !st.patches.is_empty();
-        }
-        if let Some((cursor, clicks, _)) = fx {
-            st.last_fx = Some((cursor, clicks));
-        }
-        if st.converted_is_new || painted {
-            st.converter.convert(st.frame.as_ref().unwrap())?;
-            st.converted_is_new = false;
-        }
-        let t1 = Instant::now();
-        let encoded = st.encoder.encode(st.converter.frame(), pts)?;
-        let t2 = Instant::now();
-        if encoded.is_empty() {
-            stats.frames_skipped.fetch_add(1, Ordering::Relaxed);
-        }
-        for enc in encoded {
-            st.push(&enc, &stats)?;
-        }
-        let t3 = Instant::now();
-        c.next += 1;
-        stats.slots_done.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })();
 
-        // Skip the preview when already behind: it costs a full downscale and
-        // would push the next slot further past its deadline.
-        if preview_visible.load(Ordering::Relaxed)
-            && t0.duration_since(last_preview) >= PREVIEW_INTERVAL
-            && c.due(rec_now()) == 0
-        {
-            last_preview = t0;
-            let img = st.previewer.make(st.frame.as_ref().unwrap());
-            *preview.image.lock().unwrap() = Some(img);
-            if let Some(cb) = &on_preview {
-                cb();
-            }
-        }
-        // Undone only now, so the preview above shows what went into the file
-        // (watermark and mouse effects included) and the reusable buffer is
-        // still clean for the next repeated slot.
-        if painted {
-            MouseFx::restore(st.frame.as_mut().unwrap(), &mut st.patches);
-        }
-        let t4 = Instant::now();
+        // Wake `openclip-prep` cleanly before joining if `encode_res` exited early.
+        abort_prep.store(true, Ordering::Relaxed);
+        drop(prep_rx);
+        drop(recycle_tx);
+        drop(last_conv);
+        let prep_res = prep_handle.join().map_err(|_| anyhow!("prep thread panicked"))?;
+        encode_res?;
+        prep_res?;
+        Ok(())
+    })?;
 
-        Stats::rolling(&stats.encode_us, (t2 - t1).as_micros() as u64);
-        Stats::rolling(&stats.mux_us, (t3 - t2).as_micros() as u64);
-        // Includes the preview: it runs on this thread and eats the same budget.
-        Stats::rolling(&stats.slot_us, (t4 - t0).as_micros() as u64);
-        if t3 - t0 > c.interval() * 2 {
-            log::warn!(
-                "slow slot {slot}: prepare {:.1} ms, encode {:.1} ms, mux {:.1} ms",
-                (t1 - t0).as_secs_f64() * 1e3,
-                (t2 - t1).as_secs_f64() * 1e3,
-                (t3 - t2).as_secs_f64() * 1e3
-            );
-        }
-        if last_report.elapsed() >= Duration::from_secs(5) {
-            last_report = Instant::now();
-            log::info!(
-                "slot {slot}: captured {} encoded {} dropped {} slots skipped {} repeated {} superseded {} | encode {:.1} ms, slot {:.1} ms",
-                stats.frames_captured.load(Ordering::Relaxed),
-                stats.frames_encoded.load(Ordering::Relaxed),
-                stats.frames_dropped.load(Ordering::Relaxed),
-                stats.slots_skipped.load(Ordering::Relaxed),
-                stats.frames_repeated.load(Ordering::Relaxed),
-                stats.frames_superseded.load(Ordering::Relaxed),
-                stats.encode_us.load(Ordering::Relaxed) as f64 / 1e3,
-                stats.slot_us.load(Ordering::Relaxed) as f64 / 1e3
-            );
-        }
-        push_audio(&mut st.mux, &stats)?;
-        if disconnected && newest.is_none() {
-            break;
-        }
+    for enc in core.encoder.flush()? {
+        core.push(&enc, &stats)?;
     }
-
-    let Some(mut st) = state else {
-        return Err(anyhow!("no frames were captured"));
-    };
-    if let Some(f) = newest.take() {
-        pool.recycle(f.data);
+    if is_auto {
+        let mut end_pts = stats.stop_pts.get().unwrap_or_else(rec_now);
+        if let Some(last_pts) = core.last_video_pts {
+            end_pts = end_pts.max(last_pts + slot_interval);
+        }
+        core.mux.finish_video(end_pts)?;
     }
-    for enc in st.encoder.flush()? {
-        st.push(&enc, &stats)?;
-    }
-    let EncodeState { mut mux, .. } = st;
+    let EncodeCore { mut mux, .. } = core;
     // Audio thread flushes and closes its channel after the stop flag; drain everything.
     if mux.has_audio() {
-        for f in audio_rx.iter() {
-            mux.push_audio(&f)?;
+        for (track, f) in audio_rx.iter() {
+            mux.push_audio_track(track, &f)?;
             stats.audio_frames.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -928,7 +1365,7 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
     Ok(())
 }
 
-struct EncodeState {
+struct PrepState {
     /// Half size uses the exact 2×2 box filter; everything else the scaler.
     half: bool,
     scaler: Option<Scaler>,
@@ -943,14 +1380,10 @@ struct EncodeState {
     frame: Option<RawFrame>,
     /// True when `frame` changed since the converter last saw it.
     converted_is_new: bool,
-    converter: Converter,
-    encoder: Box<dyn VideoEncoder>,
-    mux: Muxer,
     previewer: Previewer,
     dims: (u32, u32),
     /// Encoded-frame / source ratio per axis, for mouse-effect placement.
     fx_scale: (f32, f32),
-    params_sent: bool,
     patches: Vec<Patch>,
     /// Composes the watermark badge once for this recording; `None` when the
     /// badge is off or the bundled artwork could not be loaded.
@@ -958,81 +1391,98 @@ struct EncodeState {
     last_fx: Option<((i32, i32), Vec<FrameClick>)>,
 }
 
-impl EncodeState {
-    fn new(
-        config: &RecordConfig,
-        first: &RawFrame,
-        audio: Option<AudioTrackConfig>,
-        stats: &Stats,
-    ) -> Result<Self> {
-        let fmt = &config.format;
-        let src = (first.width, first.height);
-        let (half, scaled) = match fmt.size {
-            SizeMode::Full => (false, src),
-            SizeMode::Half if src.0 >= 64 && src.1 >= 64 => (true, ((src.0 / 2).max(1), (src.1 / 2).max(1))),
-            SizeMode::Half => (false, src),
-            other => (false, other.resolve(src.0, src.1)),
-        };
-        let dims = even_dims(scaled.0, scaled.1);
-        if dims.0 == 0 || dims.1 == 0 {
-            return Err(anyhow!("frame too small to encode: {}x{}", src.0, src.1));
-        }
-        let req = EncoderRequest {
-            codec: fmt.video_codec.clone(),
-            width: dims.0,
-            height: dims.1,
-            fps: config.fps(),
-            rate_control: fmt.rate_control,
-            target_bitrate_bps: fmt.target_bitrate_kbps(dims.0, dims.1).saturating_mul(1000),
-            keyframe_interval_frames: fmt.keyframe_interval_frames(),
-            profiles: fmt.profiles,
-        };
-        let (encoder, note) = create_video_encoder(&req)?;
-        if let Some(n) = note {
-            stats.add_note(n);
-        }
-        *stats.encoder.lock().unwrap() = Some(encoder.describe());
-        let converter = Converter::new(scaled.0, scaled.1, encoder.input_layout())?;
-        let scaler = (!half && scaled != src).then(|| Scaler::new(src, scaled));
-        let video = VideoTrackConfig {
-            width: dims.0,
-            height: dims.1,
-            fps: config.fps() as f64,
-            codec: if encoder.is_hevc() { VideoCodecConfig::Hevc } else { VideoCodecConfig::H264 },
-        };
-        let mux = Muxer::create(fmt.container, &config.output, video, audio)?;
-        let fx_scale = (dims.0 as f32 / src.0.max(1) as f32, dims.1 as f32 / src.1.max(1) as f32);
-        log::info!(
-            "encoding {}×{} → {}×{} @ {} fps into {} with {}",
-            src.0,
-            src.1,
-            dims.0,
-            dims.1,
-            config.fps(),
-            fmt.container.label(),
-            encoder.describe()
-        );
-        Ok(Self {
-            half,
-            scaler,
-            src,
-            scaled,
-            letterbox: None,
-            frame: None,
-            converted_is_new: false,
-            converter,
-            encoder,
-            mux,
-            previewer: Previewer::new(scaled.0, scaled.1, PREVIEW_MAX_SIDE),
-            dims,
-            fx_scale,
-            params_sent: false,
-            patches: Vec::new(),
-            watermark: config.watermark.any_overlay().then(WatermarkRenderer::new).flatten(),
-            last_fx: None,
-        })
-    }
+struct EncodeCore {
+    encoder: Box<dyn VideoEncoder>,
+    mux: Muxer,
+    params_sent: bool,
+    last_video_pts: Option<Duration>,
+}
 
+fn init_encode_pipeline(
+    config: &RecordConfig,
+    nominal_fps: u32,
+    first: &RawFrame,
+    audio: Vec<AudioTrackConfig>,
+    stats: &Stats,
+) -> Result<(PrepState, EncodeCore, Converter, Converter, u32)> {
+    let fmt = &config.format;
+    let src = (first.width, first.height);
+    let (half, scaled) = match fmt.size {
+        SizeMode::Full => (false, src),
+        SizeMode::Half if src.0 >= 64 && src.1 >= 64 => (true, ((src.0 / 2).max(1), (src.1 / 2).max(1))),
+        SizeMode::Half => (false, src),
+        other => (false, other.resolve(src.0, src.1)),
+    };
+    let dims = even_dims(scaled.0, scaled.1);
+    if dims.0 == 0 || dims.1 == 0 {
+        return Err(anyhow!("frame too small to encode: {}x{}", src.0, src.1));
+    }
+    let make_req = |fps: u32| EncoderRequest {
+        codec: fmt.video_codec.clone(),
+        width: dims.0,
+        height: dims.1,
+        fps,
+        rate_control: fmt.rate_control,
+        target_bitrate_bps: fmt.target_bitrate_kbps_at(dims.0, dims.1, fps).saturating_mul(1000),
+        keyframe_interval_frames: fmt.keyframe_interval_frames_at(fps),
+        profiles: fmt.profiles,
+    };
+    let mut resolved_fps = nominal_fps;
+    let (encoder, note) = match create_video_encoder(&make_req(resolved_fps)) {
+        Ok(res) => res,
+        Err(e) if config.is_auto_fps() && resolved_fps != 60 => {
+            log::warn!("encoder init failed at {resolved_fps} fps ({e:#}); falling back to 60 fps");
+            resolved_fps = 60;
+            create_video_encoder(&make_req(resolved_fps))?
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(n) = note {
+        stats.add_note(n);
+    }
+    *stats.encoder.lock().unwrap() = Some(encoder.describe());
+    let layout = encoder.input_layout();
+    let conv1 = Converter::new(scaled.0, scaled.1, layout)?;
+    let conv2 = Converter::new(scaled.0, scaled.1, layout)?;
+    let scaler = (!half && scaled != src).then(|| Scaler::new(src, scaled));
+    let video = VideoTrackConfig {
+        width: dims.0,
+        height: dims.1,
+        fps: resolved_fps as f64,
+        codec: if encoder.is_hevc() { VideoCodecConfig::Hevc } else { VideoCodecConfig::H264 },
+    };
+    let mux = Muxer::create_multi(fmt.container, &config.output, video, audio)?;
+    let fx_scale = (dims.0 as f32 / src.0.max(1) as f32, dims.1 as f32 / src.1.max(1) as f32);
+    log::info!(
+        "encoding {}×{} → {}×{} @ {} fps into {} with {}",
+        src.0,
+        src.1,
+        dims.0,
+        dims.1,
+        resolved_fps,
+        fmt.container.label(),
+        encoder.describe()
+    );
+    let prep = PrepState {
+        half,
+        scaler,
+        src,
+        scaled,
+        letterbox: None,
+        frame: None,
+        converted_is_new: false,
+        previewer: Previewer::new(scaled.0, scaled.1, PREVIEW_MAX_SIDE),
+        dims,
+        fx_scale,
+        patches: Vec::new(),
+        watermark: config.watermark.any_overlay().then(WatermarkRenderer::new).flatten(),
+        last_fx: None,
+    };
+    let core = EncodeCore { encoder, mux, params_sent: false, last_video_pts: None };
+    Ok((prep, core, conv1, conv2, resolved_fps))
+}
+
+impl PrepState {
     /// Makes `captured` the current frame (scaling into the reusable buffer),
     /// returning consumed buffers to the pool.
     fn accept(&mut self, captured: RawFrame, pool: &FramePool, stats: &Stats) {
@@ -1063,12 +1513,14 @@ impl EncodeState {
             }
             pool.recycle(captured.data);
             self.frame = Some(dst);
-        } else {
-            if let Some(old) = self.frame.replace(captured) {
-                pool.recycle(old.data);
-            }
+        } else if let Some(old) = self.frame.replace(captured) {
+            pool.recycle(old.data);
         }
         self.converted_is_new = true;
+    }
+
+    fn has_active_clicks(&self) -> bool {
+        self.last_fx.as_ref().is_some_and(|(_, clicks)| !clicks.is_empty())
     }
 
     /// Whether the effects would look different from the last painted frame.
@@ -1079,7 +1531,9 @@ impl EncodeState {
             None => true,
         }
     }
+}
 
+impl EncodeCore {
     fn push(&mut self, enc: &EncodedFrame, stats: &Stats) -> Result<()> {
         if !self.params_sent
             && let Some(p) = self.encoder.codec_params()
@@ -1087,7 +1541,9 @@ impl EncodeState {
             self.mux.set_codec_params(p);
             self.params_sent = true;
         }
-        if self.mux.push_video(&enc.data, enc.pts, enc.keyframe)? {
+        let pts = monotonic_pts(self.last_video_pts, enc.pts);
+        if self.mux.push_video(&enc.data, pts, enc.keyframe)? {
+            self.last_video_pts = Some(pts);
             stats.frames_encoded.fetch_add(1, Ordering::Relaxed);
             stats.bytes_written.store(self.mux.bytes_written(), Ordering::Relaxed);
         } else {
@@ -1103,60 +1559,91 @@ struct AudioArgs {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     paused_total: Arc<AtomicU64>,
-    tx: SyncSender<AudioFrame>,
+    tx: SyncSender<(usize, AudioFrame)>,
     stats: Arc<Stats>,
 }
 
-fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, AudioTrackConfig)> {
+struct FanOut {
+    raw: SharedQueue,
+    targets: [SharedQueue; 2],
+}
+
+fn push_capped(q: &mut Queue, chunk: Chunk) {
+    if q.chunks.len() >= 512 {
+        q.chunks.pop_front();
+        q.overflow += 1;
+    }
+    q.chunks.push_back(chunk);
+}
+
+struct TrackPipeline {
+    mixer: Mixer,
+    encoder: Box<dyn AudioEncoder>,
+    channels: usize,
+}
+
+fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, Vec<AudioTrackConfig>)> {
     let AudioArgs { config, epoch, stop, paused, paused_total, tx, stats } = args;
-    // Open devices and create the encoder on the worker thread (Media
+    // Open devices and create the encoders on the worker thread (Media
     // Foundation objects are thread-affine), reporting back before mixing.
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<AudioTrackConfig>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<Vec<AudioTrackConfig>>>();
     let handle = std::thread::Builder::new().name("openclip-audio".into()).spawn(move || {
-        let mut sources: Vec<(AudioSource, f32)> = Vec::new();
+        let clamp_gain = |g: f32| if g.is_finite() { g.clamp(0.0, 2.0) } else { 1.0 };
+        let mut sys_src: Option<(AudioSource, f32)> = None;
+        let mut mic_src: Option<(AudioSource, f32)> = None;
         let mut notes = Vec::new();
         if config.system_audio {
-            match open_system_loopback() {
-                Ok(s) => sources.push((s, 1.0)),
+            match open_system_loopback_device(config.system_audio_device.as_deref()) {
+                Ok(s) => sys_src = Some((s, clamp_gain(config.system_audio_gain))),
                 Err(e) => notes.push(crate::t!(NOTE_SYSTEM_AUDIO_UNAVAILABLE, format!("{e:#}"))),
             }
         }
         if let Some(mic) = &config.microphone {
             match open_microphone(mic.as_deref()) {
-                Ok(s) => sources.push((s, 1.0)),
+                Ok(s) => mic_src = Some((s, clamp_gain(config.mic_gain))),
                 Err(e) => notes.push(crate::t!(NOTE_MIC_UNAVAILABLE, format!("{e:#}"))),
             }
         }
         if !notes.is_empty() {
             *stats.audio_note.lock().unwrap() = Some(notes.join("; "));
         }
-        if sources.is_empty() {
+        let roles = resolve_audio_tracks(sys_src.is_some(), mic_src.is_some(), config.audio_track_mode);
+        if roles.is_empty() {
             let _ = ready_tx.send(Err(anyhow!("no audio source could be opened")));
             return Ok(());
         }
         let fmt = &config.format;
-        let (mut encoder, note) =
-            match create_audio_encoder(fmt.audio_codec, fmt.audio_sample_rate, fmt.audio_channels, fmt.audio_bitrate_kbps) {
+        let mut encoders = Vec::with_capacity(roles.len());
+        let mut track_cfgs = Vec::with_capacity(roles.len());
+        for (idx, _role) in roles.iter().enumerate() {
+            let (enc, note) = match create_audio_encoder(
+                fmt.audio_codec,
+                fmt.audio_sample_rate,
+                fmt.audio_channels,
+                fmt.audio_bitrate_kbps,
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
                     return Ok(());
                 }
             };
-        if let Some(n) = note {
-            stats.add_note(n);
+            if idx == 0 {
+                if let Some(n) = note {
+                    stats.add_note(n);
+                }
+                log::info!("audio ({} track(s)): {}", roles.len(), enc.describe());
+            }
+            track_cfgs.push(AudioTrackConfig {
+                sample_rate: enc.sample_rate(),
+                channels: enc.channels().clamp(1, 2),
+                bitrate_bps: enc.bitrate_bps(),
+                samples_per_frame: enc.samples_per_frame(),
+                codec: enc.codec_config(),
+            });
+            encoders.push(enc);
         }
-        log::info!("audio: {}", encoder.describe());
-        let channels = encoder.channels().clamp(1, 2) as usize;
-        let rate = encoder.sample_rate();
-        let track = AudioTrackConfig {
-            sample_rate: rate,
-            channels: channels as u16,
-            bitrate_bps: encoder.bitrate_bps(),
-            samples_per_frame: encoder.samples_per_frame(),
-            codec: encoder.codec_config(),
-        };
-        let _ = ready_tx.send(Ok(track));
+        let _ = ready_tx.send(Ok(track_cfgs));
 
         // Wait for the first video frame to define the timeline origin.
         let origin = loop {
@@ -1168,15 +1655,74 @@ fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, AudioT
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        let mut mixer = Mixer::new(rate, epoch, origin);
-        for (s, gain) in &sources {
-            mixer.add_source(s.queue.clone(), s.sample_rate, s.channels, *gain);
-        }
+
+        // When both Mixed and per-source tracks consume the same AudioSource,
+        // duplicate incoming chunks into paired queues so Mixer::ingest /
+        // shift_origin never steal chunks from the sibling track.
+        let fan_out_sys = roles.contains(&TrackRole::Mixed) && roles.contains(&TrackRole::System);
+        let fan_out_mic = roles.contains(&TrackRole::Mixed) && roles.contains(&TrackRole::Mic);
+        let mut fanouts: Vec<FanOut> = Vec::new();
+        let (sys_mix_q, sys_sep_q) = if let Some((s, _)) = &sys_src {
+            if fan_out_sys {
+                let q1: SharedQueue = Arc::new(Mutex::new(Queue::default()));
+                let q2: SharedQueue = Arc::new(Mutex::new(Queue::default()));
+                fanouts.push(FanOut { raw: s.queue.clone(), targets: [q1.clone(), q2.clone()] });
+                (Some(q1), Some(q2))
+            } else {
+                (Some(s.queue.clone()), Some(s.queue.clone()))
+            }
+        } else {
+            (None, None)
+        };
+        let (mic_mix_q, mic_sep_q) = if let Some((s, _)) = &mic_src {
+            if fan_out_mic {
+                let q1: SharedQueue = Arc::new(Mutex::new(Queue::default()));
+                let q2: SharedQueue = Arc::new(Mutex::new(Queue::default()));
+                fanouts.push(FanOut { raw: s.queue.clone(), targets: [q1.clone(), q2.clone()] });
+                (Some(q1), Some(q2))
+            } else {
+                (Some(s.queue.clone()), Some(s.queue.clone()))
+            }
+        } else {
+            (None, None)
+        };
+
+        let mut tracks: Vec<TrackPipeline> = roles
+            .into_iter()
+            .zip(encoders)
+            .map(|(role, encoder)| {
+                let rate = encoder.sample_rate();
+                let channels = encoder.channels().clamp(1, 2) as usize;
+                let mut mixer = Mixer::new(rate, epoch, origin);
+                match role {
+                    TrackRole::Mixed => {
+                        if let (Some((s, gain)), Some(q)) = (&sys_src, &sys_mix_q) {
+                            mixer.add_source(q.clone(), s.sample_rate, s.channels, *gain);
+                        }
+                        if let (Some((s, gain)), Some(q)) = (&mic_src, &mic_mix_q) {
+                            mixer.add_source(q.clone(), s.sample_rate, s.channels, *gain);
+                        }
+                    }
+                    TrackRole::System => {
+                        if let (Some((s, gain)), Some(q)) = (&sys_src, &sys_sep_q) {
+                            mixer.add_source(q.clone(), s.sample_rate, s.channels, *gain);
+                        }
+                    }
+                    TrackRole::Mic => {
+                        if let (Some((s, gain)), Some(q)) = (&mic_src, &mic_sep_q) {
+                            mixer.add_source(q.clone(), s.sample_rate, s.channels, *gain);
+                        }
+                    }
+                }
+                TrackPipeline { mixer, encoder, channels }
+            })
+            .collect();
+
         let mut pcm = Vec::new();
         let mut mono = Vec::new();
-        let send = |frames: Vec<AudioFrame>| -> Result<()> {
+        let send = |track_idx: usize, frames: Vec<AudioFrame>| -> Result<()> {
             for f in frames {
-                if tx.send(f).is_err() {
+                if tx.send((track_idx, f)).is_err() {
                     return Err(anyhow!("encoder went away"));
                 }
             }
@@ -1187,39 +1733,68 @@ fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, AudioT
             let stopping = stop.load(Ordering::Relaxed);
             let total_paused_us = paused_total.load(Ordering::SeqCst);
             if total_paused_us != seen_paused_us {
-                mixer.shift_origin(Duration::from_micros(total_paused_us - seen_paused_us));
+                let delta = Duration::from_micros(total_paused_us - seen_paused_us);
+                for fan in &fanouts {
+                    fan.raw.lock().unwrap().chunks.clear();
+                }
+                for tp in &mut tracks {
+                    tp.mixer.shift_origin(delta);
+                }
                 seen_paused_us = total_paused_us;
             }
             if paused.load(Ordering::Relaxed) && !stopping {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
-            let until = if stopping { Instant::now() } else { Instant::now() - AUDIO_LAG };
-            pcm.clear();
-            mixer.mix_until(until, &mut pcm);
-            if !pcm.is_empty() {
-                let input: &[f32] = if channels == 1 {
-                    // The mixer always produces stereo; fold it down.
-                    mono.clear();
-                    mono.extend(pcm.as_chunks::<2>().0.iter().map(|[l, r]| (l + r) * 0.5));
-                    &mono
-                } else {
-                    &pcm
-                };
-                send(encoder.encode(input)?)?;
+            for fan in &fanouts {
+                let drained: Vec<_> = fan.raw.lock().unwrap().chunks.drain(..).collect();
+                if drained.is_empty() {
+                    continue;
+                }
+                {
+                    let mut q0 = fan.targets[0].lock().unwrap();
+                    for c in &drained {
+                        push_capped(&mut q0, c.clone());
+                    }
+                }
+                let mut q1 = fan.targets[1].lock().unwrap();
+                for c in drained {
+                    push_capped(&mut q1, c);
+                }
+            }
+            let now = Instant::now();
+            let until = if stopping { now } else { now - AUDIO_LAG };
+            for (track_idx, tp) in tracks.iter_mut().enumerate() {
+                pcm.clear();
+                tp.mixer.mix_until(until, &mut pcm);
+                if !pcm.is_empty() {
+                    let input: &[f32] = if tp.channels == 1 {
+                        // The mixer always produces stereo; fold it down.
+                        mono.clear();
+                        mono.extend(pcm.as_chunks::<2>().0.iter().map(|[l, r]| (l + r) * 0.5));
+                        &mono
+                    } else {
+                        &pcm
+                    };
+                    send(track_idx, tp.encoder.encode(input)?)?;
+                }
             }
             if stopping {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        send(encoder.flush()?)?;
-        log::info!("audio: done, {} silence samples inserted", mixer.silence_inserted);
-        drop(sources);
+        for (track_idx, tp) in tracks.iter_mut().enumerate() {
+            send(track_idx, tp.encoder.flush()?)?;
+        }
+        let silence_total: u64 = tracks.iter().map(|tp| tp.mixer.silence_inserted).sum();
+        log::info!("audio: done, {silence_total} silence samples inserted");
+        drop(sys_src);
+        drop(mic_src);
         Ok(())
     })?;
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(cfg)) => Ok((handle, cfg)),
+        Ok(Ok(cfgs)) => Ok((handle, cfgs)),
         Ok(Err(e)) => {
             let _ = handle.join();
             Err(e)
@@ -1284,15 +1859,68 @@ mod tests {
     #[test]
     fn pre_roll_counters_are_cleared_but_encoded_frames_are_not() {
         let s = Stats::default();
-        for c in [&s.frames_captured, &s.frames_dropped, &s.frames_superseded, &s.frames_encoded] {
+        for c in [&s.frames_captured, &s.frames_to_encoder, &s.frames_dropped, &s.frames_superseded, &s.frames_encoded]
+        {
             c.store(7, Ordering::Relaxed);
         }
         s.reset_pre_roll();
         assert_eq!(s.frames_captured.load(Ordering::Relaxed), 0);
+        assert_eq!(s.frames_to_encoder.load(Ordering::Relaxed), 0);
         assert_eq!(s.frames_dropped.load(Ordering::Relaxed), 0);
         assert_eq!(s.frames_superseded.load(Ordering::Relaxed), 0);
         // Encoded frames belong to the file, not the warm-up.
         assert_eq!(s.frames_encoded.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn frame_mailbox_overwrites_stale_and_recycles_buffer() {
+        let pool = FramePool::new(4);
+        let stats = Arc::new(Stats::default());
+        let (tx, rx) = frame_mailbox(pool, stats.clone());
+        let mk = |pts_ms: u64| RawFrame {
+            data: vec![pts_ms as u8; 16],
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: PixelFormat::Bgra,
+            pts: ms(pts_ms),
+            mouse: None,
+        };
+        assert!(tx.send(mk(10)));
+        assert!(tx.send(mk(20)));
+        assert!(tx.send(mk(30)));
+        assert!(tx.send(mk(40)));
+        // Up to FRAME_QUEUE_CAP (4) frames queue without lock eviction.
+        assert_eq!(stats.frames_superseded.load(Ordering::Relaxed), 0);
+        // Pushing a 5th evicts the oldest (10) without dropping newer incoming frames.
+        assert!(tx.send(mk(50)));
+        assert_eq!(stats.frames_superseded.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.frames_dropped.load(Ordering::Relaxed), 0);
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let pts: Vec<_> = got.iter().map(|f| f.pts).collect();
+        assert_eq!(pts, vec![ms(20), ms(30), ms(40), ms(50)]);
+        assert_eq!(got.last().unwrap().data[0], 50);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        drop(rx);
+        assert!(!tx.send(mk(60)));
+    }
+
+    #[test]
+    fn clock_snaps_to_pts_without_going_backwards() {
+        let mut c = FrameClock::new(120, ms(0));
+        c.snap_to_pts(ms(1000));
+        assert_eq!(c.next, 120);
+        // Never snaps backwards.
+        c.snap_to_pts(ms(500));
+        assert_eq!(c.next, 120);
+    }
+
+    #[test]
+    fn monotonic_pts_never_goes_backwards_or_repeats() {
+        assert_eq!(monotonic_pts(None, ms(10)), ms(10));
+        assert_eq!(monotonic_pts(Some(ms(10)), ms(20)), ms(20));
+        assert_eq!(monotonic_pts(Some(ms(20)), ms(20)), Duration::from_micros(20_100));
+        assert_eq!(monotonic_pts(Some(ms(20)), ms(15)), Duration::from_micros(20_100));
     }
 
     #[test]
@@ -1305,5 +1933,21 @@ mod tests {
         // Never moves backwards.
         c.resync(ms(100));
         assert_eq!(c.next, 30);
+    }
+
+    #[test]
+    fn resolve_audio_tracks_layout() {
+        assert_eq!(resolve_audio_tracks(false, false, AudioTrackMode::Mixed), Vec::new());
+        assert_eq!(resolve_audio_tracks(true, false, AudioTrackMode::Separate), vec![TrackRole::System]);
+        assert_eq!(resolve_audio_tracks(false, true, AudioTrackMode::MixedAndSeparate), vec![TrackRole::Mic]);
+        assert_eq!(resolve_audio_tracks(true, true, AudioTrackMode::Mixed), vec![TrackRole::Mixed]);
+        assert_eq!(
+            resolve_audio_tracks(true, true, AudioTrackMode::Separate),
+            vec![TrackRole::System, TrackRole::Mic]
+        );
+        assert_eq!(
+            resolve_audio_tracks(true, true, AudioTrackMode::MixedAndSeparate),
+            vec![TrackRole::Mixed, TrackRole::System, TrackRole::Mic]
+        );
     }
 }

@@ -18,9 +18,9 @@ use super::decode::{Packet, Reader};
 use super::output::{fold_to_stereo, Output};
 use super::{Command, Frame, PlaybackState, Shared};
 
-/// How many packets to spend looking for the first frame before giving up and
-/// letting the GUI show an empty well.
-const PRIME_READS: u32 = 400;
+/// How many packets to spend looking for the first frame and initial audio buffer
+/// before giving up and letting the GUI show an empty well.
+const PRIME_READS: u32 = 600;
 
 /// Idle nap when there is decoded work in hand but nowhere to put it.
 const BACKOFF: Duration = Duration::from_millis(2);
@@ -82,6 +82,7 @@ struct Worker {
     ended: bool,
     interval: Duration,
     last_pts: Duration,
+    has_video_frame: bool,
     stereo: Vec<f32>,
     resampled: Vec<f32>,
     /// Frames decoded since the last report, and when that report went out.
@@ -144,6 +145,7 @@ impl Worker {
             ended: false,
             interval,
             last_pts: Duration::ZERO,
+            has_video_frame: false,
             stereo: Vec::new(),
             resampled: Vec::new(),
             decoded: 0,
@@ -153,16 +155,22 @@ impl Worker {
         Ok(me)
     }
 
-    /// Decodes far enough to put the opening frame on screen, then starts
+    /// Decodes far enough to put the opening frame on screen and pre-roll
+    /// enough audio that playback does not immediately underrun, then starts
     /// playing — opening a clip you just recorded should simply play it.
     fn prime(&mut self) {
         self.shared.set_state(PlaybackState::Paused);
         self.shared.clock.rebase(Duration::ZERO, 0);
-        if self.reader.has_video() {
-            for _ in 0..PRIME_READS {
-                if !self.pump() || self.ended || self.last_pts > Duration::ZERO {
-                    break;
-                }
+        let need_video = self.reader.has_video();
+        for _ in 0..PRIME_READS {
+            let have_video = !need_video || self.has_video_frame;
+            let have_audio = !self.reader.has_live_audio()
+                || self.output.as_ref().is_none_or(|o| o.ring.queued_frames() >= o.low_water_frames());
+            if have_video && have_audio {
+                break;
+            }
+            if !self.pump_step(have_video && !have_audio) || self.ended {
+                break;
             }
         }
         self.start();
@@ -234,10 +242,11 @@ impl Worker {
         if !self.playing() {
             return false;
         }
-        let audio_full = self
-            .output
-            .as_ref()
-            .is_some_and(|o| o.ring.queued_frames() >= o.high_water_frames());
+        let audio_full = !self.reader.has_live_audio()
+            || self
+                .output
+                .as_ref()
+                .is_some_and(|o| o.ring.queued_frames() >= o.high_water_frames());
         // Nothing useful left to do this round: video is buffered as far ahead
         // as it may run and the device has all the sound it can hold.
         !(self.held.len() >= self.held_cap && (self.output.is_none() || audio_full))
@@ -352,20 +361,47 @@ impl Worker {
     }
 
     fn pump(&mut self) -> bool {
+        self.pump_step(false)
+    }
+
+    fn pump_step(&mut self, force_audio_only: bool) -> bool {
         // During a seek, everything a half-frame before the target is pre-roll:
         // the reader skips converting it, which is what makes seeks feel quick.
-        let pixels_from = self.target.map(|t| t.saturating_sub(self.interval / 2));
-        // Video is as far ahead as it may run, so this round is only here to
-        // keep the output device fed. Reading every stream would decode frames
-        // that `place` would immediately drop off the front of the backlog —
-        // the next ones due on screen — for nothing.
-        let audio_only = !self.busy() && self.held.len() >= self.held_cap;
+        // During realtime playback, also skip pixel conversion when video decode
+        // has fallen behind the audio clock so audio never starves and video
+        // stays synchronized.
+        let pixels_from = if let Some(t) = self.target {
+            Some(t.saturating_sub(self.interval / 2))
+        } else if !self.busy() && self.playing() && self.has_video_frame {
+            let now = self.shared.clock.position();
+            (self.last_pts + self.interval < now).then(|| now.saturating_sub(self.interval / 2))
+        } else {
+            None
+        };
+        // Prioritize audio whenever its ring drops below the low-water mark or
+        // when video is already buffered to its cap.
+        let audio_starving = !self.busy()
+            && self.reader.has_live_audio()
+            && self.output.as_ref().is_some_and(|o| o.ring.queued_frames() < o.low_water_frames());
+        let audio_only = force_audio_only
+            || (!self.busy()
+                && self.reader.has_live_audio()
+                && (self.held.len() >= self.held_cap || audio_starving));
         match self.reader.read(pixels_from, &self.pool, audio_only) {
             Ok(Packet::Video { image, pts }) => self.on_video(image, pts),
             Ok(Packet::VideoSkipped { pts }) => self.last_pts = pts,
             Ok(Packet::Audio { samples, channels, pts }) => self.on_audio(samples, channels, pts),
             Ok(Packet::Idle) => {}
-            Ok(Packet::End) => self.ended = true,
+            Ok(Packet::End) => {
+                if let (Some(r), Some(o)) = (&mut self.resampler, &self.output) {
+                    self.resampled.clear();
+                    r.flush(&mut self.resampled);
+                    if !self.resampled.is_empty() {
+                        o.ring.push(&self.resampled);
+                    }
+                }
+                self.ended = true;
+            }
             Err(e) => {
                 self.shared.fail(format!("{e:#}"));
                 (self.repaint)();
@@ -378,6 +414,7 @@ impl Worker {
     fn on_video(&mut self, image: crate::video::preview::PreviewImage, pts: Duration) {
         let landed = self.target.take().is_some() || self.stepping;
         self.stepping = false;
+        self.has_video_frame = true;
         self.last_pts = pts;
         if landed {
             self.shared.clock.rebase(pts, self.ring_frames());

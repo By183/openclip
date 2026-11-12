@@ -53,6 +53,26 @@ struct Handler {
     readback: Readback,
     frames: u64,
     priority_set: bool,
+    /// `(base_ts_100ns, base_arrival)` anchoring WGC `SystemRelativeTime` to `epoch`.
+    ts_anchor: Option<(i64, Duration)>,
+}
+
+impl Handler {
+    /// Maps a WGC `SystemRelativeTime` value (in 100-ns ticks) onto our
+    /// recording timeline (`epoch`-relative `Duration`).
+    ///
+    /// Anchoring the first accepted hardware timestamp to its arrival offset
+    /// keeps audio/video aligned while computing every subsequent PTS delta in
+    /// exact 100-ns hardware ticks instead of noisy callback arrival times.
+    fn map_timestamp(anchor: &mut Option<(i64, Duration)>, ts_100ns: i64, arrival: Duration) -> Duration {
+        let (base_ts, base_arrival) = *anchor.get_or_insert((ts_100ns, arrival));
+        let delta_100ns = ts_100ns.saturating_sub(base_ts);
+        if delta_100ns >= 0 {
+            base_arrival.saturating_add(Duration::from_nanos((delta_100ns as u64).saturating_mul(100)))
+        } else {
+            base_arrival.saturating_sub(Duration::from_nanos(delta_100ns.unsigned_abs().saturating_mul(100)))
+        }
+    }
 }
 
 type HandlerError = Box<dyn std::error::Error + Send + Sync>;
@@ -69,6 +89,7 @@ impl GraphicsCaptureApiHandler for Handler {
             limiter,
             frames: 0,
             priority_set: false,
+            ts_anchor: None,
         })
     }
 
@@ -88,7 +109,11 @@ impl GraphicsCaptureApiHandler for Handler {
         {
             return Ok(());
         }
-        let pts = now.duration_since(self.flags.epoch);
+        let arrival = now.duration_since(self.flags.epoch);
+        let pts = match frame.timestamp() {
+            Ok(ts) => Self::map_timestamp(&mut self.ts_anchor, ts.Duration, arrival),
+            Err(_) => arrival,
+        };
         let (fw, fh) = (frame.width(), frame.height());
         let (x0, y0, x1, y1) = match self.flags.crop.as_ref().map(LiveRect::get) {
             Some(r) => {
@@ -143,6 +168,8 @@ pub(crate) struct Readback {
     pixels: PixelFormat,
     /// Staging slot holding a copy that has not been read yet, with its timestamp.
     pending: Option<(usize, Duration)>,
+    /// True once the initial frame (or first frame after resize) has been delivered.
+    primed: bool,
 }
 
 impl Readback {
@@ -155,6 +182,7 @@ impl Readback {
             format: DXGI_FORMAT(0),
             pixels: PixelFormat::Bgra,
             pending: None,
+            primed: false,
         }
     }
 
@@ -184,12 +212,19 @@ impl Readback {
         self.pixels = pixel_format(format)
             .ok_or_else(|| anyhow!("unsupported surface format {:?}; 8-bit BGRA or RGBA only", format.0))?;
         self.pending = None;
+        self.primed = false;
         log::debug!("readback staging textures {w}×{h}");
         Ok(())
     }
 
     /// Queues the copy of `bx` from `src` and returns the frame queued by the
     /// previous call (if any), copied into a pooled buffer.
+    ///
+    /// On a static screen, WGC delivers one frame and then waits up to a couple
+    /// of seconds before emitting another; waiting for the second callback to
+    /// read out slot 0 would stall recording startup and anchor `pts0` late.
+    /// The very first frame therefore reads synchronously so double-buffering
+    /// primes cleanly without delaying startup.
     pub(crate) fn submit(
         &mut self,
         src: &ID3D11Texture2D,
@@ -208,19 +243,32 @@ impl Readback {
             // make sure the copy is submitted before that.
             self.context.Flush();
         }
-        let previous = self.pending.replace((slot, pts));
-        let Some((read_slot, read_pts)) = previous else { return Ok(None) };
+        let (read_slot, read_pts) = if !self.primed && self.pending.is_none() {
+            self.primed = true;
+            (slot, pts)
+        } else {
+            let previous = self.pending.replace((slot, pts));
+            let Some(prev) = previous else { return Ok(None) };
+            prev
+        };
         let tex = self.staging[read_slot].as_ref().unwrap();
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe { self.context.Map(tex, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.context("Map staging texture")?;
         let row = (w * 4) as usize;
         let pitch = mapped.RowPitch as usize;
+        let total = row * h as usize;
         let mut data = pool.take();
-        data.reserve(row * h as usize);
+        if data.capacity() < total {
+            data.reserve(total);
+        }
         unsafe {
             let base = mapped.pData as *const u8;
-            for y in 0..h as usize {
-                data.extend_from_slice(std::slice::from_raw_parts(base.add(y * pitch), row));
+            if pitch == row {
+                data.extend_from_slice(std::slice::from_raw_parts(base, total));
+            } else {
+                for y in 0..h as usize {
+                    data.extend_from_slice(std::slice::from_raw_parts(base.add(y * pitch), row));
+                }
             }
             self.context.Unmap(tex, 0);
         }
@@ -257,7 +305,8 @@ fn launch<T>(
 where
     T: TryInto<GraphicsCaptureItemType> + Send + 'static,
 {
-    let fps = config.fps.max(1);
+    let is_auto = config.fps == 0;
+    let fps = if is_auto { 0 } else { config.fps.max(1) };
     // Windows 11 throttles delivery itself; Windows 10 delivers every vsync
     // and rejects the setting, so pick frames ourselves there.
     let native_interval = match GraphicsCaptureApi::is_minimum_update_interval_supported() {
@@ -267,7 +316,22 @@ where
             false
         }
     };
-    let interval = if native_interval {
+    let interval = if is_auto {
+        if native_interval {
+            // WGC `Default` on Windows 11 24H2 caps capture at ~50–60 Hz (snapping
+            // to 48 fps on 144 Hz monitors). Asking for 1 ms lets DWM deliver at
+            // the monitor/window's true composition rate without vsync beating.
+            let min_interval = Duration::from_millis(1);
+            log::info!(
+                "capture: dynamic/source fps using WGC minimum update interval ({:.2} ms)",
+                min_interval.as_secs_f64() * 1e3
+            );
+            MinimumUpdateIntervalSettings::Custom(min_interval)
+        } else {
+            log::info!("capture: dynamic/source fps unthrottled (WGC minimum update interval unsupported)");
+            MinimumUpdateIntervalSettings::Default
+        }
+    } else if native_interval {
         let floor = super::min_update_interval(fps);
         log::info!("capture: {fps} fps throttled by WGC ({:.2} ms minimum update interval)", floor.as_secs_f64() * 1e3);
         MinimumUpdateIntervalSettings::Custom(floor)
@@ -276,7 +340,7 @@ where
         MinimumUpdateIntervalSettings::Default
     };
     let pool = config.pool.clone().unwrap_or_else(|| FramePool::new(6));
-    let flags = Flags { sink, epoch, stop: stop.clone(), crop, fps, limit_ourselves: !native_interval, pool };
+    let flags = Flags { sink, epoch, stop: stop.clone(), crop, fps, limit_ourselves: !is_auto && !native_interval, pool };
     // Both of these are rejected outright — the session never starts — when the
     // OS lacks the property behind them, so ask only for what it supports.
     let border_ok = supported("border", GraphicsCaptureApi::is_border_settings_supported());
@@ -378,5 +442,22 @@ mod tests {
         assert_eq!(border_setting(false), DrawBorderSettings::Default);
         assert_eq!(cursor_setting(true, false), CursorCaptureSettings::Default);
         assert_eq!(cursor_setting(false, false), CursorCaptureSettings::Default);
+    }
+
+    #[test]
+    fn system_relative_time_anchors_without_jitter() {
+        let mut anchor = None;
+        let ms = |m| Duration::from_millis(m);
+        // First frame at QPC=1_000_000 (100 ms) observed at arrival=25 ms.
+        assert_eq!(Handler::map_timestamp(&mut anchor, 1_000_000, ms(25)), ms(25));
+        // Second frame +69_444 ticks (6.9444 ms), even though callback woke up late at 40 ms.
+        let p2 = Handler::map_timestamp(&mut anchor, 1_069_444, ms(40));
+        assert_eq!(p2, ms(25) + Duration::from_nanos(6_944_400));
+        // Third frame +138_888 ticks (13.8888 ms) even with early wakeup.
+        let p3 = Handler::map_timestamp(&mut anchor, 1_138_888, ms(37));
+        assert_eq!(p3, ms(25) + Duration::from_nanos(13_888_800));
+        // Slight negative delta saturates safely against arrival anchor.
+        let p0 = Handler::map_timestamp(&mut anchor, 900_000, ms(25));
+        assert_eq!(p0, ms(15));
     }
 }

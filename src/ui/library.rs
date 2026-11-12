@@ -107,10 +107,31 @@ impl Library {
     }
 
     pub fn delete(&mut self, path: &Path, dir: &Path) -> std::io::Result<()> {
-        std::fs::remove_file(path)?;
-        self.selected = None;
-        self.refresh(dir, true);
-        Ok(())
+        let mut last_err = None;
+        for attempt in 0..10 {
+            match std::fs::remove_file(path) {
+                Ok(()) => {
+                    self.selected = None;
+                    self.refresh(dir, true);
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.selected = None;
+                    self.refresh(dir, true);
+                    return Err(e);
+                }
+                Err(e)
+                    if attempt < 9
+                        && (e.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(e.raw_os_error(), Some(5 | 32))) =>
+                {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap())
     }
 }
 
@@ -164,5 +185,57 @@ pub fn reveal_in_folder(path: &Path) {
     let cmd = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
     if let Err(e) = cmd {
         log::warn!("reveal file: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("openclip-lib-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn delete_removes_file_and_clears_selection() {
+        let dir = temp_dir("delete-ok");
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, b"fake mp4").unwrap();
+
+        let mut lib = Library::new();
+        lib.refresh(&dir, true);
+        assert_eq!(lib.entries.len(), 1);
+        lib.selected = Some(0);
+
+        lib.delete(&file, &dir).unwrap();
+        assert!(!file.exists());
+        assert!(lib.selected.is_none());
+        assert!(lib.entries.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_missing_file_still_refreshes_stale_list() {
+        let dir = temp_dir("delete-missing");
+        let file = dir.join("gone.mp4");
+        std::fs::write(&file, b"fake mp4").unwrap();
+
+        let mut lib = Library::new();
+        lib.refresh(&dir, true);
+        assert_eq!(lib.entries.len(), 1);
+        lib.selected = Some(0);
+
+        // External delete happened right before Library::delete ran.
+        std::fs::remove_file(&file).unwrap();
+        let err = lib.delete(&file, &dir).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(lib.selected.is_none());
+        assert!(lib.entries.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

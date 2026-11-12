@@ -2,7 +2,7 @@
 //! sample holds exactly one MP3 frame.
 
 use anyhow::{anyhow, Context, Result};
-use mp3lame_encoder::{Bitrate, Builder, Encoder, FlushNoGap, InterleavedPcm, Mode, Quality};
+use mp3lame_encoder::{Bitrate, Builder, Encoder, FlushNoGap, InterleavedPcm, Mode, MonoPcm, Quality};
 
 use super::encoder::{AudioCodecConfig, AudioEncoder, AudioFrame};
 
@@ -76,9 +76,12 @@ impl Mp3Encoder {
         // buffer as "unchecked", so reserve its documented worst case first.
         self.out.clear();
         self.out.reserve(input.len() / ch * 5 / 4 + 7200);
-        self.inner
-            .encode_to_vec(InterleavedPcm(input), &mut self.out)
-            .map_err(|e| anyhow!("LAME encode: {e:?}"))?;
+        if self.channels == 1 {
+            self.inner.encode_to_vec(MonoPcm(input), &mut self.out)
+        } else {
+            self.inner.encode_to_vec(InterleavedPcm(input), &mut self.out)
+        }
+        .map_err(|e| anyhow!("LAME encode: {e:?}"))?;
         self.pending.extend_from_slice(&self.out);
         Ok(self.drain_frames(false))
     }
@@ -232,6 +235,28 @@ mod tests {
         assert!(frames.len() >= 40, "got {} frames", frames.len());
         for f in &frames {
             let h = parse_frame_header(&f.data).expect("frame starts with header");
+            assert_eq!(h.frame_len, f.data.len());
+            assert_eq!(f.samples, 1152);
+        }
+    }
+
+    #[test]
+    fn encodes_mono_tone_into_full_duration_frames() {
+        let rate = 48000;
+        let mut enc = Mp3Encoder::new(rate, 1, 128).unwrap();
+        let pcm: Vec<f32> = (0..rate)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5)
+            .collect();
+        let mut frames = Vec::new();
+        for chunk in pcm.chunks(2048) {
+            frames.extend(enc.encode(chunk).unwrap());
+        }
+        frames.extend(enc.flush().unwrap());
+        // 1 s minus 1105-sample codec delay at 1152 samples/frame = 41 frames.
+        // Previously InterleavedPcm discarded half the stream (~20 frames).
+        assert!(frames.len() >= 40, "expected >= 40 mono frames, got {}", frames.len());
+        for f in &frames {
+            let h = parse_frame_header(&f.data).expect("mono frame starts with header");
             assert_eq!(h.frame_len, f.data.len());
             assert_eq!(f.samples, 1152);
         }

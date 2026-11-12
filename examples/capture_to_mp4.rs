@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use openclip::capture::monitors::{list_monitors, list_windows};
 use openclip::capture::{Rect, Source};
 use openclip::pipeline::{RecordConfig, Recorder};
-use openclip::settings::{pick_encoder, AudioCodec, Container, FormatSettings, RateControl, SizeMode, VideoCodec};
+use openclip::settings::{
+    pick_encoder, AudioCodec, AudioTrackMode, Container, FormatSettings, RateControl, SizeMode, VideoCodec,
+};
 use openclip::video::available_encoders;
 use openclip::video::mouse_fx::MouseFx;
 use openclip::video::watermark::Watermark;
@@ -97,7 +99,11 @@ fn main() -> anyhow::Result<()> {
         mouse_fx: fx,
         watermark,
         system_audio: audio,
+        system_audio_device: None,
+        system_audio_gain: 1.0,
         microphone: mic.then_some(None),
+        mic_gain: 1.0,
+        audio_track_mode: AudioTrackMode::Mixed,
         output: out.clone(),
     };
     // --pause-at S --resume-at S: exercise pause/resume (wall-clock seconds).

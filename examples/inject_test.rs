@@ -32,7 +32,7 @@ mod win {
     use openclip::game::probe::{classify_modules, is_excluded};
     use openclip::game::{inject, HookSession};
     use openclip::pipeline::{RecordConfig, Recorder};
-    use openclip::settings::FormatSettings;
+    use openclip::settings::{AudioTrackMode, FormatSettings};
     use openclip::video::mouse_fx::MouseFx;
     use openclip::video::watermark::Watermark;
     use openclip_overlay::abi::OverlaySettings;
@@ -112,7 +112,11 @@ mod win {
                     mouse_fx: MouseFx { cursor_size: 0, click_effect: false, highlight: false, ..Default::default() },
                     watermark: Watermark { enabled: false, ..Default::default() },
                     system_audio: false,
+                    system_audio_device: None,
+                    system_audio_gain: 1.0,
                     microphone: None,
+                    mic_gain: 1.0,
+                    audio_track_mode: AudioTrackMode::Mixed,
                     output: out,
                 },
                 None,

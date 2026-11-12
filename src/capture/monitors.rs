@@ -64,7 +64,7 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
     for (i, m) in Monitor::all().context("enumerating monitors")?.into_iter().enumerate() {
         let name = m.friendly_name().or_else(|_| m.name()).unwrap_or_default();
         let name = if name.trim().is_empty() || name.starts_with("Unknown") {
-            format!("Display {}", i + 1)
+            crate::t!(DISPLAY_N, i + 1)
         } else {
             name
         };
@@ -172,6 +172,23 @@ pub fn source_origin(source: &super::Source) -> Result<(i32, i32)> {
     }
 }
 
+/// Refresh rate (Hz) of the monitor hosting `source`, if reported by the OS.
+pub fn source_refresh_hz(source: &super::Source) -> Option<u32> {
+    let freq = match source {
+        super::Source::Monitor { id } | super::Source::Region { monitor_id: id, .. } => {
+            find_monitor(*id).ok().and_then(|m| m.frequency().ok())
+        }
+        super::Source::Window { id } => {
+            find_window(*id).ok().and_then(|w| w.current_monitor().ok()).and_then(|m| m.frequency().ok())
+        }
+        super::Source::Game { .. } => Monitor::all().ok().and_then(|ms| {
+            let m = ms.iter().find(|m| m.is_primary().unwrap_or(false)).or_else(|| ms.first())?;
+            m.frequency().ok()
+        }),
+    };
+    freq.and_then(|hz| if hz.is_finite() && hz >= 15.0 { Some(hz.round() as u32) } else { None })
+}
+
 /// Screenshot of any [`super::Source`], used for idle thumbnails.
 pub fn screenshot_source(source: &super::Source) -> Result<RawFrame> {
     match source {
@@ -180,6 +197,6 @@ pub fn screenshot_source(source: &super::Source) -> Result<RawFrame> {
         super::Source::Region { monitor_id, rect } => screenshot_region(*monitor_id, *rect),
         // There is no way to sample a game's back buffer from outside; a preview
         // or snapshot has to come from the hook's own frames instead.
-        super::Source::Game { .. } => Err(anyhow!("a game cannot be captured as a still")),
+        super::Source::Game { .. } => Err(anyhow!("{}", crate::t!(ERR_GAME_STILL))),
     }
 }

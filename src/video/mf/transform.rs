@@ -32,6 +32,9 @@ pub struct MftSession {
     /// Outstanding `METransformNeedInput` credits.
     need_input: u32,
     started: bool,
+    /// Reusable output samples (`!provides_samples` only) to avoid per-frame
+    /// multi-megabyte `MFCreateMemoryBuffer` allocations at high FPS.
+    out_pool: Vec<IMFSample>,
     /// Microseconds spent in the last `process`: waiting for an input
     /// request, in `ProcessInput`, and pulling outputs afterwards.
     pub last_timing: (u64, u64, u64),
@@ -65,6 +68,7 @@ impl MftSession {
             out_buf_size: 0,
             need_input: 0,
             started: false,
+            out_pool: Vec::new(),
             last_timing: (0, 0, 0),
         })
     }
@@ -259,10 +263,44 @@ impl MftSession {
         }
     }
 
+    fn take_out_sample(&mut self) -> Result<IMFSample> {
+        while let Some(sample) = self.out_pool.pop() {
+            if unsafe { sample.GetBufferCount() } == Ok(1)
+                && let Ok(buf) = unsafe { sample.GetBufferByIndex(0) }
+                && unsafe { buf.GetMaxLength() }.unwrap_or(0) >= self.out_buf_size
+            {
+                let _ = unsafe { buf.SetCurrentLength(0) };
+                let _ = unsafe { sample.DeleteAllItems() };
+                return Ok(sample);
+            }
+        }
+        new_sample(self.out_buf_size)
+    }
+
+    /// Returns consumed output samples back to the internal pool (`!provides_samples` only).
+    pub fn recycle_output(&mut self, samples: Vec<IMFSample>) {
+        if self.provides_samples {
+            return;
+        }
+        for sample in samples {
+            if self.out_pool.len() >= 4 {
+                break;
+            }
+            if unsafe { sample.GetBufferCount() } == Ok(1)
+                && let Ok(buf) = unsafe { sample.GetBufferByIndex(0) }
+                && unsafe { buf.GetMaxLength() }.unwrap_or(0) >= self.out_buf_size
+            {
+                let _ = unsafe { buf.SetCurrentLength(0) };
+                let _ = unsafe { sample.DeleteAllItems() };
+                self.out_pool.push(sample);
+            }
+        }
+    }
+
     /// Calls `ProcessOutput` once. Returns `false` when the transform needs more input.
     fn pull_output(&mut self, out: &mut Vec<IMFSample>) -> Result<bool> {
         loop {
-            let sample = if self.provides_samples { None } else { Some(new_sample(self.out_buf_size)?) };
+            let sample = if self.provides_samples { None } else { Some(self.take_out_sample()?) };
             let mut buf = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: self.out_id,
                 pSample: std::mem::ManuallyDrop::new(sample),
@@ -283,8 +321,16 @@ impl MftSession {
                     }
                     return Ok(true);
                 }
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(false),
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                    if let Some(s) = sample {
+                        self.recycle_output(vec![s]);
+                    }
+                    return Ok(false);
+                }
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    if let Some(s) = sample {
+                        self.recycle_output(vec![s]);
+                    }
                     // Renegotiate the output type (same codec, refreshed attributes).
                     let t = unsafe { self.mft.GetOutputAvailableType(self.out_id, 0) }.context("stream change")?;
                     self.set_output_type(&t)?;
@@ -299,6 +345,7 @@ impl MftSession {
                 }
                 Err(e) if e.code() == MF_E_BUFFERTOOSMALL => {
                     self.out_buf_size = self.out_buf_size.saturating_mul(2).max(1 << 16);
+                    self.out_pool.clear();
                 }
                 Err(e) => return Err(anyhow!("ProcessOutput: {e}")),
             }

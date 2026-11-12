@@ -12,6 +12,17 @@ use yuv::{
     YuvChromaSubsampling, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
 };
 
+/// Minimum pixel count before horizontal strip parallelism kicks in (`1280×720`).
+const PARALLEL_MIN_PIXELS: usize = 1280 * 720;
+/// Half-size downscale destination pixel threshold (`960×540`, i.e. half of 1080p).
+const HALF_PARALLEL_MIN_PIXELS: usize = 960 * 540;
+/// Cap worker strips at 4 so prep finishes in ~2 ms without starving games.
+const MAX_THREADS: usize = 4;
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, MAX_THREADS)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     /// 4 bytes per pixel: B, G, R, A (Windows.Graphics.Capture, DXGI).
@@ -81,11 +92,23 @@ impl RawFrame {
     pub fn downscale_half_into(&self, dst: &mut RawFrame) {
         let w = (self.width / 2).max(1);
         let h = (self.height / 2).max(1);
+        let threads = if (w as usize).saturating_mul(h as usize) >= HALF_PARALLEL_MIN_PIXELS && h >= 16 {
+            default_threads()
+        } else {
+            1
+        };
+        self.downscale_half_into_with_threads(dst, threads);
+    }
+
+    fn downscale_half_into_with_threads(&self, dst: &mut RawFrame, max_threads: usize) {
+        let w = (self.width / 2).max(1);
+        let h = (self.height / 2).max(1);
         let s = self.stride as usize;
         let sw = self.width as usize;
         let sh = self.height as usize;
         let dw = w as usize;
-        let needed = dw * h as usize * 4;
+        let dh = h as usize;
+        let needed = dw * dh * 4;
         // Size the buffer once and write in place: pushing two million bytes one
         // at a time was the most expensive step of the half-size path.
         if dst.data.len() < needed {
@@ -93,29 +116,56 @@ impl RawFrame {
         } else {
             dst.data.truncate(needed);
         }
-        for (y, drow) in dst.data.chunks_exact_mut(dw * 4).enumerate() {
-            let r0 = &self.data[y * 2 * s..y * 2 * s + sw * 4];
-            let y1 = (y * 2 + 1).min(sh - 1);
-            let r1 = &self.data[y1 * s..y1 * s + sw * 4];
-            let (p0, rest0) = r0.as_chunks::<8>();
-            let (p1, _) = r1.as_chunks::<8>();
-            let (out, _) = drow.as_chunks_mut::<4>();
-            // Pairs of source pixels (8 bytes) → one destination pixel.
-            for ((a, b), o) in p0.iter().zip(p1).zip(out.iter_mut()) {
-                for ch in 0..4 {
-                    let sum = a[ch] as u32 + a[ch + 4] as u32 + b[ch] as u32 + b[ch + 4] as u32;
-                    o[ch] = ((sum + 2) / 4) as u8;
+        let downscale_rows = |start_y: usize, dslice: &mut [u8]| {
+            for (off, drow) in dslice.chunks_exact_mut(dw * 4).enumerate() {
+                let y = start_y + off;
+                let r0 = &self.data[y * 2 * s..y * 2 * s + sw * 4];
+                let y1 = (y * 2 + 1).min(sh - 1);
+                let r1 = &self.data[y1 * s..y1 * s + sw * 4];
+                let (p0, rest0) = r0.as_chunks::<8>();
+                let (p1, _) = r1.as_chunks::<8>();
+                let (out, _) = drow.as_chunks_mut::<4>();
+                // Pairs of source pixels (8 bytes) → one destination pixel.
+                for ((a, b), o) in p0.iter().zip(p1).zip(out.iter_mut()) {
+                    for ch in 0..4 {
+                        let sum = a[ch] as u32 + a[ch + 4] as u32 + b[ch] as u32 + b[ch + 4] as u32;
+                        o[ch] = ((sum + 2) / 4) as u8;
+                    }
+                }
+                if p0.len() < dw {
+                    // Odd source width: the last destination pixel repeats the last column.
+                    let a = &rest0[..4];
+                    let b = &r1[r1.len() - 4..];
+                    let o = &mut out[p0.len()];
+                    for ch in 0..4 {
+                        o[ch] = (a[ch] as u32 + b[ch] as u32).div_ceil(2) as u8;
+                    }
                 }
             }
-            if p0.len() < dw {
-                // Odd source width: the last destination pixel repeats the last column.
-                let a = &rest0[..4];
-                let b = &r1[r1.len() - 4..];
-                let o = &mut out[p0.len()];
-                for ch in 0..4 {
-                    o[ch] = (a[ch] as u32 + b[ch] as u32).div_ceil(2) as u8;
+        };
+
+        let threads = max_threads.clamp(1, MAX_THREADS);
+        let slice_rows = (dh / threads).max(1);
+        if threads > 1 && h >= 16 && slice_rows < dh {
+            std::thread::scope(|scope| {
+                let mut rem_dst = dst.data.as_mut_slice();
+                let mut start_y = 0usize;
+                for ti in 0..threads {
+                    let end_y = if ti + 1 == threads { dh } else { (start_y + slice_rows).min(dh) };
+                    let strip_h = end_y - start_y;
+                    let part = if ti + 1 == threads {
+                        std::mem::take(&mut rem_dst)
+                    } else {
+                        let (p, next) = rem_dst.split_at_mut(strip_h * dw * 4);
+                        rem_dst = next;
+                        p
+                    };
+                    scope.spawn(move || downscale_rows(start_y, part));
+                    start_y = end_y;
                 }
-            }
+            });
+        } else {
+            downscale_rows(0, &mut dst.data);
         }
         dst.width = w;
         dst.height = h;
@@ -174,6 +224,16 @@ impl Converter {
     /// converter dimensions after even rounding.
     pub fn convert(&mut self, frame: &RawFrame) -> Result<()> {
         let (w, h) = even_dims(frame.width, frame.height);
+        let threads = if (w as usize).saturating_mul(h as usize) >= PARALLEL_MIN_PIXELS && h >= 16 {
+            default_threads()
+        } else {
+            1
+        };
+        self.convert_with_threads(frame, threads)
+    }
+
+    fn convert_with_threads(&mut self, frame: &RawFrame, max_threads: usize) -> Result<()> {
+        let (w, h) = even_dims(frame.width, frame.height);
         if (w, h) != self.dims {
             bail!("frame size {}x{} does not match converter {}x{}", frame.width, frame.height, self.dims.0, self.dims.1);
         }
@@ -183,6 +243,146 @@ impl Converter {
         }
         let data = &frame.data[..needed];
         let (range, matrix, mode) = (YuvRange::Limited, YuvStandardMatrix::Bt709, YuvConversionMode::Balanced);
+
+        let threads = max_threads.clamp(1, MAX_THREADS);
+        // Chroma rows are 1 per 2 luma rows in 4:2:0, so each horizontal strip
+        // must have an even height to keep UV planes aligned cleanly.
+        let slice_rows = ((h as usize / threads) & !1).max(2);
+        if threads > 1 && h >= 16 && slice_rows < h as usize {
+            let src_stride = frame.stride as usize;
+            let total_h = h as usize;
+            match self.layout {
+                InputLayout::I420 => {
+                    let p = self.i420.as_mut().unwrap();
+                    let (y_stride, u_stride, v_stride) = (p.y_stride as usize, p.u_stride as usize, p.v_stride as usize);
+                    let y_plane: &mut [u8] = p.y_plane.borrow_mut();
+                    let u_plane: &mut [u8] = p.u_plane.borrow_mut();
+                    let v_plane: &mut [u8] = p.v_plane.borrow_mut();
+                    return std::thread::scope(|scope| -> Result<()> {
+                        let mut handles = Vec::with_capacity(threads);
+                        let mut rem_src = data;
+                        let mut rem_y = y_plane;
+                        let mut rem_u = u_plane;
+                        let mut rem_v = v_plane;
+                        let mut start_y = 0usize;
+                        for ti in 0..threads {
+                            let last = ti + 1 == threads;
+                            let end_y = if last { total_h } else { (start_y + slice_rows).min(total_h) };
+                            let strip_h = end_y - start_y;
+                            let src_part = if last {
+                                rem_src
+                            } else {
+                                let (part, next) = rem_src.split_at(strip_h * src_stride);
+                                rem_src = next;
+                                part
+                            };
+                            let (y_part, u_part, v_part) = if last {
+                                (
+                                    std::mem::take(&mut rem_y),
+                                    std::mem::take(&mut rem_u),
+                                    std::mem::take(&mut rem_v),
+                                )
+                            } else {
+                                let (yp, yn) = rem_y.split_at_mut(strip_h * y_stride);
+                                let (up, un) = rem_u.split_at_mut((strip_h / 2) * u_stride);
+                                let (vp, vn) = rem_v.split_at_mut((strip_h / 2) * v_stride);
+                                rem_y = yn;
+                                rem_u = un;
+                                rem_v = vn;
+                                (yp, up, vp)
+                            };
+                            let fmt = frame.format;
+                            let stride = frame.stride;
+                            handles.push(scope.spawn(move || -> Result<()> {
+                                let mut sub = YuvPlanarImageMut {
+                                    y_plane: BufferStoreMut::Borrowed(y_part),
+                                    y_stride: y_stride as u32,
+                                    u_plane: BufferStoreMut::Borrowed(u_part),
+                                    u_stride: u_stride as u32,
+                                    v_plane: BufferStoreMut::Borrowed(v_part),
+                                    v_stride: v_stride as u32,
+                                    width: w,
+                                    height: strip_h as u32,
+                                };
+                                let r = match fmt {
+                                    PixelFormat::Bgra => bgra_to_yuv420(&mut sub, src_part, stride, range, matrix, mode),
+                                    PixelFormat::Rgba => rgba_to_yuv420(&mut sub, src_part, stride, range, matrix, mode),
+                                };
+                                r.map_err(|e| anyhow::anyhow!("yuv conversion failed: {e}"))
+                            }));
+                            start_y = end_y;
+                            if last || start_y >= total_h {
+                                break;
+                            }
+                        }
+                        for h in handles {
+                            h.join().map_err(|_| anyhow::anyhow!("yuv worker panicked"))??;
+                        }
+                        Ok(())
+                    });
+                }
+                InputLayout::Nv12 => {
+                    let p = self.nv12.as_mut().unwrap();
+                    let (y_stride, uv_stride) = (p.y_stride as usize, p.uv_stride as usize);
+                    let y_plane: &mut [u8] = p.y_plane.borrow_mut();
+                    let uv_plane: &mut [u8] = p.uv_plane.borrow_mut();
+                    return std::thread::scope(|scope| -> Result<()> {
+                        let mut handles = Vec::with_capacity(threads);
+                        let mut rem_src = data;
+                        let mut rem_y = y_plane;
+                        let mut rem_uv = uv_plane;
+                        let mut start_y = 0usize;
+                        for ti in 0..threads {
+                            let last = ti + 1 == threads;
+                            let end_y = if last { total_h } else { (start_y + slice_rows).min(total_h) };
+                            let strip_h = end_y - start_y;
+                            let src_part = if last {
+                                rem_src
+                            } else {
+                                let (part, next) = rem_src.split_at(strip_h * src_stride);
+                                rem_src = next;
+                                part
+                            };
+                            let (y_part, uv_part) = if last {
+                                (std::mem::take(&mut rem_y), std::mem::take(&mut rem_uv))
+                            } else {
+                                let (yp, yn) = rem_y.split_at_mut(strip_h * y_stride);
+                                let (uvp, uvn) = rem_uv.split_at_mut((strip_h / 2) * uv_stride);
+                                rem_y = yn;
+                                rem_uv = uvn;
+                                (yp, uvp)
+                            };
+                            let fmt = frame.format;
+                            let stride = frame.stride;
+                            handles.push(scope.spawn(move || -> Result<()> {
+                                let mut sub = YuvBiPlanarImageMut {
+                                    y_plane: BufferStoreMut::Borrowed(y_part),
+                                    y_stride: y_stride as u32,
+                                    uv_plane: BufferStoreMut::Borrowed(uv_part),
+                                    uv_stride: uv_stride as u32,
+                                    width: w,
+                                    height: strip_h as u32,
+                                };
+                                let r = match fmt {
+                                    PixelFormat::Bgra => bgra_to_yuv_nv12(&mut sub, src_part, stride, range, matrix, mode),
+                                    PixelFormat::Rgba => rgba_to_yuv_nv12(&mut sub, src_part, stride, range, matrix, mode),
+                                };
+                                r.map_err(|e| anyhow::anyhow!("yuv conversion failed: {e}"))
+                            }));
+                            start_y = end_y;
+                            if last || start_y >= total_h {
+                                break;
+                            }
+                        }
+                        for h in handles {
+                            h.join().map_err(|_| anyhow::anyhow!("yuv worker panicked"))??;
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
+
         let res = match (self.layout, frame.format) {
             (InputLayout::I420, PixelFormat::Bgra) => {
                 bgra_to_yuv420(self.i420.as_mut().unwrap(), data, frame.stride, range, matrix, mode)
@@ -311,5 +511,66 @@ mod tests {
         let cropped = frame.crop(2, 2, 4, 2);
         assert_eq!((cropped.width, cropped.height), (4, 2));
         assert_eq!(cropped.data.len(), 32);
+    }
+
+    fn pattern(w: u32, h: u32, extra_stride: u32, format: PixelFormat) -> RawFrame {
+        let row = (w * 4) as usize;
+        let stride = row + extra_stride as usize;
+        let needed = stride * (h as usize - 1) + row;
+        let mut data = vec![0xA5u8; needed];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let i = y * stride + x * 4;
+                data[i] = ((x * 9 + y * 13) % 256) as u8;
+                data[i + 1] = (((x * 5) ^ (y * 17)) % 256) as u8;
+                data[i + 2] = ((x * 3 + y * 23) % 256) as u8;
+                data[i + 3] = 255;
+            }
+        }
+        RawFrame { data, width: w, height: h, stride: stride as u32, format, pts: Duration::ZERO, mouse: None }
+    }
+
+    #[test]
+    fn parallel_yuv_matches_single_thread_exactly() {
+        for (w, h, pad) in [(64, 18, 0), (66, 20, 16), (128, 34, 8)] {
+            for fmt in [PixelFormat::Bgra, PixelFormat::Rgba] {
+                let frame = pattern(w, h, pad, fmt);
+                for layout in [InputLayout::Nv12, InputLayout::I420] {
+                    let mut c1 = Converter::new(w, h, layout).unwrap();
+                    let mut c4 = Converter::new(w, h, layout).unwrap();
+                    c1.convert_with_threads(&frame, 1).unwrap();
+                    c4.convert_with_threads(&frame, 4).unwrap();
+                    match (c1.frame(), c4.frame()) {
+                        (
+                            FrameInput::Nv12 { y: y1, uv: uv1, .. },
+                            FrameInput::Nv12 { y: y4, uv: uv4, .. },
+                        ) => {
+                            assert_eq!(y1, y4, "Nv12 Y mismatch {w}x{h} pad={pad} {fmt:?}");
+                            assert_eq!(uv1, uv4, "Nv12 UV mismatch {w}x{h} pad={pad} {fmt:?}");
+                        }
+                        (
+                            FrameInput::I420 { y: y1, u: u1, v: v1, .. },
+                            FrameInput::I420 { y: y4, u: u4, v: v4, .. },
+                        ) => {
+                            assert_eq!(y1, y4, "I420 Y mismatch {w}x{h} pad={pad} {fmt:?}");
+                            assert_eq!(u1, u4, "I420 U mismatch {w}x{h} pad={pad} {fmt:?}");
+                            assert_eq!(v1, v4, "I420 V mismatch {w}x{h} pad={pad} {fmt:?}");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_downscale_half_matches_single_thread_exactly() {
+        let frame = pattern(65, 37, 12, PixelFormat::Bgra);
+        let mut r1 = RawFrame::empty(PixelFormat::Bgra);
+        let mut r4 = RawFrame::empty(PixelFormat::Bgra);
+        frame.downscale_half_into_with_threads(&mut r1, 1);
+        frame.downscale_half_into_with_threads(&mut r4, 4);
+        assert_eq!((r1.width, r1.height, r1.stride), (r4.width, r4.height, r4.stride));
+        assert_eq!(r1.data, r4.data);
     }
 }

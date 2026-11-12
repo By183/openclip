@@ -25,6 +25,15 @@ impl Muxer {
         video: VideoTrackConfig,
         audio: Option<AudioTrackConfig>,
     ) -> Result<Self> {
+        Self::create_multi(container, path, video, audio.into_iter().collect())
+    }
+
+    pub fn create_multi(
+        container: Container,
+        path: &Path,
+        video: VideoTrackConfig,
+        audio_tracks: Vec<AudioTrackConfig>,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -33,8 +42,8 @@ impl Muxer {
         let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
         let out = BufWriter::with_capacity(1 << 20, file);
         match container {
-            Container::Mp4 => Ok(Muxer::Mp4(Mp4Writer::new(out, Some(video), audio)?)),
-            Container::Avi => Ok(Muxer::Avi(AviWriter::new(out, video, audio)?)),
+            Container::Mp4 => Ok(Muxer::Mp4(Mp4Writer::with_audio_tracks(out, Some(video), audio_tracks)?)),
+            Container::Avi => Ok(Muxer::Avi(AviWriter::with_audio_tracks(out, video, audio_tracks)?)),
         }
     }
 
@@ -42,6 +51,13 @@ impl Muxer {
         match self {
             Muxer::Mp4(m) => m.has_audio(),
             Muxer::Avi(m) => m.has_audio(),
+        }
+    }
+
+    pub fn audio_track_count(&self) -> usize {
+        match self {
+            Muxer::Mp4(m) => m.audio_track_count(),
+            Muxer::Avi(m) => m.audio_track_count(),
         }
     }
 
@@ -62,10 +78,24 @@ impl Muxer {
         }
     }
 
-    pub fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
+    pub fn finish_video(&mut self, end_pts: Duration) -> Result<()> {
         match self {
-            Muxer::Mp4(m) => m.push_audio(&frame.data),
-            Muxer::Avi(m) => m.push_audio(&frame.data, frame.samples),
+            Muxer::Mp4(m) => {
+                m.finish_video(end_pts);
+                Ok(())
+            }
+            Muxer::Avi(m) => m.finish_video(end_pts),
+        }
+    }
+
+    pub fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
+        self.push_audio_track(0, frame)
+    }
+
+    pub fn push_audio_track(&mut self, track: usize, frame: &AudioFrame) -> Result<()> {
+        match self {
+            Muxer::Mp4(m) => m.push_audio_track(track, &frame.data),
+            Muxer::Avi(m) => m.push_audio_track(track, &frame.data, frame.samples),
         }
     }
 

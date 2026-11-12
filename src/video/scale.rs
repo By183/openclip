@@ -5,8 +5,15 @@ use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer
 
 use super::convert::RawFrame;
 
+/// Minimum destination pixel count before horizontal strip parallelism kicks in
+/// (`1280×720`). Smaller frames stay single-threaded so thread-spawn overhead never dominates.
+const PARALLEL_MIN_PIXELS: usize = 1280 * 720;
+/// Cap worker strips at 4 so video prep stays fast without saturating all cores a game needs.
+const MAX_THREADS: usize = 4;
+
 pub struct Scaler {
-    resizer: Resizer,
+    resizers: Vec<Resizer>,
+    filter: FilterType,
     options: ResizeOptions,
     dst: (u32, u32),
     tight: Vec<u8>,
@@ -14,11 +21,18 @@ pub struct Scaler {
     scratch: Vec<u8>,
 }
 
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, MAX_THREADS)
+}
+
 /// Bilinear for mild downscaling keeps screen text crisp; a box filter avoids
 /// aliasing beyond 2×.
-fn alg(src: (u32, u32), dst: (u32, u32)) -> ResizeOptions {
+fn filter_for(src: (u32, u32), dst: (u32, u32)) -> FilterType {
     let ratio = (src.0 as f32 / dst.0.max(1) as f32).max(src.1 as f32 / dst.1.max(1) as f32);
-    let filter = if ratio > 2.0 { FilterType::Box } else { FilterType::Bilinear };
+    if ratio > 2.0 { FilterType::Box } else { FilterType::Bilinear }
+}
+
+fn alg(filter: FilterType) -> ResizeOptions {
     ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter)).use_alpha(false)
 }
 
@@ -74,7 +88,16 @@ fn fill_bars(data: &mut [u8], stride: usize, dh: u32, ox: u32, oy: u32, fw: u32,
 impl Scaler {
     /// Scales `src`-sized frames to `dst`.
     pub fn new(src: (u32, u32), dst: (u32, u32)) -> Self {
-        Self { resizer: Resizer::new(), options: alg(src, dst), dst, tight: Vec::new(), scratch: Vec::new() }
+        let filter = filter_for(src, dst);
+        let threads = default_threads();
+        Self {
+            resizers: (0..threads).map(|_| Resizer::new()).collect(),
+            filter,
+            options: alg(filter),
+            dst,
+            tight: Vec::new(),
+            scratch: Vec::new(),
+        }
     }
 
     pub fn dst(&self) -> (u32, u32) {
@@ -89,6 +112,18 @@ impl Scaler {
 
     /// Scales `frame` into `dst`, reusing `dst`'s buffer.
     pub fn scale_into(&mut self, frame: &RawFrame, dst: &mut RawFrame) {
+        let max_threads = if (self.dst.0 as usize).saturating_mul(self.dst.1 as usize) >= PARALLEL_MIN_PIXELS
+            && frame.height >= 16
+            && self.dst.1 >= 16
+        {
+            self.resizers.len()
+        } else {
+            1
+        };
+        self.scale_into_with_threads(frame, dst, max_threads);
+    }
+
+    fn scale_into_with_threads(&mut self, frame: &RawFrame, dst: &mut RawFrame, max_threads: usize) {
         let (w, h) = (frame.width, frame.height);
         dst.format = frame.format;
         dst.pts = frame.pts;
@@ -114,6 +149,69 @@ impl Scaler {
         } else {
             dst.data.truncate(needed);
         }
+
+        let threads = max_threads.min(self.resizers.len()).max(1);
+        let dst_slice_rows = (dh as usize / threads).max(1);
+        if threads > 1 && h >= 16 && dh >= 16 && dst_slice_rows < dh as usize {
+            let filter = self.filter;
+            let row_bytes = dw as usize * 4;
+            let src_row_bytes = w as usize * 4;
+            let scale_y = h as f64 / dh as f64;
+            // Generous vertical convolution support overlap so border coefficients match
+            // a single full-frame pass for both Bilinear and Box downscaling.
+            let r_src = 1.5 * scale_y.max(1.0) + 2.0;
+
+            let err = std::thread::scope(|s| -> Result<(), String> {
+                let mut handles = Vec::with_capacity(threads);
+                let mut rem_dst = dst.data.as_mut_slice();
+                let mut rem_resizers = self.resizers.as_mut_slice();
+                let mut start_dy = 0usize;
+                for ti in 0..threads {
+                    let end_dy = if ti + 1 == threads { dh as usize } else { (start_dy + dst_slice_rows).min(dh as usize) };
+                    let strip_h = end_dy - start_dy;
+                    let (dst_part, dst_next) = rem_dst.split_at_mut(strip_h * row_bytes);
+                    rem_dst = dst_next;
+                    let (r_head, r_tail) = rem_resizers.split_first_mut().unwrap();
+                    rem_resizers = r_tail;
+
+                    let src_top = ((start_dy as f64 + 0.5) * scale_y - r_src).floor().max(0.0) as u32;
+                    let src_bot = (((end_dy as f64 - 0.5) * scale_y + r_src).ceil() as u32).min(h);
+                    let src_strip_h = src_bot - src_top;
+                    let src_strip = &src_bytes[src_top as usize * src_row_bytes..src_bot as usize * src_row_bytes];
+                    let top_crop = start_dy as f64 * scale_y - src_top as f64;
+                    let h_crop = strip_h as f64 * scale_y;
+                    let slice_opts = alg(filter).crop(0.0, top_crop, w as f64, h_crop);
+
+                    handles.push(s.spawn(move || -> Result<(), String> {
+                        let src_img = ImageRef::new(w, src_strip_h, src_strip, PixelType::U8x4)
+                            .map_err(|e| format!("bad source buffer: {e}"))?;
+                        let mut tgt_img = Image::from_slice_u8(dw, strip_h as u32, dst_part, PixelType::U8x4)
+                            .map_err(|e| format!("bad dest buffer: {e}"))?;
+                        r_head
+                            .resize(&src_img, &mut tgt_img, &slice_opts)
+                            .map_err(|e| format!("resize failed: {e}"))?;
+                        Ok(())
+                    }));
+                    start_dy = end_dy;
+                }
+                for h in handles {
+                    h.join().map_err(|_| "scale worker panicked".to_string())??;
+                }
+                Ok(())
+            });
+            match err {
+                Ok(()) => {
+                    dst.width = dw;
+                    dst.height = dh;
+                    dst.stride = dw * 4;
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("parallel resize fallback: {e}");
+                }
+            }
+        }
+
         let src = match ImageRef::new(w, h, src_bytes, PixelType::U8x4) {
             Ok(s) => s,
             Err(e) => {
@@ -123,7 +221,7 @@ impl Scaler {
             }
         };
         let mut target = Image::from_slice_u8(dw, dh, &mut dst.data, PixelType::U8x4).expect("sized above");
-        if let Err(e) = self.resizer.resize(&src, &mut target, &self.options) {
+        if let Err(e) = self.resizers[0].resize(&src, &mut target, &self.options) {
             log::warn!("resize failed: {e}");
             copy_source(dst);
             return;
@@ -164,14 +262,14 @@ impl Scaler {
         dst.stride = dw * 4;
 
         let (fw, fh) = fit_inside((w, h), (dw, dh));
-        let opts = alg((w, h), (fw, fh));
+        let opts = alg(filter_for((w, h), (fw, fh)));
         let src_bytes = pack(&mut self.tight, frame);
         self.scratch.resize(fw as usize * fh as usize * 4, 0);
         let mut fitted = false;
         if let Ok(src) = ImageRef::new(w, h, src_bytes, PixelType::U8x4)
             && let Ok(mut target) = Image::from_slice_u8(fw, fh, &mut self.scratch, PixelType::U8x4)
         {
-            fitted = self.resizer.resize(&src, &mut target, &opts).is_ok();
+            fitted = self.resizers[0].resize(&src, &mut target, &opts).is_ok();
         }
         if !fitted {
             // Nothing usable to show; a black frame still keeps the timeline going.
@@ -277,5 +375,51 @@ mod tests {
         let out2 = Scaler::new((w, h), (20, 10)).scale(&padded);
         assert_eq!((out2.width, out2.height), (20, 10));
         assert_eq!(&out2.data[..4], &[10, 20, 30, 255]);
+    }
+
+    fn pattern_frame(w: u32, h: u32) -> RawFrame {
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                data[i] = ((x * 7 + y * 13) % 256) as u8;
+                data[i + 1] = (((x * 3) ^ (y * 19)) % 256) as u8;
+                data[i + 2] = ((x * 11 + y * 5) % 256) as u8;
+                data[i + 3] = 255;
+            }
+        }
+        RawFrame { data, width: w, height: h, stride: w * 4, format: PixelFormat::Bgra, pts: Duration::ZERO, mouse: None }
+    }
+
+    #[test]
+    fn parallel_strips_match_single_thread_bilinear_and_box() {
+        for (src, dst) in [
+            ((320, 180), (240, 135)),  // Bilinear (4:3 downscale like 1440p->1080p)
+            ((257, 145), (192, 108)),  // Bilinear non-multiple
+            ((320, 180), (80, 45)),    // Box 4x (like 1440p->360p)
+            ((257, 145), (80, 44)),    // Box non-integer >2x
+            ((160, 90), (240, 135)),   // Bilinear upscale
+        ] {
+            let frame = pattern_frame(src.0, src.1);
+            let mut single = Scaler::new(src, dst);
+            let mut parallel = Scaler::new(src, dst);
+            let mut ref_out = RawFrame::empty(PixelFormat::Bgra);
+            let mut par_out = RawFrame::empty(PixelFormat::Bgra);
+            single.scale_into_with_threads(&frame, &mut ref_out, 1);
+            parallel.scale_into_with_threads(&frame, &mut par_out, 4);
+            assert_eq!(ref_out.width, par_out.width);
+            assert_eq!(ref_out.height, par_out.height);
+            let max_diff = ref_out
+                .data
+                .iter()
+                .zip(par_out.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_diff <= 1,
+                "src={src:?} dst={dst:?} diverged by max_diff={max_diff}"
+            );
+        }
     }
 }

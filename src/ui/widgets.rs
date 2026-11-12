@@ -542,6 +542,7 @@ pub fn status_capsule(
 }
 
 /// Clickable tinted capsule (the "Update to vX" chip).
+#[allow(dead_code)]
 pub fn capsule_button(ui: &mut Ui, tint: Tint, text: &str, tip: &str) -> Response {
     let color = tint.color();
     let resp = pill_button(ui, text, tinted(color, 46), tinted(color, 70), color, semibold(12.0), 26.0);

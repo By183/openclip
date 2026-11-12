@@ -16,6 +16,10 @@ use cpal::{Device, SampleFormat, Stream, StreamConfig};
 
 use super::Shared;
 
+/// Minimum buffered audio kept ahead of the playback callback before video
+/// decoding takes precedence.
+pub const LOW_WATER_MS: u64 = 150;
+
 /// How much decoded audio to keep ahead of the device.
 pub const HIGH_WATER_MS: u64 = 300;
 
@@ -166,6 +170,11 @@ impl Output {
         if let Err(e) = self.stream.pause() {
             log::warn!("playback stream pause: {e}");
         }
+    }
+
+    /// Minimum buffered audio before the worker prioritizes audio over video.
+    pub fn low_water_frames(&self) -> usize {
+        (self.rate as u64 * LOW_WATER_MS / 1000) as usize
     }
 
     /// Frames to buffer before the device runs dry.

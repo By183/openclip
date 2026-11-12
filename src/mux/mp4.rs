@@ -114,7 +114,8 @@ pub struct Mp4Writer<W: Write + Seek> {
     pos: u64,
     mdat_start: u64,
     video: Option<(Track, VideoTrackConfig)>,
-    audio: Option<(Track, AudioTrackConfig)>,
+    video_end_pts: Option<Duration>,
+    audio: Vec<(Track, AudioTrackConfig)>,
     params: Option<CodecParams>,
     scratch: Vec<u8>,
     finalized: bool,
@@ -123,17 +124,26 @@ pub struct Mp4Writer<W: Write + Seek> {
 impl<W: Write + Seek> Mp4Writer<W> {
     /// Starts a new file with the given tracks. At least one track is required.
     pub fn new(
-        mut out: W,
+        out: W,
         video: Option<VideoTrackConfig>,
         audio: Option<AudioTrackConfig>,
     ) -> Result<Self> {
-        if video.is_none() && audio.is_none() {
+        Self::with_audio_tracks(out, video, audio.into_iter().collect())
+    }
+
+    /// Starts a new file with an optional video track and zero or more audio tracks.
+    pub fn with_audio_tracks(
+        mut out: W,
+        video: Option<VideoTrackConfig>,
+        audio_tracks: Vec<AudioTrackConfig>,
+    ) -> Result<Self> {
+        if video.is_none() && audio_tracks.is_empty() {
             bail!("MP4 needs at least one track");
         }
-        if let Some(a) = &audio
-            && matches!(a.codec, AudioCodecConfig::Pcm { .. })
-        {
-            bail!("PCM audio is not supported in MP4; use AVI");
+        for a in &audio_tracks {
+            if matches!(a.codec, AudioCodecConfig::Pcm { .. }) {
+                bail!("PCM audio is not supported in MP4; use AVI");
+            }
         }
         let hevc = video.as_ref().map(|v| v.codec == VideoCodecConfig::Hevc).unwrap_or(false);
         let mut ftyp = Buf::new();
@@ -154,11 +164,19 @@ impl<W: Write + Seek> Mp4Writer<W> {
             pos: mdat_start + 16,
             mdat_start,
             video: video.map(|c| (Track::new(VIDEO_TIMESCALE), c)),
-            audio: audio.map(|c| (Track::new(c.sample_rate), c)),
+            video_end_pts: None,
+            audio: audio_tracks.into_iter().map(|c| (Track::new(c.sample_rate), c)).collect(),
             params: None,
             scratch: Vec::new(),
             finalized: false,
         })
+    }
+
+    /// Extends the final video sample's presentation duration up to `end_pts`
+    /// so variable-frame-rate recordings that end on a static screen match the
+    /// full wall-clock/audio duration without writing duplicate frames.
+    pub fn finish_video(&mut self, end_pts: Duration) {
+        self.video_end_pts = Some(end_pts);
     }
 
     pub fn has_video(&self) -> bool {
@@ -166,7 +184,11 @@ impl<W: Write + Seek> Mp4Writer<W> {
     }
 
     pub fn has_audio(&self) -> bool {
-        self.audio.is_some()
+        !self.audio.is_empty()
+    }
+
+    pub fn audio_track_count(&self) -> usize {
+        self.audio.len()
     }
 
     /// Registers the codec parameter sets (start-code-free NALs). Only the
@@ -214,9 +236,14 @@ impl<W: Write + Seek> Mp4Writer<W> {
         Self::push_sample(&mut self.out, &mut self.pos, track, sample, &self.scratch)
     }
 
-    /// Appends one audio frame (MP3 frame / AAC access unit). Audio samples are assumed contiguous.
+    /// Appends one audio frame (MP3 frame / AAC access unit) to track 0. Audio samples are assumed contiguous.
     pub fn push_audio(&mut self, frame: &[u8]) -> Result<()> {
-        let (track, cfg) = self.audio.as_mut().context("no audio track")?;
+        self.push_audio_track(0, frame)
+    }
+
+    /// Appends one audio frame (MP3 frame / AAC access unit) to audio track `index`.
+    pub fn push_audio_track(&mut self, index: usize, frame: &[u8]) -> Result<()> {
+        let (track, cfg) = self.audio.get_mut(index).with_context(|| format!("no audio track {index}"))?;
         let ticks = track.samples.len() as u64 * cfg.samples_per_frame as u64;
         let sample = Sample { size: frame.len() as u32, pts: ticks, keyframe: true };
         Self::push_sample(&mut self.out, &mut self.pos, track, sample, frame)
@@ -263,9 +290,14 @@ impl<W: Write + Seek> Mp4Writer<W> {
         self.video.as_ref().map(|(t, _)| t.samples.len()).unwrap_or(0)
     }
 
-    /// Number of audio samples (MP3 frames) pushed so far.
+    /// Number of audio samples (MP3 frames) pushed so far on track 0.
     pub fn audio_samples(&self) -> usize {
-        self.audio.as_ref().map(|(t, _)| t.samples.len()).unwrap_or(0)
+        self.audio_track_samples(0)
+    }
+
+    /// Number of audio samples pushed so far on audio track `index`.
+    pub fn audio_track_samples(&self, index: usize) -> usize {
+        self.audio.get(index).map(|(t, _)| t.samples.len()).unwrap_or(0)
     }
 
     /// Writes the remaining chunks and the `moov` box, then flushes the writer.
@@ -273,7 +305,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
         if let Some((track, _)) = self.video.as_mut() {
             Self::flush_chunk(&mut self.out, &mut self.pos, track)?;
         }
-        if let Some((track, _)) = self.audio.as_mut() {
+        for (track, _) in &mut self.audio {
             Self::flush_chunk(&mut self.out, &mut self.pos, track)?;
         }
         // Patch mdat largesize.
@@ -301,7 +333,15 @@ impl<W: Write + Seek> Mp4Writer<W> {
             }
             let params = self.params.as_ref().context("no parameter sets recorded for video track")?;
             let fallback = (track.timescale as f64 / cfg.fps.max(1.0)).round() as u32;
-            let deltas = track.deltas(fallback);
+            let mut deltas = track.deltas(fallback);
+            if let (Some(end_pts), Some(first), Some(last)) = (self.video_end_pts, track.first_pts, track.samples.last()) {
+                let end_ticks = duration_to_ticks(end_pts.saturating_sub(first), track.timescale);
+                if end_ticks > last.pts
+                    && let Some(d) = deltas.last_mut()
+                {
+                    *d = (end_ticks - last.pts).clamp(1, u32::MAX as u64) as u32;
+                }
+            }
             let dur_ticks = track.duration_ticks(*deltas.last().unwrap());
             let movie_dur = rescale(dur_ticks, track.timescale, MOVIE_TIMESCALE);
             let stsd = match (cfg.codec, params) {
@@ -324,9 +364,10 @@ impl<W: Write + Seek> Mp4Writer<W> {
             tracks.push((trak, movie_dur));
             next_track_id += 1;
         }
-        if let Some((track, cfg)) = &self.audio
-            && !track.samples.is_empty()
-        {
+        for (track, cfg) in &self.audio {
+            if track.samples.is_empty() {
+                continue;
+            }
             let deltas = track.deltas(cfg.samples_per_frame);
             let dur_ticks = track.duration_ticks(cfg.samples_per_frame);
             let movie_dur = rescale(dur_ticks, track.timescale, MOVIE_TIMESCALE);

@@ -41,7 +41,12 @@ const AVI_INDEX_OF_INDEXES: u8 = 0;
 const AVI_INDEX_OF_CHUNKS: u8 = 1;
 
 const VIDEO_CHUNK: [u8; 4] = *b"00dc";
-const AUDIO_CHUNK: [u8; 4] = *b"01wb";
+const MAX_AUDIO_TRACKS: usize = 8;
+
+fn audio_chunk_id(track_idx: usize) -> [u8; 4] {
+    let stream = track_idx + 1;
+    [b'0' + (stream / 10) as u8, b'0' + (stream % 10) as u8, b'w', b'b']
+}
 
 /// Little-endian byte buffer with RIFF helpers.
 #[derive(Default)]
@@ -134,11 +139,31 @@ struct StreamIndex {
     max_chunk: u32,
 }
 
+struct AviAudioTrack {
+    config: AudioTrackConfig,
+    stream: StreamIndex,
+    samples: u64,
+    bytes: u64,
+    chunks: u64,
+}
+
+impl AviAudioTrack {
+    fn new(config: AudioTrackConfig) -> Self {
+        Self {
+            config,
+            stream: StreamIndex::default(),
+            samples: 0,
+            bytes: 0,
+            chunks: 0,
+        }
+    }
+}
+
 pub struct AviWriter<W: Write + Seek> {
     out: W,
     pos: u64,
     video: VideoTrackConfig,
-    audio: Option<AudioTrackConfig>,
+    audio: Vec<AviAudioTrack>,
     fps: u32,
     header_len: u64,
     riff_start: u64,
@@ -146,7 +171,7 @@ pub struct AviWriter<W: Write + Seek> {
     movi_pos: u64,
     riff_index: u32,
     max_riff: u64,
-    streams: [StreamIndex; 2],
+    video_stream: StreamIndex,
     first_pts: Option<Duration>,
     next_slot: u64,
     /// Video chunks in the first RIFF / in total (including empty ones).
@@ -154,38 +179,43 @@ pub struct AviWriter<W: Write + Seek> {
     /// Size field of the first RIFF once closed (re-applied after the header rewrite).
     riff0_size: u32,
     total_frames: u64,
-    audio_samples: u64,
-    audio_bytes: u64,
-    audio_chunks: u64,
     finalized: bool,
 }
 
 impl<W: Write + Seek> AviWriter<W> {
     pub fn new(out: W, video: VideoTrackConfig, audio: Option<AudioTrackConfig>) -> Result<Self> {
+        Self::with_audio_tracks(out, video, audio.into_iter().collect())
+    }
+
+    pub fn with_audio_tracks(
+        out: W,
+        video: VideoTrackConfig,
+        audio_tracks: Vec<AudioTrackConfig>,
+    ) -> Result<Self> {
         if video.width == 0 || video.height == 0 {
             bail!("AVI needs video dimensions");
+        }
+        if audio_tracks.len() > MAX_AUDIO_TRACKS {
+            bail!("AVI supports at most {MAX_AUDIO_TRACKS} audio tracks");
         }
         let fps = video.fps.round().max(1.0) as u32;
         let mut w = Self {
             out,
             pos: 0,
             video,
-            audio,
+            audio: audio_tracks.into_iter().map(AviAudioTrack::new).collect(),
             fps,
             header_len: 0,
             riff_start: 0,
             movi_pos: 0,
             riff_index: 0,
             max_riff: MAX_RIFF,
-            streams: [StreamIndex::default(), StreamIndex::default()],
+            video_stream: StreamIndex::default(),
             first_pts: None,
             next_slot: 0,
             riff0_frames: 0,
             riff0_size: 0,
             total_frames: 0,
-            audio_samples: 0,
-            audio_bytes: 0,
-            audio_chunks: 0,
             finalized: false,
         };
         let header = w.build_header();
@@ -202,7 +232,11 @@ impl<W: Write + Seek> AviWriter<W> {
     }
 
     pub fn has_audio(&self) -> bool {
-        self.audio.is_some()
+        !self.audio.is_empty()
+    }
+
+    pub fn audio_track_count(&self) -> usize {
+        self.audio.len()
     }
 
     pub fn bytes_written(&self) -> u64 {
@@ -221,21 +255,25 @@ impl<W: Write + Seek> AviWriter<W> {
             VideoCodecConfig::Hevc => *b"HEVC",
         };
         let video_bps = self.video_bitrate_hint();
-        let audio_bps = self.audio.as_ref().map(|a| a.bitrate_bps).unwrap_or(0);
-        let streams = if self.audio.is_some() { 2 } else { 1 };
-        let [vs, aus] = &self.streams;
+        let audio_bps: u32 = self.audio.iter().fold(0u32, |acc, a| acc.saturating_add(a.config.bitrate_bps));
+        let streams = 1 + self.audio.len() as u32;
+        let vs = &self.video_stream;
+        let max_chunk = self
+            .audio
+            .iter()
+            .fold(vs.max_chunk, |m, a| m.max(a.stream.max_chunk));
         let mut b = Le::default();
         b.fourcc(b"RIFF").u32(0).fourcc(b"AVI ");
         b.list(b"hdrl", |b| {
             b.chunk(b"avih", |b| {
                 b.u32(1_000_000 / self.fps);
-                b.u32((video_bps + audio_bps) / 8);
+                b.u32(video_bps.saturating_add(audio_bps) / 8);
                 b.u32(0); // padding granularity
                 b.u32(AVIF_HASINDEX | AVIF_ISINTERLEAVED | AVIF_TRUSTCKTYPE);
                 b.u32(self.riff0_frames);
                 b.u32(0); // initial frames
                 b.u32(streams);
-                b.u32(vs.max_chunk.max(aus.max_chunk));
+                b.u32(max_chunk);
                 b.u32(v.width).u32(v.height);
                 b.zeros(16);
             });
@@ -260,15 +298,17 @@ impl<W: Write + Seek> AviWriter<W> {
                 });
                 super_index(b, &VIDEO_CHUNK, &vs.supers);
             });
-            if let Some(a) = &self.audio {
+            for (idx, a) in self.audio.iter().enumerate() {
+                let chunk_id = audio_chunk_id(idx);
+                let cfg = &a.config;
                 b.list(b"strl", |b| {
-                    let (scale, rate, sample_size, length) = match &a.codec {
+                    let (scale, rate, sample_size, length) = match &cfg.codec {
                         AudioCodecConfig::Pcm { .. } => {
-                            let align = a.channels as u32 * 2;
-                            (align, a.sample_rate * align, align, self.audio_samples)
+                            let align = cfg.channels as u32 * 2;
+                            (align, cfg.sample_rate * align, align, a.samples)
                         }
                         // Byte-based CBR: one tick per byte.
-                        _ => (1, (a.bitrate_bps / 8).max(1), 1, self.audio_bytes),
+                        _ => (1, (cfg.bitrate_bps / 8).max(1), 1, a.bytes),
                     };
                     b.chunk(b"strh", |b| {
                         b.fourcc(b"auds").u32(0);
@@ -276,13 +316,13 @@ impl<W: Write + Seek> AviWriter<W> {
                         b.u32(scale).u32(rate);
                         b.u32(0);
                         b.u32(length.min(u32::MAX as u64) as u32);
-                        b.u32(aus.max_chunk);
+                        b.u32(a.stream.max_chunk);
                         b.u32(u32::MAX);
                         b.u32(sample_size);
                         b.i16(0).i16(0).i16(0).i16(0);
                     });
-                    b.chunk(b"strf", |b| wave_format(b, a));
-                    super_index(b, &AUDIO_CHUNK, &aus.supers);
+                    b.chunk(b"strf", |b| wave_format(b, cfg));
+                    super_index(b, &chunk_id, &a.stream.supers);
                 });
             }
             b.list(b"odml", |b| {
@@ -304,7 +344,7 @@ impl<W: Write + Seek> AviWriter<W> {
     fn video_bitrate_hint(&self) -> u32 {
         // Rough estimate from what was written so far, for `dwMaxBytesPerSec`.
         let frames = self.total_frames.max(1);
-        let bytes: u64 = self.streams[0].legacy.iter().map(|e| e.size as u64).sum();
+        let bytes: u64 = self.video_stream.legacy.iter().map(|e| e.size as u64).sum();
         ((bytes * 8 * self.fps as u64) / frames).min(u32::MAX as u64) as u32
     }
 
@@ -332,14 +372,40 @@ impl<W: Write + Seek> AviWriter<W> {
         Ok(())
     }
 
+    fn stream_mut(&mut self, stream: usize) -> &mut StreamIndex {
+        if stream == 0 {
+            &mut self.video_stream
+        } else {
+            &mut self.audio[stream - 1].stream
+        }
+    }
+
+    fn has_current_entries(&self) -> bool {
+        !self.video_stream.current.is_empty() || self.audio.iter().any(|a| !a.stream.current.is_empty())
+    }
+
+    fn reserve_for_riff(&self) -> u64 {
+        let mut bytes = 32 + 8 * self.video_stream.current.len() as u64;
+        for a in &self.audio {
+            bytes += 32 + 8 * a.stream.current.len() as u64;
+        }
+        if self.riff_index == 0 {
+            let mut legacy = self.video_stream.legacy.len();
+            for a in &self.audio {
+                legacy += a.stream.legacy.len();
+            }
+            bytes += 16 * legacy as u64 + 8;
+        }
+        bytes
+    }
+
     /// Writes one data chunk covering `ticks` of stream time, rolling over to
     /// a new RIFF first if it would not fit.
     fn write_chunk(&mut self, stream: usize, id: &[u8; 4], data: &[u8], keyframe: bool, ticks: u64) -> Result<()> {
         let needed = 8 + data.len() as u64 + (data.len() % 2) as u64;
-        // Keep room for the two standard indexes (+ idx1 in the first RIFF).
-        let index_reserve: u64 = self.streams.iter().map(|s| 32 + 8 * s.current.len() as u64).sum::<u64>()
-            + if self.riff_index == 0 { 16 * (self.streams[0].legacy.len() + self.streams[1].legacy.len()) as u64 + 8 } else { 0 };
-        if self.pos + needed + index_reserve + 1024 > self.riff_start + self.max_riff && !self.streams[stream].current.is_empty() {
+        // Keep room for all standard indexes (+ idx1 in the first RIFF).
+        let index_reserve = self.reserve_for_riff();
+        if self.pos + needed + index_reserve + 1024 > self.riff_start + self.max_riff && self.has_current_entries() {
             self.close_riff()?;
             self.riff_index += 1;
             self.open_movi()?;
@@ -353,10 +419,11 @@ impl<W: Write + Seek> AviWriter<W> {
             self.write(&[0])?;
         }
         let entry = IndexEntry { header_pos, size: data.len() as u32, keyframe };
-        let s = &mut self.streams[stream];
+        let riff0 = self.riff_index == 0;
+        let s = self.stream_mut(stream);
         s.current.push(entry);
         s.current_duration += ticks;
-        if self.riff_index == 0 {
+        if riff0 {
             s.legacy.push(entry);
         }
         s.max_chunk = s.max_chunk.max(data.len() as u32);
@@ -380,6 +447,19 @@ impl<W: Write + Seek> AviWriter<W> {
         Ok(true)
     }
 
+    /// Pads trailing empty slots up to `end_pts` so variable-frame-rate recordings
+    /// ending on a static frame preserve full video duration in fixed-rate AVI.
+    pub fn finish_video(&mut self, end_pts: Duration) -> Result<()> {
+        if let Some(first) = self.first_pts {
+            let end_slot = (end_pts.saturating_sub(first).as_secs_f64() * self.fps as f64).round() as u64;
+            while self.next_slot < end_slot {
+                self.write_chunk(0, &VIDEO_CHUNK, &[], false, 1)?;
+                self.count_frame();
+            }
+        }
+        Ok(())
+    }
+
     fn count_frame(&mut self) {
         self.next_slot += 1;
         self.total_frames += 1;
@@ -388,59 +468,85 @@ impl<W: Write + Seek> AviWriter<W> {
         }
     }
 
-    /// Appends one audio frame (`samples` PCM frames per channel).
+    /// Appends one audio frame (`samples` PCM frames per channel) to track 0.
     pub fn push_audio(&mut self, data: &[u8], samples: u32) -> Result<()> {
-        let Some(a) = &self.audio else { bail!("no audio track") };
-        let ticks = match a.codec {
+        self.push_audio_track(0, data, samples)
+    }
+
+    /// Appends one audio frame (`samples` PCM frames per channel) to audio track `index`.
+    pub fn push_audio_track(&mut self, index: usize, data: &[u8], samples: u32) -> Result<()> {
+        let a = self.audio.get(index).with_context(|| format!("no audio track {index}"))?;
+        let ticks = match a.config.codec {
             AudioCodecConfig::Pcm { .. } => samples as u64,
             _ => data.len() as u64,
         };
-        self.write_chunk(1, &AUDIO_CHUNK, data, true, ticks)?;
-        self.audio_samples += samples as u64;
-        self.audio_bytes += data.len() as u64;
-        self.audio_chunks += 1;
+        let id = audio_chunk_id(index);
+        self.write_chunk(index + 1, &id, data, true, ticks)?;
+        let a = &mut self.audio[index];
+        a.samples += samples as u64;
+        a.bytes += data.len() as u64;
+        a.chunks += 1;
         Ok(())
+    }
+
+    fn write_standard_index(&mut self, id: [u8; 4], entries: &[IndexEntry]) -> Result<(u64, u32)> {
+        let ix_pos = self.pos;
+        let mut b = Le::default();
+        let ix_id = [b'i', b'x', id[0], id[1]];
+        b.chunk(&ix_id, |b| {
+            b.u16(2).u8(0).u8(AVI_INDEX_OF_CHUNKS);
+            b.u32(entries.len() as u32);
+            b.fourcc(&id);
+            b.u64(self.movi_pos);
+            b.u32(0);
+            for e in entries {
+                b.u32((e.header_pos + 8 - self.movi_pos) as u32);
+                b.u32(if e.keyframe { e.size } else { e.size | 0x8000_0000 });
+            }
+        });
+        self.write(&b.0)?;
+        Ok((ix_pos, b.0.len() as u32))
     }
 
     /// Writes the standard indexes of the current RIFF, patches its sizes and,
     /// for the first RIFF, appends the legacy `idx1`.
     fn close_riff(&mut self) -> Result<()> {
-        let stream_count = if self.audio.is_some() { 2 } else { 1 };
-        for stream in 0..stream_count {
-            let id = if stream == 0 { VIDEO_CHUNK } else { AUDIO_CHUNK };
-            let entries = std::mem::take(&mut self.streams[stream].current);
-            let duration = std::mem::take(&mut self.streams[stream].current_duration);
-            if entries.is_empty() && stream == 1 {
+        let v_entries = std::mem::take(&mut self.video_stream.current);
+        let v_dur = std::mem::take(&mut self.video_stream.current_duration);
+        let (ix_pos, ix_len) = self.write_standard_index(VIDEO_CHUNK, &v_entries)?;
+        self.video_stream.supers.push(SuperEntry {
+            offset: ix_pos,
+            size: ix_len,
+            duration: v_dur.min(u32::MAX as u64) as u32,
+        });
+
+        let audio_count = self.audio.len();
+        for idx in 0..audio_count {
+            let entries = std::mem::take(&mut self.audio[idx].stream.current);
+            let dur = std::mem::take(&mut self.audio[idx].stream.current_duration);
+            if entries.is_empty() {
                 continue;
             }
-            let ix_pos = self.pos;
-            let mut b = Le::default();
-            let ix_id = [b'i', b'x', id[0], id[1]];
-            b.chunk(&ix_id, |b| {
-                b.u16(2).u8(0).u8(AVI_INDEX_OF_CHUNKS);
-                b.u32(entries.len() as u32);
-                b.fourcc(&id);
-                b.u64(self.movi_pos);
-                b.u32(0);
-                for e in &entries {
-                    b.u32((e.header_pos + 8 - self.movi_pos) as u32);
-                    b.u32(if e.keyframe { e.size } else { e.size | 0x8000_0000 });
-                }
-            });
-            self.write(&b.0)?;
-            self.streams[stream].supers.push(SuperEntry {
+            let id = audio_chunk_id(idx);
+            let (ix_pos, ix_len) = self.write_standard_index(id, &entries)?;
+            self.audio[idx].stream.supers.push(SuperEntry {
                 offset: ix_pos,
-                size: b.0.len() as u32,
-                duration: duration.min(u32::MAX as u64) as u32,
+                size: ix_len,
+                duration: dur.min(u32::MAX as u64) as u32,
             });
         }
+
         // Patch the movi LIST size (the size counts the `movi` type + payload).
         let movi_size = self.pos - self.movi_pos;
         self.patch_u32(self.movi_pos - 4, movi_size as u32)?;
         if self.riff_index == 0 {
             let mut legacy: Vec<(u64, [u8; 4], IndexEntry)> = Vec::new();
-            for (stream, id) in [(0usize, VIDEO_CHUNK), (1usize, AUDIO_CHUNK)] {
-                for e in std::mem::take(&mut self.streams[stream].legacy) {
+            for e in std::mem::take(&mut self.video_stream.legacy) {
+                legacy.push((e.header_pos, VIDEO_CHUNK, e));
+            }
+            for idx in 0..audio_count {
+                let id = audio_chunk_id(idx);
+                for e in std::mem::take(&mut self.audio[idx].stream.legacy) {
                     legacy.push((e.header_pos, id, e));
                 }
             }

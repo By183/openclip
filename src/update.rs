@@ -12,22 +12,19 @@
 //! a folder of the same stem with the binary, LICENSE and README; only the
 //! binary is taken out of the archive.
 
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use semver::Version;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 pub const REPO: &str = "catalingrigoriev285/openclip";
-/// The human-facing page for the newest release (fallback when in-app install is not possible).
+/// The human-facing page for the newest release (reference link only; in-app checks are disabled).
 pub const RELEASES_URL: &str = "https://github.com/catalingrigoriev285/openclip/releases/latest";
-const API_URL: &str = "https://api.github.com/repos/catalingrigoriev285/openclip/releases/latest";
 /// File name of the binary inside the release archive.
 pub const BIN_NAME: &str = if cfg!(windows) { "openclip.exe" } else { "openclip" };
 /// The game-capture hook shipped beside the executable, when this platform has
@@ -57,8 +54,6 @@ pub const TARGET_SUFFIX: Option<&str> = Some("macos-arm64.tar.gz");
     all(target_os = "macos", target_arch = "aarch64")
 )))]
 pub const TARGET_SUFFIX: Option<&str> = None;
-
-const DOWNLOAD_BLOCK: usize = 64 * 1024;
 
 /// A downloadable release archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,64 +101,14 @@ pub fn is_newer(remote: &Version, local: &Version) -> bool {
     remote > local
 }
 
-/// Queries GitHub for the latest release, whatever version it is.
-///
-/// [`check`] is this plus the "is it newer" gate. The ungated form is what
-/// [`repair_sidecar`] needs: a build that is already up to date is exactly the
-/// one that can be missing its hook DLL, and it never receives a `Release`.
+/// Update checking against the upstream GitHub repository is disabled in this build.
 pub fn latest() -> anyhow::Result<Release> {
-    let json = fetch_latest_json()?;
-    let release = parse_release(&json)?;
-    log::info!("update check: latest release is {} (running {})", release.version, local_version());
-    Ok(release)
+    bail!("update checks are disabled in this build")
 }
 
-/// Queries GitHub for the latest release. `Ok(None)` means the running build is
-/// up to date (`/releases/latest` never returns drafts or pre-releases).
+/// Update checking against the upstream GitHub repository is disabled in this build.
 pub fn check() -> anyhow::Result<Option<Release>> {
-    let release = latest()?;
-    Ok(is_newer(&release.version, &local_version()).then_some(release))
-}
-
-fn fetch_latest_json() -> anyhow::Result<String> {
-    let result = agent(Duration::from_secs(10))
-        .get(API_URL)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .call();
-    let mut response = match result {
-        Ok(r) => r,
-        Err(ureq::Error::StatusCode(403 | 429)) => bail!("GitHub rate limit reached, try again later"),
-        Err(ureq::Error::StatusCode(404)) => bail!("no release has been published yet"),
-        Err(e) => return Err(anyhow!(e).context("contacting GitHub")),
-    };
-    response.body_mut().read_to_string().context("reading the GitHub response")
-}
-
-/// HTTP client: OS certificate store, sensible timeouts. `global` bounds the
-/// whole call (`None` for downloads, which are bounded per phase instead).
-fn agent(global: Duration) -> ureq::Agent {
-    let tls = ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build();
-    ureq::Agent::config_builder()
-        .timeout_global(Some(global))
-        .user_agent(format!("openclip/{}", env!("CARGO_PKG_VERSION")))
-        .http_status_as_error(true)
-        .tls_config(tls)
-        .build()
-        .new_agent()
-}
-
-fn download_agent() -> ureq::Agent {
-    let tls = ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build();
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
-        .timeout_recv_body(Some(Duration::from_secs(15 * 60)))
-        .user_agent(format!("openclip/{}", env!("CARGO_PKG_VERSION")))
-        .http_status_as_error(true)
-        .tls_config(tls)
-        .build()
-        .new_agent()
+    Ok(None)
 }
 
 #[derive(Deserialize)]
@@ -263,8 +208,10 @@ pub fn install_dir_writable() -> bool {
 }
 
 /// Removes leftover files on every exit path.
+#[cfg(test)]
 struct Cleanup(Vec<PathBuf>);
 
+#[cfg(test)]
 impl Drop for Cleanup {
     fn drop(&mut self) {
         for p in &self.0 {
@@ -277,125 +224,14 @@ impl Drop for Cleanup {
     }
 }
 
-/// Downloads the release archive next to the executable, verifies it, extracts
-/// the binary and replaces the running executable. Returns the executable path
-/// to hand to [`relaunch`]. Cancellation (via [`Progress::cancel`]) surfaces as
-/// an error; the caller can tell it apart by reading the flag.
-pub fn download_and_install(release: &Release, progress: &Progress) -> anyhow::Result<PathBuf> {
-    let asset = release.asset.as_ref().ok_or_else(|| anyhow!("no download for this platform"))?;
-    // Resolve the path before anything moves (on Linux /proc/self/exe changes after the swap).
-    let exe = std::env::current_exe().context("locating the executable")?;
-    let dir = exe.parent().ok_or_else(|| anyhow!("executable has no parent folder"))?.to_path_buf();
-    let exe_name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| BIN_NAME.into());
-    let ext = if asset.name.ends_with(".zip") { "zip" } else { "tar.gz" };
-    // Same folder (and volume) as the executable so the final rename is atomic.
-    let archive = dir.join(format!(".openclip-update-{}.{ext}", std::process::id()));
-    let new_exe = dir.join(format!("{exe_name}.new"));
-    let new_hook = HOOK_NAME.map(|n| dir.join(format!("{n}.new")));
-    let mut temporary = vec![archive.clone(), new_exe.clone()];
-    temporary.extend(new_hook.clone());
-    let _cleanup = Cleanup(temporary);
-
-    download_to(asset, &archive, progress)?;
-    if progress.cancel.load(Ordering::Relaxed) {
-        bail!("cancelled");
-    }
-
-    let mut wanted: Vec<(&str, &Path)> = vec![(BIN_NAME, new_exe.as_path())];
-    if let (Some(name), Some(path)) = (HOOK_NAME, new_hook.as_deref()) {
-        wanted.push((name, path));
-    }
-    let found = extract_files(&archive, &wanted, BIN_NAME)?;
-
-    // The sidecar goes first. If it cannot be replaced the whole update is
-    // abandoned, rather than leaving an executable and a hook from different
-    // builds — which the ABI check would then refuse to run together.
-    if let (Some(name), Some(new)) = (HOOK_NAME, new_hook.as_deref()) {
-        if found.iter().any(|f| f == name) {
-            replace_sidecar(&dir.join(name), new).context("replacing the game-capture component")?;
-        } else {
-            // Not fatal: an archive built before the hook existed simply has no
-            // DLL in it. Worth saying out loud, though — silence here is how an
-            // install ends up with a stale sidecar and no way to tell.
-            log::warn!("update: {} holds no {name}; the installed one is left as it is", asset.name);
-        }
-    }
-
-    self_replace::self_replace(&new_exe).context("replacing the executable")?;
-    log::info!("update: installed {} over {}", release.version, exe.display());
-    Ok(exe)
+/// Self-update downloads from the upstream repository are disabled in this build.
+pub fn download_and_install(_release: &Release, _progress: &Progress) -> anyhow::Result<PathBuf> {
+    bail!("in-app updates are disabled in this build")
 }
 
-/// Re-downloads the release archive and puts `HOOK_NAME` back beside the
-/// executable, without touching the executable itself.
-///
-/// For an install whose sidecar went missing (see [`sidecar_missing`]) but
-/// whose version is current, so no update will ever be offered. The DLL comes
-/// from `release`, so the caller must have checked that it is the *same*
-/// version as the running build: a hook and an executable from different builds
-/// are exactly what the ABI check refuses to run together.
-pub fn repair_sidecar(release: &Release, progress: &Progress) -> anyhow::Result<()> {
-    let name = HOOK_NAME.ok_or_else(|| anyhow!("this platform has no game-capture component"))?;
-    if release.version != local_version() {
-        bail!("the latest release is {}, not {} — install the update instead", release.version, local_version());
-    }
-    let asset = release.asset.as_ref().ok_or_else(|| anyhow!("no download for this platform"))?;
-    let dir = install_dir().ok_or_else(|| anyhow!("executable has no parent folder"))?;
-    let ext = if asset.name.ends_with(".zip") { "zip" } else { "tar.gz" };
-    // Same folder (and volume) as the executable so the final rename is atomic.
-    let archive = dir.join(format!(".openclip-repair-{}.{ext}", std::process::id()));
-    let new_hook = dir.join(format!("{name}.new"));
-    let _cleanup = Cleanup(vec![archive.clone(), new_hook.clone()]);
-
-    download_to(asset, &archive, progress)?;
-    if progress.cancel.load(Ordering::Relaxed) {
-        bail!("cancelled");
-    }
-    // Only the sidecar: the executable is already the right one, and replacing
-    // it here would need a restart the user did not ask for.
-    extract_files(&archive, &[(name, new_hook.as_path())], name)?;
-    replace_sidecar(&dir.join(name), &new_hook).context("restoring the game-capture component")?;
-    log::info!("update: restored {name} from {}", release.version);
-    Ok(())
-}
-
-fn download_to(asset: &Asset, dest: &Path, progress: &Progress) -> anyhow::Result<()> {
-    log::info!("update: downloading {} ({} bytes)", asset.url, asset.size);
-    let mut response =
-        download_agent().get(&asset.url).call().with_context(|| format!("downloading {}", asset.name))?;
-    let mut reader = response.body_mut().as_reader();
-    let mut file = File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; DOWNLOAD_BLOCK];
-    let mut total = 0u64;
-    loop {
-        if progress.cancel.load(Ordering::Relaxed) {
-            bail!("cancelled");
-        }
-        let n = reader.read(&mut buf).context("download interrupted")?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n]).context("writing the download")?;
-        hasher.update(&buf[..n]);
-        total += n as u64;
-        progress.downloaded.store(total, Ordering::Relaxed);
-        if asset.size > 0 && total > asset.size {
-            bail!("download is larger than announced ({} bytes)", asset.size);
-        }
-    }
-    file.flush()?;
-    drop(file);
-    if asset.size > 0 && total != asset.size {
-        bail!("incomplete download: {total} of {} bytes", asset.size);
-    }
-    let digest: [u8; 32] = hasher.finalize().into();
-    match asset.sha256 {
-        Some(expected) if expected != digest => bail!("checksum mismatch — the download is corrupt"),
-        Some(_) => log::info!("update: sha256 verified"),
-        None => log::warn!("update: GitHub published no digest for {}; checksum not verified", asset.name),
-    }
-    Ok(())
+/// Online sidecar repair from the upstream repository is disabled in this build.
+pub fn repair_sidecar(_release: &Release, _progress: &Progress) -> anyhow::Result<()> {
+    bail!("online sidecar repair is disabled in this build")
 }
 
 /// Pulls the named files out of the release archive (Windows: zip).
@@ -404,8 +240,10 @@ fn download_to(asset: &Asset, dest: &Path, progress: &Progress) -> anyhow::Resul
 /// except `required`: a full update needs [`BIN_NAME`] and tolerates an archive
 /// built before the hook existed, while a sidecar repair needs the sidecar and
 /// nothing else.
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn extract_files(archive: &Path, wanted: &[(&str, &Path)], required: &str) -> anyhow::Result<Vec<String>> {
+    use std::fs::File;
+    use std::io::Write;
     let file = File::open(archive)?;
     let mut zip = zip::ZipArchive::new(file).context("reading the zip archive")?;
     let mut found = Vec::new();
@@ -431,8 +269,10 @@ fn extract_files(archive: &Path, wanted: &[(&str, &Path)], required: &str) -> an
 /// Pulls the named files out of the release archive (Unix: tar.gz).
 ///
 /// See the Windows twin for why only [`BIN_NAME`] is required.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn extract_files(archive: &Path, wanted: &[(&str, &Path)], required: &str) -> anyhow::Result<Vec<String>> {
+    use std::fs::File;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let file = File::open(archive)?;
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
@@ -522,6 +362,8 @@ pub fn relaunch(exe: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Write;
     use super::*;
 
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -789,5 +631,14 @@ mod tests {
         drop(Cleanup(vec![junk.clone(), dir.join("never-created")]));
         assert!(!junk.exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn network_update_and_install_are_disabled() {
+        assert!(check().unwrap().is_none());
+        assert!(latest().is_err());
+        let rel = parse_release(&fixture()).unwrap();
+        assert!(download_and_install(&rel, &Progress::default()).is_err());
+        assert!(repair_sidecar(&rel, &Progress::default()).is_err());
     }
 }

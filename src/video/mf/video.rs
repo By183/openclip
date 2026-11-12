@@ -270,12 +270,14 @@ impl VideoEncoder for MfVideoEncoder {
         self.frames_in += 1;
         let outputs = self.session.process(&sample)?;
         let t2 = std::time::Instant::now();
-        let mut frames = Vec::with_capacity(outputs.len());
+        let out_count = outputs.len();
+        let mut frames = Vec::with_capacity(out_count);
         for s in &outputs {
             if let Some(f) = self.convert_output(s)? {
                 frames.push(f);
             }
         }
+        self.session.recycle_output(outputs);
         let t3 = std::time::Instant::now();
         if t3 - t0 > Duration::from_millis(8) {
             let (wait, input, pump) = self.session.last_timing;
@@ -287,7 +289,7 @@ impl VideoEncoder for MfVideoEncoder {
                 input as f64 / 1e3,
                 pump as f64 / 1e3,
                 (t3 - t2).as_secs_f64() * 1e3,
-                outputs.len()
+                out_count
             );
         }
         Ok(frames)
@@ -301,6 +303,7 @@ impl VideoEncoder for MfVideoEncoder {
                 frames.push(f);
             }
         }
+        self.session.recycle_output(outputs);
         log::info!("{}: {} frames in, {} out", self.description, self.frames_in, self.frames_out);
         Ok(frames)
     }

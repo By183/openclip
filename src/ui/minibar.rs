@@ -215,12 +215,20 @@ impl App {
 
             // ----- inputs -----
             ui.add_enabled_ui(!recording, |ui| {
+                let before_audio = (self.system_audio, self.mic_enabled);
                 let mic_name = match self.mics.get(self.mic_idx) {
                     Some(dev) => format!("{} ({dev})", t!(MICROPHONE)),
                     None => t!(MICROPHONE).to_string(),
                 };
                 icon_toggle(ui, icons::MIC, &mic_name, &mut self.mic_enabled);
-                icon_toggle(ui, icons::SPEAKER, t!(SYSTEM_AUDIO), &mut self.system_audio);
+                let sys_name = match &self.system_audio_device {
+                    Some(dev) => format!("{} ({dev})", t!(SYSTEM_AUDIO)),
+                    None => t!(SYSTEM_AUDIO).to_string(),
+                };
+                icon_toggle(ui, icons::SPEAKER, &sys_name, &mut self.system_audio);
+                if (self.system_audio, self.mic_enabled) != before_audio {
+                    self.save_settings();
+                }
                 let mut show_cursor = self.mouse_fx.read().unwrap().show_cursor;
                 let before = show_cursor;
                 icon_toggle(ui, icons::CURSOR, t!(CURSOR), &mut show_cursor);

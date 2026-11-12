@@ -104,6 +104,11 @@ impl Thumbs {
         }
     }
 
+    /// Drops the cached entry for `path`, if present (e.g. after deleting the file).
+    pub fn remove(&mut self, path: &Path) {
+        self.cache.remove(path);
+    }
+
     /// Drops textures for files that are no longer listed, so browsing a large
     /// folder does not grow the cache without bound.
     pub fn retain(&mut self, entries: &[Entry]) {
