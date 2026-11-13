@@ -571,3 +571,268 @@ fn finish_video_extends_final_frame_duration_for_vfr() {
     assert_eq!(stts.entries[0].sample_delta, 9_000);
     assert_eq!(stts.entries[1].sample_delta, 270_000);
 }
+
+struct TempMp4(std::path::PathBuf);
+
+impl TempMp4 {
+    fn new(name: &str) -> Self {
+        let mut p = std::env::temp_dir();
+        p.push(format!("openclip_test_{}_{name}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        Self(p)
+    }
+}
+
+impl Drop for TempMp4 {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn verify_mp4_decodes_cleanly(path: &std::path::Path, expected_frames: usize) {
+    assert!(expected_frames > 0, "expected at least one video frame");
+
+    #[cfg(windows)]
+    {
+        use openclip::capture::FramePool;
+        use openclip::player::decode::{Packet, Reader};
+        use openclip::video::mf::ComGuard;
+
+        let _com = ComGuard::new();
+        let pool = FramePool::new(4);
+        let mut reader = Reader::open(path, 640).expect("Media Foundation Reader::open");
+        let mut decoded = 0usize;
+        loop {
+            match reader.read(None, &pool, false).expect("MP4 frame decode must not error") {
+                Packet::Video { .. } => decoded += 1,
+                Packet::VideoSkipped { .. } | Packet::Audio { .. } | Packet::Idle => {}
+                Packet::End => break,
+            }
+        }
+        assert_eq!(
+            decoded, expected_frames,
+            "Media Foundation decoded {decoded} frames vs {expected_frames} encoded in {}",
+            path.display()
+        );
+    }
+
+    match std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-xerror", "-i"])
+        .arg(path)
+        .args(["-f", "null", "-"])
+        .output()
+    {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stderr.trim().is_empty(),
+                "ffmpeg reported decode errors (status {:?}): {stderr}",
+                out.status.code()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Optional in stripped CI containers; Media Foundation decode above still ran on Windows.
+        }
+        Err(e) => panic!("spawning ffmpeg decode verifier failed: {e}"),
+    }
+}
+
+#[test]
+fn adaptive_grid_cpu_mp4_decodes_cleanly() {
+    use openclip::pipeline::FrameClock;
+
+    let tmp = TempMp4::new("adaptive_cpu");
+    let mut converter = Converter::new(W, H, InputLayout::I420).unwrap();
+    let mut enc = H264Encoder::new(&EncoderRequest::simple(W, H, 120, 1_500_000)).unwrap();
+    let file = std::fs::File::create(&tmp.0).unwrap();
+    let mut mux = Mp4Writer::new(
+        std::io::BufWriter::new(file),
+        Some(VideoTrackConfig { width: W, height: H, fps: 120.0, codec: VideoCodecConfig::H264 }),
+        None,
+    )
+    .unwrap();
+
+    let mut frame = RawFrame {
+        data: vec![0u8; (W * H * 4) as usize],
+        width: W,
+        height: H,
+        stride: W * 4,
+        format: PixelFormat::Bgra,
+        pts: Duration::ZERO,
+        mouse: None,
+    };
+
+    let mut clock = FrameClock::new(120, Duration::ZERO);
+    let mut pushed = 0usize;
+    let mut params_sent = false;
+    let mut idx = 0u32;
+
+    for target_fps in [120u32, 90, 72, 60, 90] {
+        clock.set_fps(target_fps);
+        for _ in 0..30 {
+            let pts = clock.slot_pts(clock.next);
+            for (n, px) in frame.data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let x = (n as u32 % W + idx * 5) % W;
+                let y = n as u32 / W;
+                px[0] = (x * 255 / W) as u8;
+                px[1] = (y * 255 / H) as u8;
+                px[2] = if (x / 24).is_multiple_of(2) { 210 } else { 40 };
+                px[3] = 255;
+            }
+            converter.convert(&frame).unwrap();
+            for pkt in enc.encode(converter.frame(), pts).unwrap() {
+                if !params_sent && let Some(p) = enc.codec_params() {
+                    mux.set_codec_params(p);
+                    params_sent = true;
+                }
+                mux.push_video(&pkt.data, pkt.pts, pkt.keyframe).unwrap();
+                pushed += 1;
+            }
+            clock.mark_emitted(pts);
+            clock.next += 1;
+            idx += 1;
+        }
+    }
+    for pkt in enc.flush().unwrap() {
+        if !params_sent && let Some(p) = enc.codec_params() {
+            mux.set_codec_params(p);
+            params_sent = true;
+        }
+        mux.push_video(&pkt.data, pkt.pts, pkt.keyframe).unwrap();
+        pushed += 1;
+    }
+    mux.finalize().unwrap();
+    verify_mp4_decodes_cleanly(&tmp.0, pushed);
+}
+
+#[cfg(windows)]
+#[test]
+fn adaptive_grid_gpu_d3d11_mp4_decodes_cleanly() {
+    use openclip::pipeline::FrameClock;
+    use openclip::video::create_video_encoder_with_d3d;
+    use openclip::video::d3d11_vp::{enable_multithread, GpuCaptureProcessor};
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+        D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    const GW: u32 = 1280;
+    const GH: u32 = 720;
+
+    let mut dev_opt: Option<ID3D11Device> = None;
+    let mut ctx_opt: Option<ID3D11DeviceContext> = None;
+    let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+    let hr = unsafe {
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            windows::Win32::Foundation::HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            Some(&levels),
+            D3D11_SDK_VERSION,
+            Some(&mut dev_opt),
+            None,
+            Some(&mut ctx_opt),
+        )
+    };
+    let Ok(()) = hr else { return };
+    let (Some(device), Some(context)) = (dev_opt, ctx_opt) else { return };
+    enable_multithread(&device);
+
+    let mut req = EncoderRequest::simple(GW, GH, 120, 12_000_000);
+    req.codec = openclip::settings::VideoCodec::Auto;
+    let Ok((mut enc, _note)) = create_video_encoder_with_d3d(&req, Some(&device)) else { return };
+    if !enc.supports_d3d11() {
+        // No hardware D3D11 encoder on this runner; skip silently while CPU test always runs.
+        return;
+    }
+    let Ok(mut vp) = GpuCaptureProcessor::new(device.clone(), context.clone(), (GW, GH), (GW, GH), (GW, GH)) else {
+        return;
+    };
+
+    let tex_desc = D3D11_TEXTURE2D_DESC {
+        Width: GW,
+        Height: GH,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut src_opt: Option<ID3D11Texture2D> = None;
+    unsafe { device.CreateTexture2D(&tex_desc, None, Some(&mut src_opt)) }.unwrap();
+    let src_tex = src_opt.unwrap();
+
+    let tmp = TempMp4::new("adaptive_gpu");
+    let file = std::fs::File::create(&tmp.0).unwrap();
+    let mut mux = Mp4Writer::new(
+        std::io::BufWriter::new(file),
+        Some(VideoTrackConfig {
+            width: GW,
+            height: GH,
+            fps: 120.0,
+            codec: if enc.is_hevc() { VideoCodecConfig::Hevc } else { VideoCodecConfig::H264 },
+        }),
+        None,
+    )
+    .unwrap();
+
+    let mut bgra = vec![0u8; (GW * GH * 4) as usize];
+    let src_rect = RECT { left: 0, top: 0, right: GW as i32, bottom: GH as i32 };
+    let mut clock = FrameClock::new(120, Duration::ZERO);
+    let mut pushed = 0usize;
+    let mut params_sent = false;
+    let mut idx = 0u32;
+
+    for target_fps in [120u32, 90, 72, 60, 90] {
+        clock.set_fps(target_fps);
+        for _ in 0..24 {
+            let pts = clock.slot_pts(clock.next);
+            let bar_x = (idx * 17) % GW;
+            for y in 0..GH {
+                let row = &mut bgra[((y * GW) as usize * 4)..(((y + 1) * GW) as usize * 4)];
+                for x in 0..GW {
+                    let off = (x as usize) * 4;
+                    let in_bar = x >= bar_x && x < (bar_x + 96).min(GW);
+                    row[off] = if in_bar { 240 } else { (x * 255 / GW) as u8 };
+                    row[off + 1] = if in_bar { 180 } else { (y * 255 / GH) as u8 };
+                    row[off + 2] = if in_bar { 40 } else { ((idx * 9) % 255) as u8 };
+                    row[off + 3] = 255;
+                }
+            }
+            unsafe {
+                context.UpdateSubresource(&src_tex, 0, None, bgra.as_ptr().cast(), GW * 4, 0);
+            }
+            let nv12_slot = vp.convert(&src_tex, (GW, GH), src_rect).unwrap();
+            let _ = nv12_slot.wait_complete(&context);
+            for pkt in enc.encode_d3d11(&nv12_slot.texture, pts).unwrap() {
+                if !params_sent && let Some(p) = enc.codec_params() {
+                    mux.set_codec_params(p);
+                    params_sent = true;
+                }
+                mux.push_video(&pkt.data, pkt.pts, pkt.keyframe).unwrap();
+                pushed += 1;
+            }
+            clock.mark_emitted(pts);
+            clock.next += 1;
+            idx += 1;
+        }
+    }
+    for pkt in enc.flush().unwrap() {
+        if !params_sent && let Some(p) = enc.codec_params() {
+            mux.set_codec_params(p);
+            params_sent = true;
+        }
+        mux.push_video(&pkt.data, pkt.pts, pkt.keyframe).unwrap();
+        pushed += 1;
+    }
+    mux.finalize().unwrap();
+    verify_mp4_decodes_cleanly(&tmp.0, pushed);
+}

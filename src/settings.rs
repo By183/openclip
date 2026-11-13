@@ -289,6 +289,36 @@ pub fn approx_mb_per_min(kbps: u32) -> f64 {
     kbps as f64 * 60.0 / 8.0 / 1024.0
 }
 
+/// How captured frames are converted from RGB (`BGRA`/`RGBA`) to `NV12`/`I420`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ColorConversion {
+    /// Use GPU `VideoProcessorBlt` + zero-readback DXGI MFT (`Gpu` path), falling
+    /// back to CPU conversion only at initialization if GPU setup fails before frame 0.
+    #[default]
+    Auto,
+    /// Prefer GPU `VideoProcessorBlt` + zero-readback DXGI MFT (falls back to CPU
+    /// only at startup if GPU initialization fails or overlays/encoder require CPU).
+    Gpu,
+    /// Always use CPU readback + software color conversion (`Converter`).
+    Cpu,
+}
+
+impl ColorConversion {
+    pub const ALL: [ColorConversion; 3] = [
+        ColorConversion::Auto,
+        ColorConversion::Gpu,
+        ColorConversion::Cpu,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorConversion::Auto => t!(AUTO),
+            ColorConversion::Gpu => "GPU",
+            ColorConversion::Cpu => "CPU",
+        }
+    }
+}
+
 /// How captured audio sources are mapped to container audio streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AudioTrackMode {
@@ -630,6 +660,12 @@ pub struct Settings {
     /// Count down before recording starts.
     pub countdown_enabled: bool,
     pub countdown_secs: u32,
+    /// Color conversion path (`Auto` / `Gpu` / `Cpu`).
+    #[serde(default)]
+    pub color_conversion: ColorConversion,
+    /// Global hotkey for starting / stopping recording.
+    #[serde(default)]
+    pub hotkey: crate::hotkey::HotkeyConfig,
     /// Interface language; applied to [`crate::i18n`] by [`Settings::load`].
     pub language: Lang,
     /// Look for a newer release on GitHub when the app starts (see [`crate::update`]).
@@ -657,6 +693,8 @@ impl Default for Settings {
             game_ignored: Vec::new(),
             countdown_enabled: true,
             countdown_secs: 3,
+            color_conversion: ColorConversion::default(),
+            hotkey: crate::hotkey::HotkeyConfig::default(),
             language: Lang::default(),
             check_updates: true,
         }
@@ -850,6 +888,8 @@ mod tests {
         assert_eq!(choose_path(None, false, true, roaming.clone()), roaming);
         assert!(Settings::default().countdown_enabled);
         assert_eq!(Settings::default().countdown_secs, 3);
+        assert!(Settings::default().hotkey.enabled);
+        assert_eq!(Settings::default().hotkey.display_string(), "Ctrl+Alt+R");
     }
 
     #[test]
@@ -971,14 +1011,16 @@ mod tests {
         assert_eq!(legacy.audio_track_mode, AudioTrackMode::Mixed);
         assert!(legacy.bitrate_presets.is_empty());
         assert_eq!(legacy.language, Lang::Uk);
+        assert_eq!(legacy.color_conversion, ColorConversion::Auto);
 
         let mut clamped: Settings = serde_json::from_str(
-            r#"{"system_audio_volume":255,"mic_volume":220,"audio_track_mode":"Separate"}"#,
+            r#"{"system_audio_volume":255,"mic_volume":220,"audio_track_mode":"Separate","color_conversion":"Cpu"}"#,
         )
         .unwrap();
         clamped.normalize_fields();
         assert_eq!(clamped.system_audio_volume, 200);
         assert_eq!(clamped.mic_volume, 200);
         assert_eq!(clamped.audio_track_mode, AudioTrackMode::Separate);
+        assert_eq!(clamped.color_conversion, ColorConversion::Cpu);
     }
 }

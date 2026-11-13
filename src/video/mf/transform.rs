@@ -235,6 +235,7 @@ impl MftSession {
     fn pump_events(&mut self, out: &mut Vec<IMFSample>, wait_for_input: bool) -> Result<()> {
         let Some(events) = self.events.clone() else { return Ok(()) };
         let deadline = Instant::now() + STALL_TIMEOUT;
+        let mut waits = 0u32;
         loop {
             match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(ev) => {
@@ -256,7 +257,14 @@ impl MftSession {
                     if Instant::now() > deadline {
                         bail!("encoder stalled (no input request for {STALL_TIMEOUT:?})");
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+                    waits += 1;
+                    if waits <= 8 {
+                        std::hint::spin_loop();
+                    } else if waits <= 32 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(Duration::from_micros(250));
+                    }
                 }
                 Err(e) => return Err(anyhow!("GetEvent: {e}")),
             }

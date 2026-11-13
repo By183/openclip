@@ -37,8 +37,13 @@ const BACKOFF: Duration = Duration::from_millis(2);
 /// decoded in full and then dropped off the front of the backlog — the very
 /// next one due on screen. [`Worker::pump`] now reads audio alone once the
 /// backlog is full, so a shallow queue costs lead time rather than frames.
-fn held_cap(width: u32, height: u32) -> usize {
-    if width as u64 * height as u64 > 2_500_000 { 3 } else { super::MAX_HELD }
+fn held_cap(width: u32, height: u32, interval: Duration) -> usize {
+    if width as u64 * height as u64 > 2_500_000 {
+        return 6;
+    }
+    let ms = interval.as_secs_f64() * 1000.0;
+    let target = if ms > 0.0 { (200.0 / ms).ceil() as usize } else { 8 };
+    target.clamp(6, super::MAX_HELD)
 }
 
 pub fn run(
@@ -129,7 +134,7 @@ impl Worker {
             }
         }
 
-        let held_cap = reader.video_info.map_or(1, |v| held_cap(v.width, v.height));
+        let held_cap = reader.video_info.map_or(1, |v| held_cap(v.width, v.height, interval));
         let mut me = Worker {
             reader,
             output,
@@ -514,6 +519,20 @@ impl Worker {
     }
 
     fn flush_held(&mut self) {
+        // Shed stale overdue frames whenever newer ones are already waiting in
+        // `held`, so recovery after any brief GUI hitch is instantaneous.
+        if self.playing() && !self.busy() && self.held.len() > 1 {
+            let now = self.shared.clock.position();
+            while self.held.len() > 1 {
+                let overdue = self.held.front().is_some_and(|f| f.pts + self.interval * 2 < now);
+                if !overdue {
+                    break;
+                }
+                if let Some(old) = self.held.pop_front() {
+                    self.pool.recycle(old.image.rgba);
+                }
+            }
+        }
         while let Some(f) = self.held.pop_front() {
             match self.frames.try_send(f) {
                 Ok(()) => (self.repaint)(),

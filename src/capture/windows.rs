@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
@@ -32,11 +33,69 @@ use windows_capture::settings::{
 use windows_capture::window::Window;
 
 use super::{CaptureConfig, CaptureHandle, FramePool, FrameSink, LiveRect, PhaseLimiter, Source};
+use crate::settings::SizeMode;
+use crate::video::convert::even_dims;
+use crate::video::d3d11_vp::{is_supported_capture_format, GpuCaptureProcessor, GpuNv12Slot};
+use crate::video::preview::PreviewImage;
 use crate::video::{PixelFormat, RawFrame};
+
+/// One GPU-converted `DXGI_FORMAT_NV12` surface kept in GPU memory for
+/// zero-readback hardware Media Foundation encoding.
+#[derive(Debug)]
+pub struct GpuFrame {
+    pub device: ID3D11Device,
+    pub context: ID3D11DeviceContext,
+    pub slot: Arc<GpuNv12Slot>,
+    pub src_size: (u32, u32),
+    pub pts: Duration,
+    pub resized_from_initial: bool,
+    pub prep_us: u64,
+    pub vp_submit_us: u64,
+}
+
+/// Frame delivered by the Windows capture backend: either a zero-readback GPU
+/// `NV12` surface or a standard CPU staging `RawFrame`.
+#[derive(Debug)]
+pub enum CapturedFrame {
+    Cpu(RawFrame),
+    Gpu(GpuFrame),
+}
+
+impl CapturedFrame {
+    pub fn pts(&self) -> Duration {
+        match self {
+            CapturedFrame::Cpu(f) => f.pts,
+            CapturedFrame::Gpu(f) => f.pts,
+        }
+    }
+
+    pub fn set_pts(&mut self, pts: Duration) {
+        match self {
+            CapturedFrame::Cpu(f) => f.pts = pts,
+            CapturedFrame::Gpu(f) => f.pts = pts,
+        }
+    }
+
+    pub fn src_size(&self) -> (u32, u32) {
+        match self {
+            CapturedFrame::Cpu(f) => (f.width, f.height),
+            CapturedFrame::Gpu(f) => f.src_size,
+        }
+    }
+}
+
+pub type CapturedSink = Box<dyn FnMut(CapturedFrame) -> bool + Send>;
+
+pub struct GpuCaptureOptions {
+    pub size_mode: SizeMode,
+    pub gpu_active: Arc<AtomicBool>,
+    pub preview_visible: Arc<AtomicBool>,
+    pub on_preview: Box<dyn FnMut(PreviewImage) + Send>,
+}
 
 /// Everything the capture callback needs, passed through `Settings::flags`.
 struct Flags {
-    sink: FrameSink,
+    sink: CapturedSink,
     epoch: Instant,
     stop: Arc<AtomicBool>,
     /// Re-read every frame so the UI can drag the region while recording.
@@ -45,12 +104,16 @@ struct Flags {
     /// Only when WGC cannot throttle itself (Windows 10).
     limit_ourselves: bool,
     pool: Arc<FramePool>,
+    gpu: Option<GpuCaptureOptions>,
 }
 
 struct Handler {
     flags: Flags,
     limiter: Option<PhaseLimiter>,
     readback: Readback,
+    gpu_vp: Option<GpuCaptureProcessor>,
+    gpu_expected_crop: Option<(u32, u32)>,
+    last_preview: Instant,
     frames: u64,
     priority_set: bool,
     /// `(base_ts_100ns, base_arrival)` anchoring WGC `SystemRelativeTime` to `epoch`.
@@ -73,6 +136,76 @@ impl Handler {
             base_arrival.saturating_sub(Duration::from_nanos(delta_100ns.unsigned_abs().saturating_mul(100)))
         }
     }
+
+    fn try_gpu_convert(
+        &mut self,
+        frame: &mut Frame,
+        crop: (u32, u32, u32, u32),
+        pts: Duration,
+        now: Instant,
+    ) -> Result<GpuFrame> {
+        let (x0, y0, x1, y1) = crop;
+        let (fw, fh) = (frame.width(), frame.height());
+        let crop_size = (x1 - x0, y1 - y0);
+        let fmt = frame.desc().Format;
+        if !is_supported_capture_format(fmt) {
+            return Err(anyhow!("unsupported surface format {:?} for GPU VideoProcessor", fmt.0));
+        }
+        let gpu = self.flags.gpu.as_mut().expect("checked by caller");
+        let t0 = Instant::now();
+        if self.gpu_vp.is_none() {
+            let scaled = match gpu.size_mode {
+                SizeMode::Full => crop_size,
+                SizeMode::Half if crop_size.0 >= 64 && crop_size.1 >= 64 => {
+                    ((crop_size.0 / 2).max(1), (crop_size.1 / 2).max(1))
+                }
+                SizeMode::Half => crop_size,
+                other => other.resolve(crop_size.0, crop_size.1),
+            };
+            let out_size = even_dims(scaled.0, scaled.1);
+            if out_size.0 == 0 || out_size.1 == 0 {
+                return Err(anyhow!("frame too small to encode: {}x{}", crop_size.0, crop_size.1));
+            }
+            let vp = GpuCaptureProcessor::new(
+                self.readback.device.clone(),
+                self.readback.context.clone(),
+                (fw, fh),
+                crop_size,
+                out_size,
+            )?;
+            self.gpu_expected_crop = Some(crop_size);
+            self.gpu_vp = Some(vp);
+        }
+        let vp = self.gpu_vp.as_mut().unwrap();
+        let rect = RECT { left: x0 as i32, top: y0 as i32, right: x1 as i32, bottom: y1 as i32 };
+        let tex = frame.as_raw_texture();
+        let (slot, vp_submit_us) = vp.convert_timed(tex, (fw, fh), rect)?;
+        if gpu.preview_visible.load(Ordering::Relaxed)
+            && now.duration_since(self.last_preview) >= Duration::from_millis(200)
+        {
+            match vp.render_preview(tex, (fw, fh), rect, 640) {
+                Ok(img) => {
+                    self.last_preview = now;
+                    (gpu.on_preview)(img);
+                }
+                Err(e) => {
+                    log::debug!("GPU capture preview failed: {e:#}");
+                }
+            }
+        }
+        let prep_us = t0.elapsed().as_micros() as u64;
+        let resized_from_initial = self.gpu_expected_crop.is_some_and(|e| e != crop_size);
+        Ok(GpuFrame {
+            device: vp.device().clone(),
+            context: vp.context().clone(),
+            slot,
+            src_size: crop_size,
+            pts,
+            resized_from_initial,
+            prep_us,
+            vp_submit_us,
+        })
+    }
 }
 
 type HandlerError = Box<dyn std::error::Error + Send + Sync>;
@@ -87,6 +220,9 @@ impl GraphicsCaptureApiHandler for Handler {
             readback: Readback::new(ctx.device.clone(), ctx.device_context.clone()),
             flags: ctx.flags,
             limiter,
+            gpu_vp: None,
+            gpu_expected_crop: None,
+            last_preview: Instant::now() - Duration::from_millis(200),
             frames: 0,
             priority_set: false,
             ts_anchor: None,
@@ -123,6 +259,35 @@ impl GraphicsCaptureApiHandler for Handler {
             }
             None => (0, 0, fw, fh),
         };
+
+        let try_gpu = self.flags.gpu.as_ref().is_some_and(|g| g.gpu_active.load(Ordering::Relaxed));
+        if try_gpu {
+            if self.frames == 0 {
+                self.readback.reset();
+            }
+            match self.try_gpu_convert(frame, (x0, y0, x1, y1), pts, now) {
+                Ok(gf) => {
+                    self.frames += 1;
+                    if !(self.flags.sink)(CapturedFrame::Gpu(gf)) {
+                        control.stop();
+                    }
+                    return Ok(());
+                }
+                Err(e) if self.frames == 0 => {
+                    log::warn!("capture GPU VideoProcessor failed during startup ({e:#}); using CPU readback");
+                    if let Some(g) = &self.flags.gpu {
+                        g.gpu_active.store(false, Ordering::SeqCst);
+                    }
+                    self.gpu_vp = None;
+                }
+                Err(e) => {
+                    return Err(format!("GPU VideoProcessor failed mid-recording: {e:#}").into());
+                }
+            }
+        } else if self.gpu_vp.is_some() {
+            self.gpu_vp = None;
+        }
+
         let bx = D3D11_BOX { left: x0, top: y0, front: 0, right: x1, bottom: y1, back: 1 };
         let delivered = self
             .readback
@@ -130,7 +295,7 @@ impl GraphicsCaptureApiHandler for Handler {
             .map_err(|e| -> HandlerError { format!("frame readback: {e:#}").into() })?;
         if let Some(raw) = delivered {
             self.frames += 1;
-            if !(self.flags.sink)(raw) {
+            if !(self.flags.sink)(CapturedFrame::Cpu(raw)) {
                 control.stop();
             }
         }
@@ -184,6 +349,11 @@ impl Readback {
             pending: None,
             primed: false,
         }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.pending = None;
+        self.primed = false;
     }
 
     fn ensure(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<()> {
@@ -276,21 +446,58 @@ impl Readback {
     }
 }
 
-pub fn start(config: CaptureConfig, epoch: Instant, sink: FrameSink) -> Result<CaptureHandle> {
+pub fn start(config: CaptureConfig, epoch: Instant, mut sink: FrameSink) -> Result<CaptureHandle> {
+    if let Source::Game { .. } = &config.source {
+        // Frames come from the hook inside the game, not from this backend.
+        return super::hook::start(config, epoch, sink);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let crop = config.crop();
+    let wrapped: CapturedSink = Box::new(move |frame| match frame {
+        CapturedFrame::Cpu(raw) => sink(raw),
+        CapturedFrame::Gpu(_) => true,
+    });
     match &config.source {
-        Source::Monitor { id } => launch(monitor(*id)?, None, &config, epoch, stop, sink),
-        Source::Region { monitor_id, .. } => launch(monitor(*monitor_id)?, crop, &config, epoch, stop, sink),
+        Source::Monitor { id } => launch(monitor(*id)?, None, &config, epoch, stop, wrapped, None),
+        Source::Region { monitor_id, .. } => launch(monitor(*monitor_id)?, crop, &config, epoch, stop, wrapped, None),
         Source::Window { id } => {
             let w = Window::from_raw_hwnd(*id as usize as *mut std::ffi::c_void);
             if !w.is_valid() {
                 return Err(anyhow!("window {id} is no longer valid"));
             }
-            launch(w, None, &config, epoch, stop, sink)
+            launch(w, None, &config, epoch, stop, wrapped, None)
         }
-        // Frames come from the hook inside the game, not from this backend.
-        Source::Game { .. } => super::hook::start(config, epoch, sink),
+        Source::Game { .. } => unreachable!(),
+    }
+}
+
+/// Starts capturing `config.source` with optional zero-readback GPU `BGRA → NV12`
+/// conversion (`GpuCaptureOptions`). When `gpu` is `None` or `gpu.gpu_active`
+/// flips to `false`, frames are delivered as `CapturedFrame::Cpu(RawFrame)`.
+pub fn start_with_gpu(
+    config: CaptureConfig,
+    gpu: Option<GpuCaptureOptions>,
+    epoch: Instant,
+    sink: CapturedSink,
+) -> Result<CaptureHandle> {
+    if let Source::Game { .. } = &config.source {
+        let mut cpu_sink = sink;
+        let adapter: FrameSink = Box::new(move |raw| cpu_sink(CapturedFrame::Cpu(raw)));
+        return super::hook::start(config, epoch, adapter);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let crop = config.crop();
+    match &config.source {
+        Source::Monitor { id } => launch(monitor(*id)?, None, &config, epoch, stop, sink, gpu),
+        Source::Region { monitor_id, .. } => launch(monitor(*monitor_id)?, crop, &config, epoch, stop, sink, gpu),
+        Source::Window { id } => {
+            let w = Window::from_raw_hwnd(*id as usize as *mut std::ffi::c_void);
+            if !w.is_valid() {
+                return Err(anyhow!("window {id} is no longer valid"));
+            }
+            launch(w, None, &config, epoch, stop, sink, gpu)
+        }
+        Source::Game { .. } => unreachable!(),
     }
 }
 
@@ -300,7 +507,8 @@ fn launch<T>(
     config: &CaptureConfig,
     epoch: Instant,
     stop: Arc<AtomicBool>,
-    sink: FrameSink,
+    sink: CapturedSink,
+    gpu: Option<GpuCaptureOptions>,
 ) -> Result<CaptureHandle>
 where
     T: TryInto<GraphicsCaptureItemType> + Send + 'static,
@@ -340,7 +548,8 @@ where
         MinimumUpdateIntervalSettings::Default
     };
     let pool = config.pool.clone().unwrap_or_else(|| FramePool::new(6));
-    let flags = Flags { sink, epoch, stop: stop.clone(), crop, fps, limit_ourselves: !is_auto && !native_interval, pool };
+    let flags =
+        Flags { sink, epoch, stop: stop.clone(), crop, fps, limit_ourselves: !is_auto && !native_interval, pool, gpu };
     // Both of these are rejected outright — the session never starts — when the
     // OS lacks the property behind them, so ask only for what it supports.
     let border_ok = supported("border", GraphicsCaptureApi::is_border_settings_supported());

@@ -239,8 +239,13 @@ impl App {
         // frame grid, so a stall still gets looked at.
         if v.is_playing() {
             let p = v.player.as_ref();
-            let grid = p.map(|p| p.frame_interval()).unwrap_or(SKIP) / 2;
-            ctx.request_repaint_after(p.and_then(|p| p.next_due()).unwrap_or(grid).min(grid));
+            let interval = p.map(|p| p.frame_interval()).unwrap_or(Duration::from_millis(16));
+            let watchdog = interval.clamp(Duration::from_millis(8), Duration::from_millis(33));
+            let wait = p
+                .and_then(|p| p.next_due())
+                .map(|d| d.max(Duration::from_millis(1)).min(watchdog * 2))
+                .unwrap_or(watchdog);
+            ctx.request_repaint_after(wait);
         }
 
         // A finished snapshot, decoded at full resolution off-thread.

@@ -107,6 +107,7 @@ mod win {
                 RecordConfig {
                     source: Source::Game { pid },
                     format,
+                    color_conversion: Default::default(),
                     // The cursor is somewhere on the desktop, not in the game's
                     // back buffer, so mouse effects would land in a random spot.
                     mouse_fx: MouseFx { cursor_size: 0, click_effect: false, highlight: false, ..Default::default() },

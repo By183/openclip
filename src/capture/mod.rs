@@ -202,6 +202,36 @@ impl Drop for CaptureHandle {
     }
 }
 
+#[cfg(windows)]
+pub use windows::{CapturedFrame, GpuCaptureOptions, GpuFrame};
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+pub enum CapturedFrame {
+    Cpu(RawFrame),
+}
+
+#[cfg(not(windows))]
+impl CapturedFrame {
+    pub fn pts(&self) -> Duration {
+        match self {
+            CapturedFrame::Cpu(f) => f.pts,
+        }
+    }
+
+    pub fn set_pts(&mut self, pts: Duration) {
+        match self {
+            CapturedFrame::Cpu(f) => f.pts = pts,
+        }
+    }
+
+    pub fn src_size(&self) -> (u32, u32) {
+        match self {
+            CapturedFrame::Cpu(f) => (f.width, f.height),
+        }
+    }
+}
+
 /// Starts capturing `config.source`, delivering frames to `sink` with
 /// timestamps relative to `epoch`.
 pub fn start(config: CaptureConfig, epoch: Instant, sink: FrameSink) -> Result<CaptureHandle> {

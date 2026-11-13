@@ -302,6 +302,28 @@ strings! {
         "afișată în fereastră și în bara mică, niciodată în videoclip",
         "показывается в окне и на мини-панели, но не попадает в видео",
         "показується у вікні та на міні-панелі, але не потрапляє у відео";
+    ROW_COLOR_CONVERSION => "Color conversion", "Conversie culoare", "Конвертация цвета", "Конвертація кольору";
+    COLOR_CONVERSION_NOTE => "Auto uses GPU zero-readback and falls back to CPU only if GPU initialization fails",
+        "Automat folosește GPU fără citire în RAM și trece la CPU doar dacă inițializarea GPU eșuează",
+        "Авто использует GPU без копирования и переходит на CPU только при сбое инициализации GPU",
+        "Авто використовує GPU без копіювання і переходить на CPU лише при збої ініціалізації GPU";
+    SECTION_HOTKEY => "Shortcut", "Comandă rapidă", "Горячая клавиша", "Гаряча клавіша";
+    ROW_HOTKEY => "Start / Stop recording", "Pornire / Oprire înregistrare", "Старт / Остановка записи", "Старт / Зупинка запису";
+    HOTKEY_RECORDING => "Press keys… (Esc cancels)", "Apăsați tastele… (Esc anulează)", "Нажмите комбинацию… (Esc отмена)", "Натисніть комбінацію… (Esc скасувати)";
+    HOTKEY_RESET => "Reset", "Resetează", "Сбросить", "Скинути";
+    HOTKEY_SOUND => "Sound feedback", "Semnal sonor", "Звуковой сигнал", "Звуковий сигнал";
+    HOTKEY_SOUND_NOTE => "Play a short tone when recording starts or stops",
+        "Redă un ton scurt la pornirea sau oprirea înregistrării",
+        "Воспроизводить короткий сигнал при старте и остановке",
+        "Відтворювати короткий сигнал при старті та зупинці";
+    HOTKEY_STATUS_CONFLICT => "Shortcut is in use by another app ({0})",
+        "Comanda rapidă este utilizată de altă aplicație ({0})",
+        "Комбинация занята другим приложением ({0})",
+        "Комбінація зайнята іншою програмою ({0})";
+    HOTKEY_STATUS_FALLBACK => "Active via keyboard hook (game/app conflict fallback)",
+        "Activ prin hook de tastatură (mod rezervă)",
+        "Активен через перехват клавиатуры (запасной режим)",
+        "Активний через перехоплення клавіатури (запасний режим)";
     SECTION_SOURCES => "Sources", "Surse", "Источники", "Джерела";
     ROW_DEVICES => "Devices", "Dispozitive", "Устройства", "Пристрої";
     REFRESH_DEVICES => "Refresh monitors, windows and devices", "Reîmprospătează monitoarele, ferestrele și dispozitivele",

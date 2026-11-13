@@ -12,19 +12,24 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use windows::core::{GUID, HSTRING};
+use windows::core::{GUID, HSTRING, Interface};
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFMediaType, IMFSample, IMFSourceReader, MFAudioFormat_PCM, MFCreateAttributes,
-    MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video, MFVideoFormat_RGB32,
+    IMFAttributes, IMFDXGIBuffer, IMFMediaType, IMFSample, IMFSourceReader, MFAudioFormat_PCM, MFCreateAttributes,
+    MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video, MFVideoArea,
+    MFVideoFormat_NV12, MFVideoFormat_RGB32, MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709,
     MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
+    MF_MT_YUV_MATRIX, MF_PD_DURATION, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
     MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR,
     MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED, MF_SOURCE_READERF_NEWSTREAM, MF_SOURCE_READER_ALL_STREAMS,
-    MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-    MF_SOURCE_READER_MEDIASOURCE,
+    MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_DISABLE_DXVA, MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_MEDIASOURCE,
 };
 
 use crate::capture::FramePool;
+use crate::video::d3d11_vp::GpuPlaybackProcessor;
 use crate::video::mf::{propvariant_i64, startup};
 use crate::video::preview::{rows_to_rgba_into, PreviewImage};
 
@@ -66,12 +71,19 @@ pub enum Packet {
 
 pub struct Reader {
     reader: IMFSourceReader,
+    gpu: Option<GpuPlaybackProcessor>,
     video: Option<u32>,
     audio: Option<u32>,
     video_eos: bool,
     audio_eos: bool,
-    /// Row pitch of the decoded RGB32; negative means bottom-up.
+    /// Row pitch of the decoded frame (`RGB32` or fallback `NV12`); negative means bottom-up.
     stride: i32,
+    /// Coded surface dimensions from `MF_MT_FRAME_SIZE` (GPU NV12 mode).
+    coded_size: (u32, u32),
+    /// Visible crop aperture within `coded_size` (GPU NV12 mode).
+    crop_rect: RECT,
+    /// Transfer matrix (`true` = BT.709, `false` = BT.601) for GPU NV12 -> RGBA.
+    bt709: bool,
     /// Longest side asked of the decoder, re-applied after a format change.
     max_side: u32,
     pub duration: Option<Duration>,
@@ -81,17 +93,52 @@ pub struct Reader {
 
 impl Reader {
     /// Opens `path`, asking for frames no larger than `max_side` on their
-    /// longer side. Tries the advanced video processor first (it is the only
-    /// one that can scale, and it does so on the way out of the decoder, so
-    /// every pass after it is proportionally cheaper) and falls back to the
-    /// basic converter at native size for sources that refuse it.
+    /// longer side. Tries GPU DXVA hardware decoding + `ID3D11VideoProcessor`
+    /// downscaling first, then falls back to CPU `RGB32` decoding.
     pub fn open(path: &Path, max_side: u32) -> Result<Reader> {
+        match Reader::open_gpu(path, max_side) {
+            Ok(r) => {
+                if let Some(v) = r.video_info {
+                    log::info!(
+                        "player decoder: GPU DXVA NV12 -> RGBA ({}x{} -> {}x{}, bt709={})",
+                        r.coded_size.0,
+                        r.coded_size.1,
+                        v.width,
+                        v.height,
+                        r.bt709
+                    );
+                }
+                return Ok(r);
+            }
+            Err(e) => {
+                log::info!("player decoder: GPU DXVA unavailable ({e:#}); falling back to CPU RGB32");
+            }
+        }
         match Reader::open_with(path, true, max_side) {
             Ok(r) => Ok(r),
             Err(e) => {
                 log::debug!("advanced video processing unavailable ({e:#}); retrying without it");
                 Reader::open_with(path, false, max_side)
             }
+        }
+    }
+
+    fn open_gpu(path: &Path, max_side: u32) -> Result<Reader> {
+        startup()?;
+        let gpu = GpuPlaybackProcessor::new()?;
+        let abs = std::fs::canonicalize(path).context("resolving the file path")?;
+        let url = HSTRING::from(abs.to_string_lossy().trim_start_matches(r"\\?\"));
+        let mut attrs: Option<IMFAttributes> = None;
+        // SAFETY: `attrs` and `gpu.device_manager()` remain alive through reader creation.
+        unsafe {
+            MFCreateAttributes(&mut attrs, 3).context("MFCreateAttributes")?;
+            let attrs = attrs.ok_or_else(|| anyhow!("MFCreateAttributes returned nothing"))?;
+            attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, gpu.device_manager())?;
+            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+            attrs.SetUINT32(&MF_SOURCE_READER_DISABLE_DXVA, 0)?;
+            let reader: IMFSourceReader =
+                MFCreateSourceReaderFromURL(&url, &attrs).context("opening the file with D3D11 manager")?;
+            Self::finish_open(reader, Some(gpu), false, max_side)
         }
     }
 
@@ -116,29 +163,44 @@ impl Reader {
             attrs.SetUINT32(&key, 1)?;
             let reader: IMFSourceReader =
                 MFCreateSourceReaderFromURL(&url, &attrs).context("opening the file")?;
+            Self::finish_open(reader, None, advanced, max_side)
+        }
+    }
 
-            let duration = reader
+    unsafe fn finish_open(
+        reader: IMFSourceReader,
+        mut gpu: Option<GpuPlaybackProcessor>,
+        advanced: bool,
+        max_side: u32,
+    ) -> Result<Reader> {
+        let duration = unsafe {
+            reader
                 .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
                 .ok()
                 .map(|v| Duration::from_nanos(v.Anonymous.Anonymous.Anonymous.uhVal * 100))
-                .filter(|d| !d.is_zero());
+                .filter(|d| !d.is_zero())
+        };
 
-            // `ReadSample(ALL_STREAMS, ..)` reports the *real* stream index, not
-            // the FIRST_VIDEO/FIRST_AUDIO sentinel, so resolve them up front.
-            let (mut video, mut audio) = (None, None);
-            for i in 0..MAX_STREAMS {
-                let Ok(t) = reader.GetNativeMediaType(i, 0) else { break };
-                let Ok(major) = t.GetGUID(&MF_MT_MAJOR_TYPE) else { continue };
-                if major == MFMediaType_Video && video.is_none() {
-                    video = Some(i);
-                } else if major == MFMediaType_Audio && audio.is_none() {
-                    audio = Some(i);
-                }
+        // `ReadSample(ALL_STREAMS, ..)` reports the *real* stream index, not
+        // the FIRST_VIDEO/FIRST_AUDIO sentinel, so resolve them up front.
+        let (mut video, mut audio) = (None, None);
+        for i in 0..MAX_STREAMS {
+            let Ok(t) = (unsafe { reader.GetNativeMediaType(i, 0) }) else { break };
+            let Ok(major) = (unsafe { t.GetGUID(&MF_MT_MAJOR_TYPE) }) else { continue };
+            if major == MFMediaType_Video && video.is_none() {
+                video = Some(i);
+            } else if major == MFMediaType_Audio && audio.is_none() {
+                audio = Some(i);
             }
-            if video.is_none() && audio.is_none() {
-                bail!("no video or audio stream");
-            }
+        }
+        if video.is_none() && audio.is_none() {
+            bail!("no video or audio stream");
+        }
+        if video.is_none() {
+            gpu = None;
+        }
 
+        unsafe {
             reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
             if let Some(i) = video {
                 reader.SetStreamSelection(i, true)?;
@@ -146,38 +208,55 @@ impl Reader {
             if let Some(i) = audio {
                 reader.SetStreamSelection(i, true)?;
             }
-
-            let mut me = Reader {
-                reader,
-                video,
-                audio,
-                video_eos: video.is_none(),
-                audio_eos: audio.is_none(),
-                stride: 0,
-                max_side,
-                duration,
-                video_info: None,
-                audio_info: None,
-            };
-            if let Some(i) = video {
-                me.setup_video(i, advanced)?;
-            }
-            // A file without usable sound still plays; only video is fatal.
-            if let Some(i) = audio
-                && let Err(e) = me.setup_audio(i)
-            {
-                log::warn!("audio track unusable ({e:#}); playing without sound");
-                me.reader.SetStreamSelection(i, false).ok();
-                me.audio = None;
-                me.audio_eos = true;
-            }
-            Ok(me)
         }
+
+        let mut me = Reader {
+            reader,
+            gpu,
+            video,
+            audio,
+            video_eos: video.is_none(),
+            audio_eos: audio.is_none(),
+            stride: 0,
+            coded_size: (0, 0),
+            crop_rect: RECT::default(),
+            bt709: true,
+            max_side,
+            duration,
+            video_info: None,
+            audio_info: None,
+        };
+        if let Some(i) = video {
+            me.setup_video(i, advanced)?;
+        }
+        // A file without usable sound still plays; only video is fatal.
+        if let Some(i) = audio
+            && let Err(e) = me.setup_audio(i)
+        {
+            log::warn!("audio track unusable ({e:#}); playing without sound");
+            unsafe { me.reader.SetStreamSelection(i, false).ok() };
+            me.audio = None;
+            me.audio_eos = true;
+        }
+        Ok(me)
     }
 
-    /// Requests RGB32, capping the long side so a big file does not cost tens
-    /// of megabytes a frame, then reads back the geometry actually negotiated.
+    /// Negotiates GPU `NV12` (when `self.gpu.is_some()`) or CPU `RGB32`, then
+    /// reads back the geometry and color matrix actually negotiated.
     fn setup_video(&mut self, stream: u32, advanced: bool) -> Result<()> {
+        if self.gpu.is_some() {
+            // SAFETY: MF calls on a live reader; failures propagate to CPU fallback.
+            unsafe {
+                let want = MFCreateMediaType()?;
+                want.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+                want.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+                self.reader
+                    .SetCurrentMediaType(stream, None, &want)
+                    .context("negotiating NV12 DXVA video")?;
+            }
+            return self.refresh_video(stream);
+        }
+
         // SAFETY: MF calls on a live reader; failures propagate as errors.
         unsafe {
             let native = self.reader.GetNativeMediaType(stream, 0).ok();
@@ -216,17 +295,60 @@ impl Reader {
         unsafe {
             let mt = self.reader.GetCurrentMediaType(stream)?;
             let size = mt.GetUINT64(&MF_MT_FRAME_SIZE).context("frame size")?;
-            let (width, height) = ((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32);
-            if width == 0 || height == 0 {
+            let (coded_w, coded_h) = ((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32);
+            if coded_w == 0 || coded_h == 0 {
                 bail!("the video stream reports an empty frame size");
             }
-            // RGB32 is commonly bottom-up, which the negative stride announces.
-            self.stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or((width * 4) as i32);
-            if self.stride == 0 {
-                self.stride = (width * 4) as i32;
-            }
             let interval = frame_interval_from_rate(mt.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0));
-            self.video_info = Some(VideoInfo { width, height, interval });
+
+            if self.gpu.is_some() {
+                self.coded_size = (coded_w, coded_h);
+                self.stride = mt
+                    .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+                    .map(|s| s as i32)
+                    .unwrap_or(coded_w as i32);
+                if self.stride == 0 {
+                    self.stride = coded_w as i32;
+                }
+
+                let mut area = MFVideoArea::default();
+                let area_bytes = std::slice::from_raw_parts_mut(
+                    (&mut area as *mut MFVideoArea).cast::<u8>(),
+                    std::mem::size_of::<MFVideoArea>(),
+                );
+                let (crop_rect, disp_w, disp_h) = if mt.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, area_bytes, None).is_ok()
+                    && area.Area.cx > 0
+                    && area.Area.cy > 0
+                {
+                    let left = area.OffsetX.value as i32;
+                    let top = area.OffsetY.value as i32;
+                    (
+                        RECT { left, top, right: left + area.Area.cx, bottom: top + area.Area.cy },
+                        area.Area.cx as u32,
+                        area.Area.cy as u32,
+                    )
+                } else {
+                    (RECT { left: 0, top: 0, right: coded_w as i32, bottom: coded_h as i32 }, coded_w, coded_h)
+                };
+                self.crop_rect = crop_rect;
+                self.bt709 = match mt.GetUINT32(&MF_MT_YUV_MATRIX) {
+                    Ok(m) if m == MFVideoTransferMatrix_BT601.0 as u32 => false,
+                    Ok(m) if m == MFVideoTransferMatrix_BT709.0 as u32 => true,
+                    Ok(_) | Err(_) => disp_w >= 1280 || disp_h >= 720,
+                };
+                let (out_w, out_h) = capped_size(disp_w, disp_h, self.max_side).unwrap_or((disp_w, disp_h));
+                self.video_info = Some(VideoInfo { width: out_w, height: out_h, interval });
+            } else {
+                // RGB32 is commonly bottom-up, which the negative stride announces.
+                self.stride = mt
+                    .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+                    .map(|s| s as i32)
+                    .unwrap_or((coded_w * 4) as i32);
+                if self.stride == 0 {
+                    self.stride = (coded_w * 4) as i32;
+                }
+                self.video_info = Some(VideoInfo { width: coded_w, height: coded_h, interval });
+            }
             Ok(())
         }
     }
@@ -364,6 +486,50 @@ impl Reader {
 
     fn video_pixels(&mut self, sample: &IMFSample, pool: &FramePool) -> Result<Option<PreviewImage>> {
         let Some(info) = self.video_info else { return Ok(None) };
+        if let Some(gpu) = self.gpu.as_mut() {
+            // Try direct zero-copy DXVA texture first (`IMFDXGIBuffer`).
+            if let Ok(buf) = unsafe { sample.GetBufferByIndex(0) }
+                && let Ok(dxgi) = buf.cast::<IMFDXGIBuffer>()
+            {
+                let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+                unsafe { dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw) }
+                    .context("IMFDXGIBuffer::GetResource")?;
+                if raw.is_null() {
+                    bail!("IMFDXGIBuffer::GetResource returned null");
+                }
+                let tex = unsafe { ID3D11Texture2D::from_raw(raw) };
+                let sub = unsafe { dxgi.GetSubresourceIndex() }.context("IMFDXGIBuffer::GetSubresourceIndex")?;
+                let img = gpu.nv12_to_rgba(
+                    &tex,
+                    sub,
+                    self.crop_rect,
+                    (info.width, info.height),
+                    self.bt709,
+                    pool.take(),
+                )?;
+                return Ok(Some(img));
+            }
+            // Software decoder fallback inside MF: upload CPU NV12 to GPU VideoProcessor.
+            let buffer = unsafe { sample.ConvertToContiguousBuffer()? };
+            let mut ptr = std::ptr::null_mut();
+            let mut len = 0u32;
+            unsafe { buffer.Lock(&mut ptr, None, Some(&mut len)) }?;
+            let src = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            let img = gpu.nv12_cpu_to_rgba(
+                src,
+                self.stride.unsigned_abs() as usize,
+                self.coded_size,
+                self.crop_rect,
+                (info.width, info.height),
+                self.bt709,
+                pool.take(),
+            );
+            unsafe {
+                let _ = buffer.Unlock();
+            }
+            return Ok(Some(img?));
+        }
+
         // SAFETY: the buffer is locked and unlocked around one bounded read.
         unsafe {
             let buffer = sample.ConvertToContiguousBuffer()?;
@@ -469,5 +635,108 @@ mod tests {
         assert_eq!(capped_size(1280, 720, MAX_PLAYBACK_SIDE), None);
         // A portrait phone clip is capped on its height, not its width.
         assert_eq!(capped_size(1080, 3840, MAX_PLAYBACK_SIDE), Some((540, 1920)));
+    }
+
+    #[test]
+    fn gpu_reader_decodes_and_seeks_h264_mp4() {
+        use crate::mux::{Muxer, VideoCodecConfig, VideoTrackConfig};
+        use crate::settings::{Container, Profiles, RateControl, VideoCodec};
+        use crate::video::{Converter, EncoderRequest, FrameInput, H264Encoder, PixelFormat, RawFrame, VideoEncoder};
+
+        let (w, h) = (256u32, 256u32);
+        let req = EncoderRequest {
+            codec: VideoCodec::OpenH264,
+            width: w,
+            height: h,
+            fps: 60,
+            rate_control: RateControl::ConstantBitrate { kbps: 1500 },
+            target_bitrate_bps: 1_500_000,
+            keyframe_interval_frames: 30,
+            profiles: Profiles::default(),
+        };
+        let mut enc = H264Encoder::new(&req).unwrap();
+        let mut conv = Converter::new(w, h, enc.input_layout()).unwrap();
+
+        let path = std::env::temp_dir().join(format!("openclip_decode_test_{}.mp4", std::process::id()));
+        let mut mux = Muxer::create(
+            Container::Mp4,
+            &path,
+            VideoTrackConfig { width: w, height: h, fps: 60.0, codec: VideoCodecConfig::H264 },
+            None,
+        )
+        .unwrap();
+
+        // Solid red BGRA frame repeated for 10 frames.
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        for px in bgra.as_chunks_mut::<4>().0 {
+            *px = [0, 0, 255, 255];
+        }
+        let raw = RawFrame {
+            data: bgra,
+            width: w,
+            height: h,
+            stride: w * 4,
+            format: PixelFormat::Bgra,
+            pts: Duration::ZERO,
+            mouse: None,
+        };
+        conv.convert(&raw).unwrap();
+        let mut packets = Vec::new();
+        for i in 0..10u64 {
+            let pts = Duration::from_millis(i * 16);
+            match conv.frame() {
+                FrameInput::I420 { y, u, v, strides, dims } => {
+                    packets.extend(enc.encode(FrameInput::I420 { y, u, v, strides, dims }, pts).unwrap());
+                }
+                FrameInput::Nv12 { y, uv, strides, dims } => {
+                    packets.extend(enc.encode(FrameInput::Nv12 { y, uv, strides, dims }, pts).unwrap());
+                }
+            }
+        }
+        packets.extend(enc.flush().unwrap());
+        let p = enc.codec_params().expect("expected H264 codec params");
+        mux.set_codec_params(p);
+        assert!(!packets.is_empty());
+        for pkt in packets {
+            mux.push_video(&pkt.data, pkt.pts, pkt.keyframe).unwrap();
+        }
+        mux.finish_video(Duration::from_millis(160)).unwrap();
+        mux.finalize().unwrap();
+
+        let _com = crate::video::mf::ComGuard::new();
+        let mut reader = Reader::open(&path, 128).unwrap();
+        assert!(reader.gpu.is_some(), "expected GPU DXVA playback processor on Windows");
+        let info = reader.video_info.unwrap();
+        assert_eq!((info.width, info.height), (128, 128));
+
+        let pool = FramePool::new(2);
+        let mut decoded = 0u32;
+        for _ in 0..32 {
+            match reader.read(None, &pool, false).unwrap() {
+                Packet::Video { image, .. } => {
+                    assert_eq!((image.width, image.height), (128, 128));
+                    let center = &image.rgba[(64 * 128 + 64) * 4..][..4];
+                    assert!(center[0] > 210 && center[1] < 40 && center[2] < 40 && center[3] == 255, "center={center:?}");
+                    pool.recycle(image.rgba);
+                    decoded += 1;
+                }
+                Packet::End => break,
+                _ => {}
+            }
+        }
+        assert!(decoded >= 5, "decoded only {decoded} frames");
+        reader.seek(Duration::from_millis(48)).unwrap();
+        let mut landed = false;
+        for _ in 0..32 {
+            if let Packet::Video { image, .. } = reader.read(Some(Duration::from_millis(32)), &pool, false).unwrap() {
+                assert_eq!((image.width, image.height), (128, 128));
+                pool.recycle(image.rgba);
+                landed = true;
+                break;
+            }
+        }
+        assert!(landed, "expected frame after seek");
+        drop(reader);
+        std::fs::remove_file(&path).ok();
     }
 }

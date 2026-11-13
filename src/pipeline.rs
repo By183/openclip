@@ -11,13 +11,13 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::audio::capture::{
     open_microphone, open_system_loopback_device, AudioSource, Chunk, Queue, SharedQueue,
@@ -25,14 +25,23 @@ use crate::audio::capture::{
 use crate::audio::mixer::Mixer;
 use crate::audio::{create_audio_encoder, AudioEncoder, AudioFrame};
 use crate::capture::monitors::{source_origin, source_refresh_hz};
-use crate::capture::{self, CaptureConfig, CaptureHandle, FramePool, LiveRect, Rect, Source};
+use crate::capture::{self, CaptureConfig, CaptureHandle, CapturedFrame, FramePool, LiveRect, Rect, Source};
 use crate::mux::{AudioTrackConfig, Muxer, VideoCodecConfig, VideoTrackConfig};
-use crate::settings::{AudioTrackMode, FormatSettings, SizeMode};
+use crate::settings::{AudioTrackMode, ColorConversion, FormatSettings, SizeMode, VideoCodec};
 use crate::video::convert::even_dims;
+#[cfg(windows)]
+use crate::video::d3d11_vp::GpuNv12Slot;
 use crate::video::mouse_fx::{FrameClick, MouseFx, MouseSampler, Patch};
 use crate::video::preview::{PreviewImage, Previewer};
 use crate::video::watermark::{Watermark, WatermarkRenderer};
-use crate::video::{create_video_encoder, Converter, EncodedFrame, EncoderRequest, PixelFormat, RawFrame, Scaler, VideoEncoder};
+use crate::video::{
+    available_encoders, Converter, EncodeStageTiming, EncodedFrame, EncoderRequest, FrameInput, InputLayout,
+    PixelFormat, RawFrame, Scaler, VideoEncoder,
+};
+#[cfg(not(windows))]
+use crate::video::create_video_encoder;
+#[cfg(windows)]
+use crate::video::create_video_encoder_with_d3d;
 
 /// Longest side of preview images handed to the GUI.
 const PREVIEW_MAX_SIDE: u32 = 640;
@@ -49,6 +58,7 @@ const FRAME_QUEUE_CAP: usize = 4;
 pub struct RecordConfig {
     pub source: Source,
     pub format: FormatSettings,
+    pub color_conversion: ColorConversion,
     pub mouse_fx: MouseFx,
     pub watermark: Watermark,
     pub system_audio: bool,
@@ -275,7 +285,7 @@ impl Drop for TimerResolution {
 }
 
 struct FrameInboxState {
-    queue: VecDeque<RawFrame>,
+    queue: VecDeque<CapturedFrame>,
     closed: bool,
 }
 
@@ -294,6 +304,14 @@ struct FrameReceiver {
     inbox: Arc<FrameInbox>,
 }
 
+fn recycle_captured(pool: &FramePool, frame: CapturedFrame) {
+    match frame {
+        CapturedFrame::Cpu(f) => pool.recycle(f.data),
+        #[cfg(windows)]
+        CapturedFrame::Gpu(g) => drop(g),
+    }
+}
+
 fn frame_mailbox(pool: Arc<FramePool>, stats: Arc<Stats>) -> (FrameSender, FrameReceiver) {
     let inbox = Arc::new(FrameInbox {
         state: Mutex::new(FrameInboxState { queue: VecDeque::with_capacity(FRAME_QUEUE_CAP), closed: false }),
@@ -309,11 +327,11 @@ impl FrameSender {
     /// is the oldest unconsumed frame evicted and recycled, keeping WGC free of
     /// pool mutex contention during normal bursts while never dropping newer
     /// incoming frames. Returns `false` once the receiver has hung up.
-    fn send(&self, frame: RawFrame) -> bool {
+    fn send(&self, frame: CapturedFrame) -> bool {
         let mut guard = self.inbox.state.lock().unwrap();
         if guard.closed {
             drop(guard);
-            self.inbox.pool.recycle(frame.data);
+            recycle_captured(&self.inbox.pool, frame);
             return false;
         }
         let evicted = (guard.queue.len() >= FRAME_QUEUE_CAP).then(|| guard.queue.pop_front()).flatten();
@@ -321,7 +339,7 @@ impl FrameSender {
         drop(guard);
         if let Some(old) = evicted {
             self.inbox.stats.frames_superseded.fetch_add(1, Ordering::Relaxed);
-            self.inbox.pool.recycle(old.data);
+            recycle_captured(&self.inbox.pool, old);
         }
         self.inbox.cv.notify_one();
         true
@@ -338,7 +356,7 @@ impl Drop for FrameSender {
 }
 
 impl FrameReceiver {
-    fn try_recv(&self) -> std::result::Result<RawFrame, TryRecvError> {
+    fn try_recv(&self) -> std::result::Result<CapturedFrame, TryRecvError> {
         let mut guard = self.inbox.state.lock().unwrap();
         if let Some(f) = guard.queue.pop_front() {
             Ok(f)
@@ -349,7 +367,7 @@ impl FrameReceiver {
         }
     }
 
-    fn recv_timeout(&self, timeout: Duration) -> std::result::Result<RawFrame, RecvTimeoutError> {
+    fn recv_timeout(&self, timeout: Duration) -> std::result::Result<CapturedFrame, RecvTimeoutError> {
         let mut guard = self.inbox.state.lock().unwrap();
         let deadline = Instant::now() + timeout;
         loop {
@@ -379,7 +397,7 @@ impl Drop for FrameReceiver {
         let leftovers: Vec<_> = guard.queue.drain(..).collect();
         drop(guard);
         for f in leftovers {
-            self.inbox.pool.recycle(f.data);
+            recycle_captured(&self.inbox.pool, f);
         }
         self.inbox.cv.notify_all();
     }
@@ -441,6 +459,28 @@ impl Recorder {
             log::info!("auto fps: monitor refresh {monitor_hz:?} Hz -> nominal encoder fps {nominal_fps}");
         }
 
+        let has_overlays = config.mouse_fx.any_overlay() || config.watermark.any_overlay();
+        let is_openh264 = config.format.video_codec == VideoCodec::OpenH264
+            || (config.format.video_codec == VideoCodec::Auto
+                && VideoCodec::resolve_auto(&available_encoders()) == VideoCodec::OpenH264);
+        let gpu_off_reason: Option<&'static str> = if !cfg!(windows) {
+            Some("non-Windows platform")
+        } else if config.color_conversion == ColorConversion::Cpu {
+            Some("color conversion set to CPU")
+        } else if matches!(config.source, Source::Game { .. }) {
+            Some("in-game hook capture")
+        } else if has_overlays {
+            Some("cursor/click/watermark overlay active")
+        } else if is_openh264 {
+            Some("OpenH264 CPU encoder selected")
+        } else {
+            None
+        };
+        let gpu_active = Arc::new(AtomicBool::new(gpu_off_reason.is_none()));
+        if let Some(reason) = gpu_off_reason {
+            log::info!("video capture pipeline: CPU readback ({reason})");
+        }
+
         let (video_tx, video_rx) = frame_mailbox(pool.clone(), stats.clone());
         let (audio_tx, audio_rx) = mpsc::sync_channel::<(usize, AudioFrame)>(512);
 
@@ -464,6 +504,10 @@ impl Recorder {
             sampler.clone(),
             pool.clone(),
             region.clone(),
+            gpu_active.clone(),
+            preview.clone(),
+            preview_visible.clone(),
+            on_preview.clone(),
         )?;
 
         let (audio_thread, audio_cfgs) = if config.wants_audio() {
@@ -499,6 +543,7 @@ impl Recorder {
             sampler,
             pool,
             region: region.clone(),
+            gpu_active,
         })?;
 
         Ok(Recorder {
@@ -644,17 +689,12 @@ fn start_capture(
     sampler: Option<Arc<Mutex<MouseSampler>>>,
     pool: Arc<FramePool>,
     region: Option<LiveRect>,
+    gpu_active: Arc<AtomicBool>,
+    preview: Arc<PreviewSlot>,
+    preview_visible: Arc<AtomicBool>,
+    on_preview: Option<PreviewCallback>,
 ) -> Result<CaptureHandle> {
     let note_stats = stats.clone();
-    let sink: capture::FrameSink = Box::new(move |mut frame| {
-        stats.frames_captured.fetch_add(1, Ordering::Relaxed);
-        // Sample the pointer right when the frame arrives so effects line up
-        // with the captured image even if encoding lags behind.
-        if let Some(s) = &sampler {
-            frame.mouse = Some(s.lock().unwrap().snapshot());
-        }
-        tx.send(frame)
-    });
     let capture_fps = if config.is_auto_fps() {
         match config.source {
             Source::Game { .. } => nominal_fps,
@@ -663,18 +703,57 @@ fn start_capture(
     } else {
         config.fps()
     };
-    let mut handle = capture::start(
-        CaptureConfig {
-            source: config.source.clone(),
-            fps: capture_fps,
-            show_cursor: config.mouse_fx.native_cursor(),
-            pool: Some(pool),
-            live_region: region,
-        },
-        epoch,
-        sink,
-    )
-    .context("starting screen capture")?;
+    let cap_cfg = CaptureConfig {
+        source: config.source.clone(),
+        fps: capture_fps,
+        show_cursor: config.mouse_fx.native_cursor(),
+        pool: Some(pool),
+        live_region: region,
+    };
+    let mut handle = {
+        #[cfg(windows)]
+        {
+            let gpu_opts = gpu_active.load(Ordering::Relaxed).then(|| {
+                let prev_slot = preview;
+                let prev_cb = on_preview;
+                capture::GpuCaptureOptions {
+                    size_mode: config.format.size,
+                    gpu_active,
+                    preview_visible,
+                    on_preview: Box::new(move |img| {
+                        *prev_slot.image.lock().unwrap() = Some(img);
+                        if let Some(cb) = &prev_cb {
+                            cb();
+                        }
+                    }),
+                }
+            });
+            let sink: capture::windows::CapturedSink = Box::new(move |mut frame| {
+                stats.frames_captured.fetch_add(1, Ordering::Relaxed);
+                // Sample the pointer right when the frame arrives so effects line up
+                // with the captured image even if encoding lags behind.
+                if let Some(s) = &sampler
+                    && let CapturedFrame::Cpu(ref mut raw) = frame
+                {
+                    raw.mouse = Some(s.lock().unwrap().snapshot());
+                }
+                tx.send(frame)
+            });
+            capture::windows::start_with_gpu(cap_cfg, gpu_opts, epoch, sink).context("starting screen capture")?
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (gpu_active, preview, preview_visible, on_preview);
+            let sink: capture::FrameSink = Box::new(move |mut frame| {
+                stats.frames_captured.fetch_add(1, Ordering::Relaxed);
+                if let Some(s) = &sampler {
+                    frame.mouse = Some(s.lock().unwrap().snapshot());
+                }
+                tx.send(CapturedFrame::Cpu(frame))
+            });
+            capture::start(cap_cfg, epoch, sink).context("starting screen capture")?
+        }
+    };
     // Whatever the backend could not honour (an OS without the capture-border
     // or cursor setting) shows up next to the encoder notes.
     if let Some(n) = handle.take_note() {
@@ -683,14 +762,18 @@ fn start_capture(
     Ok(handle)
 }
 
-/// Fixed-cadence timeline: slot `k` is presented at `pts0 + k / fps`
-/// (exact rational arithmetic, so long recordings never drift).
+/// Frame timeline: slot `k` in the current epoch is presented at `pts0 + k / fps`
+/// (exact rational arithmetic, so long recordings never drift). Adaptive grid
+/// retargeting via [`Self::set_fps`] re-anchors the epoch right after the last
+/// emitted frame so cadence changes never introduce backward jumps or bursts.
 #[derive(Debug, Clone)]
 pub struct FrameClock {
     fps: u64,
     pts0_ns: u64,
-    /// Next slot to encode.
+    /// Next slot to encode in the current epoch.
     pub next: u64,
+    /// PTS of the most recently emitted slot across grid changes.
+    last_emitted_pts_ns: Option<u64>,
 }
 
 const NS: u64 = 1_000_000_000;
@@ -700,7 +783,35 @@ impl FrameClock {
     pub const MAX_BEHIND: u64 = 2;
 
     pub fn new(fps: u32, pts0: Duration) -> Self {
-        Self { fps: fps.max(1) as u64, pts0_ns: pts0.as_nanos() as u64, next: 0 }
+        Self { fps: fps.max(1) as u64, pts0_ns: pts0.as_nanos() as u64, next: 0, last_emitted_pts_ns: None }
+    }
+
+    pub fn fps(&self) -> u32 {
+        self.fps as u32
+    }
+
+    pub fn mark_emitted(&mut self, pts: Duration) {
+        self.last_emitted_pts_ns = Some(pts.as_nanos() as u64);
+    }
+
+    /// Retargets the frame clock to `new_fps` smoothly from the last emitted
+    /// frame timestamp onward, guaranteeing strictly monotonic `>= 1 / new_fps`
+    /// spacing across grid transitions.
+    pub fn set_fps(&mut self, new_fps: u32) -> bool {
+        let new_fps = new_fps.max(1) as u64;
+        if new_fps == self.fps {
+            return false;
+        }
+        let new_interval_ns = NS / new_fps;
+        if let Some(prev_ns) = self.last_emitted_pts_ns {
+            self.pts0_ns = prev_ns + new_interval_ns;
+            self.next = 0;
+        } else {
+            self.pts0_ns += self.next * NS / self.fps;
+            self.next = 0;
+        }
+        self.fps = new_fps;
+        true
     }
 
     pub fn interval(&self) -> Duration {
@@ -781,6 +892,7 @@ struct EncodeArgs {
     /// Live crop rect of a region recording; used to keep mouse effects aligned
     /// while the region is dragged.
     region: Option<LiveRect>,
+    gpu_active: Arc<AtomicBool>,
 }
 
 fn spawn_encode_thread(args: EncodeArgs) -> Result<JoinHandle<Result<()>>> {
@@ -812,6 +924,7 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
         sampler,
         pool,
         region,
+        gpu_active,
     } = args;
     let mut audio_cfgs = Some(audio_cfgs);
     // Recording-time clock: wall time since epoch minus paused time.
@@ -827,21 +940,21 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
         }
         Ok(())
     };
-    let take_newest = |newest: &mut Option<RawFrame>, f: RawFrame, pool: &FramePool, stats: &Stats| {
+    let take_newest = |newest: &mut Option<CapturedFrame>, f: CapturedFrame, pool: &FramePool, stats: &Stats| {
         if let Some(old) = newest.replace(f) {
-            pool.recycle(old.data);
+            recycle_captured(pool, old);
             stats.frames_superseded.fetch_add(1, Ordering::Relaxed);
         }
     };
 
     // Wait for the very first captured frame, which defines the timeline origin
     // and the resolution everything downstream is built around.
-    let mut first_frame: Option<RawFrame> = None;
+    let mut first_frame: Option<CapturedFrame> = None;
     while first_frame.is_none() {
         let stopping = stop.load(Ordering::Relaxed);
         if paused.load(Ordering::Relaxed) && !stopping {
             match video_rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(f) => pool.recycle(f.data),
+                Ok(f) => recycle_captured(&pool, f),
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -851,14 +964,15 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
             Ok(mut f) => {
                 // Drain if a newer frame arrived right as we woke up.
                 while let Ok(newer) = video_rx.try_recv() {
-                    pool.recycle(std::mem::take(&mut f.data));
+                    recycle_captured(&pool, f);
                     f = newer;
                 }
-                f.pts = f.pts.saturating_sub(paused_dur());
+                let adj = f.pts().saturating_sub(paused_dur());
+                f.set_pts(adj);
                 log::info!(
                     "timeline starts at {:.0} ms (capture latency {:.0} ms)",
-                    f.pts.as_secs_f64() * 1e3,
-                    rec_now().saturating_sub(f.pts).as_secs_f64() * 1e3
+                    f.pts().as_secs_f64() * 1e3,
+                    rec_now().saturating_sub(f.pts()).as_secs_f64() * 1e3
                 );
                 first_frame = Some(f);
             }
@@ -875,37 +989,84 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
         return Err(anyhow!("no frames were captured"));
     };
 
-    let (mut prep, mut core, conv1, conv2, resolved_fps) =
-        init_encode_pipeline(&config, nominal_fps, &first, audio_cfgs.take().unwrap_or_default(), &stats)?;
-    let slot_interval = Duration::from_nanos(NS / resolved_fps.max(1) as u64);
-    stats.width.store(prep.dims.0 as u64, Ordering::Relaxed);
-    stats.height.store(prep.dims.1 as u64, Ordering::Relaxed);
+    let first_pts = first.pts();
+    let InitEncodePipeline {
+        cpu_spec,
+        mut core,
+        cpu: init_cpu,
+        fallback_nv12: init_nv12,
+        resolved_fps,
+    } = init_encode_pipeline(
+        &config,
+        nominal_fps,
+        &first,
+        audio_cfgs.take().unwrap_or_default(),
+        &stats,
+        &gpu_active,
+    )?;
+    let encoder_uses_d3d11 = core.encoder.supports_d3d11();
+    let shared_grid_fps = Arc::new(AtomicU32::new(resolved_fps));
+    stats.width.store(cpu_spec.dims.0 as u64, Ordering::Relaxed);
+    stats.height.store(cpu_spec.dims.1 as u64, Ordering::Relaxed);
     let is_auto = config.is_auto_fps();
     stats.target_fps.store(resolved_fps as u64, Ordering::Relaxed);
     // Counters so far describe the warm-up, not the file.
     stats.reset_pre_roll();
-    stats.stream_start.set(first.pts);
+    stats.stream_start.set(first_pts);
+
+    struct FallbackNv12 {
+        y: Vec<u8>,
+        uv: Vec<u8>,
+        stride_y: usize,
+        stride_uv: usize,
+        dims: (u32, u32),
+    }
 
     enum PreparedSlot {
-        Converted {
+        #[cfg(windows)]
+        Gpu {
+            slot: u64,
+            pts: Duration,
+            prep_us: u64,
+            vp_submit_us: u64,
+            frame: capture::GpuFrame,
+        },
+        #[cfg(windows)]
+        GpuRepeat {
+            slot: u64,
+            pts: Duration,
+            prep_us: u64,
+        },
+        Cpu {
             slot: u64,
             pts: Duration,
             prep_us: u64,
             conv: Converter,
         },
-        RepeatPrev {
+        CpuRepeat {
             slot: u64,
             pts: Duration,
             prep_us: u64,
+        },
+        FallbackNv12 {
+            slot: u64,
+            pts: Duration,
+            prep_us: u64,
+            nv12: FallbackNv12,
         },
     }
 
     let (prep_tx, prep_rx) = mpsc::sync_channel::<PreparedSlot>(1);
     let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Converter>(2);
-    recycle_tx.send(conv1).expect("recycle channel has capacity 2");
-    recycle_tx.send(conv2).expect("recycle channel has capacity 2");
+    let mut cpu_prep = if let Some((prep, conv1, conv2)) = init_cpu {
+        recycle_tx.send(conv1).expect("recycle channel has capacity 2");
+        recycle_tx.send(conv2).expect("recycle channel has capacity 2");
+        Some(prep)
+    } else {
+        None
+    };
     let abort_prep = Arc::new(AtomicBool::new(false));
-    let mut clock = FrameClock::new(resolved_fps, first.pts);
+    let mut clock = FrameClock::new(resolved_fps, first_pts);
 
     std::thread::scope(|scope| -> Result<()> {
         let mut origin = source_origin(&config.source).unwrap_or((0, 0));
@@ -926,11 +1087,28 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
         let prep_sampler = &sampler;
         let prep_pool = &pool;
         let prep_region = &region;
+        let prep_spec = &cpu_spec;
+        let prep_grid_fps = shared_grid_fps.clone();
+        let mut prep_recycle_tx = Some(recycle_tx.clone());
 
         let prep_handle = std::thread::Builder::new()
             .name("openclip-prep".into())
             .spawn_scoped(scope, move || -> Result<()> {
-                let mut newest: Option<RawFrame> = Some(first);
+                let mut fallback_first: Option<FallbackNv12> = init_nv12.map(|(y, uv, sy, suv)| FallbackNv12 {
+                    y,
+                    uv,
+                    stride_y: sy,
+                    stride_uv: suv,
+                    dims: prep_spec.dims,
+                });
+                let mut newest: Option<CapturedFrame> = if fallback_first.is_some() {
+                    drop(first);
+                    None
+                } else {
+                    Some(first)
+                };
+                let mut last_was_gpu = false;
+                let mut gpu_resize_noted = false;
                 let mut frames_since_origin = 0u32;
                 let mut was_paused = false;
                 let mut auto_idle = false;
@@ -947,7 +1125,7 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                     if prep_paused.load(Ordering::Relaxed) && !stopping {
                         was_paused = true;
                         match video_rx.recv_timeout(Duration::from_millis(20)) {
-                            Ok(f) => prep_pool.recycle(f.data),
+                            Ok(f) => recycle_captured(prep_pool, f),
                             Err(RecvTimeoutError::Disconnected) => disconnected = true,
                             Err(RecvTimeoutError::Timeout) => {}
                         }
@@ -961,19 +1139,21 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                         auto_idle = false;
                         // Frames queued before the pause ended belong to paused time.
                         while let Ok(f) = video_rx.try_recv() {
-                            prep_pool.recycle(f.data);
+                            recycle_captured(prep_pool, f);
                         }
                         if let Some(f) = newest.take() {
-                            prep_pool.recycle(f.data);
+                            recycle_captured(prep_pool, f);
                         }
                         clock.resync(rec_now());
                     }
 
                     // ----- collect frames until ready -----
+                    clock.set_fps(prep_grid_fps.load(Ordering::Relaxed));
                     let mut force_fx_frame = false;
                     if is_auto && auto_idle {
                         while let Ok(mut f) = video_rx.try_recv() {
-                            f.pts = f.pts.saturating_sub(paused_dur());
+                            let adj = f.pts().saturating_sub(paused_dur());
+                            f.set_pts(adj);
                             take_newest(&mut newest, f, prep_pool, &prep_stats);
                         }
                         while newest.is_none()
@@ -981,9 +1161,11 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                             && !disconnected
                             && !prep_abort.load(Ordering::Relaxed)
                         {
-                            let fx_animating = prep.frame.is_some()
-                                && prep_sampler.is_some()
-                                && (!prep_config.mouse_fx.native_cursor() || prep.has_active_clicks());
+                            let fx_animating = cpu_prep.as_ref().is_some_and(|p| {
+                                p.frame.is_some()
+                                    && prep_sampler.is_some()
+                                    && (!prep_config.mouse_fx.native_cursor() || p.has_active_clicks())
+                            });
                             let wait_dur = if fx_animating {
                                 Duration::from_millis(16)
                             } else {
@@ -991,7 +1173,8 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                             };
                             match video_rx.recv_timeout(wait_dur) {
                                 Ok(mut f) => {
-                                    f.pts = f.pts.saturating_sub(paused_dur());
+                                    let adj = f.pts().saturating_sub(paused_dur());
+                                    f.set_pts(adj);
                                     take_newest(&mut newest, f, prep_pool, &prep_stats);
                                 }
                                 Err(RecvTimeoutError::Timeout) => {
@@ -1000,11 +1183,13 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                                     }
                                     // Keep non-native cursor or active click ripples animating even
                                     // if WGC is idle, without duplicating static frames otherwise.
-                                    if fx_animating && let Some(s) = prep_sampler {
+                                    if fx_animating
+                                        && let (Some(s), Some(p)) = (prep_sampler, cpu_prep.as_mut())
+                                    {
                                         let snap = s.lock().unwrap().snapshot();
-                                        let (cursor, clicks) = snap.mapped(origin, prep.fx_scale);
-                                        if prep.fx_changed(cursor, &clicks) {
-                                            if let Some(frame) = prep.frame.as_mut() {
+                                        let (cursor, clicks) = snap.mapped(origin, p.fx_scale);
+                                        if p.fx_changed(cursor, &clicks) {
+                                            if let Some(frame) = p.frame.as_mut() {
                                                 frame.mouse = Some(snap);
                                             }
                                             force_fx_frame = true;
@@ -1018,14 +1203,15 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                                 }
                             }
                         }
+                        clock.set_fps(prep_grid_fps.load(Ordering::Relaxed));
                         if let Some(f) = newest.as_ref() {
                             let wake_now = rec_now();
                             // If Readback flushed an older pre-idle staged frame, anchor at wall time
                             // so returning from static idle does not trigger fake `slots_skipped`.
-                            let snap_pts = if wake_now.saturating_sub(f.pts) > slot_interval * 2 {
+                            let snap_pts = if wake_now.saturating_sub(f.pts()) > clock.interval() * 2 {
                                 wake_now
                             } else {
-                                f.pts
+                                f.pts()
                             };
                             clock.snap_to_pts(snap_pts);
                             auto_idle = false;
@@ -1034,12 +1220,13 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                             auto_idle = false;
                         }
                     }
-                    if !is_auto || (!auto_idle && !force_fx_frame) {
+                    if (!is_auto || (!auto_idle && !force_fx_frame)) && fallback_first.is_none() {
                         let deadline = clock.deadline(clock.next);
                         loop {
                             match video_rx.try_recv() {
                                 Ok(mut f) => {
-                                    f.pts = f.pts.saturating_sub(paused_dur());
+                                    let adj = f.pts().saturating_sub(paused_dur());
+                                    f.set_pts(adj);
                                     take_newest(&mut newest, f, prep_pool, &prep_stats);
                                 }
                                 Err(TryRecvError::Empty) => break,
@@ -1062,7 +1249,8 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                             let wait = (deadline - now).min(Duration::from_millis(50));
                             match video_rx.recv_timeout(wait) {
                                 Ok(mut f) => {
-                                    f.pts = f.pts.saturating_sub(paused_dur());
+                                    let adj = f.pts().saturating_sub(paused_dur());
+                                    f.set_pts(adj);
                                     take_newest(&mut newest, f, prep_pool, &prep_stats);
                                 }
                                 Err(RecvTimeoutError::Timeout) => {
@@ -1084,23 +1272,35 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                     if stopping || disconnected {
                         // Take whatever is still queued so the last captured frame is not lost.
                         while let Ok(mut f) = video_rx.try_recv() {
-                            f.pts = f.pts.saturating_sub(paused_dur());
+                            let adj = f.pts().saturating_sub(paused_dur());
+                            f.set_pts(adj);
                             take_newest(&mut newest, f, prep_pool, &prep_stats);
                         }
                         if is_auto && auto_idle && let Some(f) = newest.as_ref() {
                             let wake_now = rec_now();
-                            let snap_pts = if wake_now.saturating_sub(f.pts) > slot_interval * 2 {
+                            let snap_pts = if wake_now.saturating_sub(f.pts()) > clock.interval() * 2 {
                                 wake_now
                             } else {
-                                f.pts
+                                f.pts()
                             };
                             clock.snap_to_pts(snap_pts);
                             auto_idle = false;
                         }
                     }
 
-                    // ----- prepare one slot (scale + overlays + YUV conversion) -----
+                    // ----- prepare one slot (GPU passthrough OR CPU scale + overlays + YUV conversion) -----
                     let now = rec_now();
+                    if let Some(nv12) = fallback_first.take() {
+                        let slot = clock.next;
+                        let pts = clock.slot_pts(slot);
+                        if prep_tx.send(PreparedSlot::FallbackNv12 { slot, pts, prep_us: 0, nv12 }).is_err() {
+                            break;
+                        }
+                        clock.mark_emitted(pts);
+                        clock.next += 1;
+                        continue;
+                    }
+
                     let have_new = newest.is_some();
                     if stopping && !have_new && !force_fx_frame {
                         break;
@@ -1117,98 +1317,167 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                         continue;
                     }
 
-                    let p0 = Instant::now();
                     let slot = clock.next;
                     let pts = clock.slot_pts(slot);
-                    if let Some(f) = newest.take() {
-                        prep.accept(f, prep_pool, &prep_stats);
-                    } else {
-                        prep_stats.frames_repeated.fetch_add(1, Ordering::Relaxed);
-                        // The screen is static but the pointer may move: sample now.
-                        if let (Some(s), Some(fx)) = (prep_sampler, prep.frame.as_mut()) {
-                            fx.mouse = Some(s.lock().unwrap().snapshot());
-                        }
-                    }
-                    let snap = prep.frame.as_mut().expect("frame present after accept").mouse.take();
+                    let taken = newest.take();
 
-                    // Overlays: paint in place, convert, restore — no frame copy.
-                    let mut fx = None;
-                    if let Some(snap) = snap.filter(|_| prep_sampler.is_some()) {
-                        if let (Some(base), Some(live)) = (region_origin, prep_region) {
-                            let r = live.get();
-                            origin = (base.0 + r.x as i32, base.1 + r.y as i32);
-                        } else if matches!(prep_config.source, Source::Window { .. }) {
-                            frames_since_origin += 1;
-                            if frames_since_origin >= 30 {
-                                frames_since_origin = 0;
-                                if let Ok(o) = source_origin(&prep_config.source) {
-                                    origin = o;
-                                }
+                    let msg = match taken {
+                        #[cfg(windows)]
+                        Some(CapturedFrame::Gpu(gf)) => {
+                            last_was_gpu = encoder_uses_d3d11;
+                            if gf.resized_from_initial && !gpu_resize_noted {
+                                gpu_resize_noted = true;
+                                prep_stats.add_note(crate::t!(NOTE_SOURCE_RESIZED, prep_spec.scaled.0, prep_spec.scaled.1));
+                            }
+                            PreparedSlot::Gpu {
+                                slot,
+                                pts,
+                                prep_us: gf.prep_us,
+                                vp_submit_us: gf.vp_submit_us,
+                                frame: gf,
                             }
                         }
-                        let (cursor, clicks) = snap.mapped(origin, prep.fx_scale);
-                        let changed = prep.fx_changed(cursor, &clicks);
-                        fx = Some((cursor, clicks, changed));
-                    }
-                    let mut painted = false;
-                    if prep.converted_is_new || fx.as_ref().is_some_and(|(_, _, changed)| *changed) {
-                        let frame = prep.frame.as_mut().unwrap();
-                        if let Some(wm) = &mut prep.watermark {
-                            wm.paint(&prep_config.watermark, frame, &mut prep.patches);
+                        None if last_was_gpu => {
+                            prep_stats.frames_repeated.fetch_add(1, Ordering::Relaxed);
+                            PreparedSlot::GpuRepeat { slot, pts, prep_us: 0 }
                         }
-                        if let Some((cursor, clicks, _)) = &fx {
-                            let scale = prep.fx_scale.0.min(prep.fx_scale.1);
-                            prep_config.mouse_fx.paint(frame, *cursor, clicks, scale, &mut prep.patches);
+                        other_cpu => {
+                            if encoder_uses_d3d11 || last_was_gpu {
+                                if let Some(f) = other_cpu {
+                                    recycle_captured(prep_pool, f);
+                                }
+                                prep_err = Some(anyhow!("GPU capture unexpectedly fell back to CPU mid-recording"));
+                                break;
+                            }
+                            let mut lazy_conv: Option<Converter> = None;
+                            if cpu_prep.is_none() {
+                                match build_cpu_prep(prep_config, prep_spec) {
+                                    Ok((p, c1, c2)) => {
+                                        if let Some(tx) = prep_recycle_tx.take() {
+                                            let _ = tx.send(c2);
+                                        }
+                                        lazy_conv = Some(c1);
+                                        cpu_prep = Some(p);
+                                    }
+                                    Err(e) => {
+                                        if let Some(f) = other_cpu {
+                                            recycle_captured(prep_pool, f);
+                                        }
+                                        prep_err = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            let p = cpu_prep.as_mut().unwrap();
+                            let p0 = Instant::now();
+                            let captured_raw = match other_cpu {
+                                Some(CapturedFrame::Cpu(r)) => Some(r),
+                                #[cfg(windows)]
+                                Some(CapturedFrame::Gpu(_)) => unreachable!(),
+                                None => None,
+                            };
+                            if let Some(r) = captured_raw {
+                                p.accept(r, prep_pool, &prep_stats);
+                            } else {
+                                prep_stats.frames_repeated.fetch_add(1, Ordering::Relaxed);
+                                // Static screen repeat: if CPU frame was not yet received after a
+                                // frame-0 GPU fallback, let encode_loop repeat the fallback NV12 frame.
+                                if p.frame.is_none() {
+                                    if prep_tx.send(PreparedSlot::CpuRepeat { slot, pts, prep_us: 0 }).is_err() {
+                                        break;
+                                    }
+                                    clock.mark_emitted(pts);
+                                    clock.next += 1;
+                                    continue;
+                                }
+                                if let (Some(s), Some(fx)) = (prep_sampler, p.frame.as_mut()) {
+                                    fx.mouse = Some(s.lock().unwrap().snapshot());
+                                }
+                            }
+
+                            let snap = p.frame.as_mut().expect("frame present after accept").mouse.take();
+                            let mut fx = None;
+                            if let Some(snap) = snap.filter(|_| prep_sampler.is_some()) {
+                                if let (Some(base), Some(live)) = (region_origin, prep_region) {
+                                    let r = live.get();
+                                    origin = (base.0 + r.x as i32, base.1 + r.y as i32);
+                                } else if matches!(prep_config.source, Source::Window { .. }) {
+                                    frames_since_origin += 1;
+                                    if frames_since_origin >= 30 {
+                                        frames_since_origin = 0;
+                                        if let Ok(o) = source_origin(&prep_config.source) {
+                                            origin = o;
+                                        }
+                                    }
+                                }
+                                let (cursor, clicks) = snap.mapped(origin, p.fx_scale);
+                                let changed = p.fx_changed(cursor, &clicks);
+                                fx = Some((cursor, clicks, changed));
+                            }
+                            let mut painted = false;
+                            if p.converted_is_new || fx.as_ref().is_some_and(|(_, _, changed)| *changed) {
+                                let frame = p.frame.as_mut().unwrap();
+                                if let Some(wm) = &mut p.watermark {
+                                    wm.paint(&prep_config.watermark, frame, &mut p.patches);
+                                }
+                                if let Some((cursor, clicks, _)) = &fx {
+                                    let scale = p.fx_scale.0.min(p.fx_scale.1);
+                                    prep_config.mouse_fx.paint(frame, *cursor, clicks, scale, &mut p.patches);
+                                }
+                                painted = !p.patches.is_empty();
+                            }
+                            if let Some((cursor, clicks, _)) = fx {
+                                p.last_fx = Some((cursor, clicks));
+                            }
+
+                            let need_convert = p.converted_is_new || painted;
+                            let mut converted = None;
+                            if need_convert {
+                                let conv_opt = lazy_conv.take().or_else(|| recycle_rx.recv().ok());
+                                let Some(mut conv) = conv_opt else {
+                                    break;
+                                };
+                                if let Err(e) = conv.convert(p.frame.as_ref().unwrap()) {
+                                    prep_err = Some(e);
+                                    break;
+                                }
+                                p.converted_is_new = false;
+                                converted = Some(conv);
+                            }
+                            let convert_done = Instant::now();
+
+                            // Build GUI preview while overlays are still painted (skipped if behind).
+                            if prep_preview_visible.load(Ordering::Relaxed)
+                                && p0.duration_since(last_preview) >= PREVIEW_INTERVAL
+                                && (is_auto || clock.due(rec_now()) == 0)
+                            {
+                                last_preview = p0;
+                                let img = p.previewer.make(p.frame.as_ref().unwrap());
+                                *prep_preview.image.lock().unwrap() = Some(img);
+                                if let Some(cb) = prep_on_preview {
+                                    cb();
+                                }
+                            }
+
+                            // Restore overlay patches immediately now that both YUV conversion
+                            // and preview took their snapshot, keeping the reusable frame clean.
+                            let r0 = Instant::now();
+                            if painted {
+                                MouseFx::restore(p.frame.as_mut().unwrap(), &mut p.patches);
+                            }
+                            let prep_us = (convert_done - p0 + r0.elapsed()).as_micros() as u64;
+
+                            match converted {
+                                Some(conv) => PreparedSlot::Cpu { slot, pts, prep_us, conv },
+                                None => PreparedSlot::CpuRepeat { slot, pts, prep_us },
+                            }
                         }
-                        painted = !prep.patches.is_empty();
-                    }
-                    if let Some((cursor, clicks, _)) = fx {
-                        prep.last_fx = Some((cursor, clicks));
-                    }
-
-                    let need_convert = prep.converted_is_new || painted;
-                    let mut converted = None;
-                    if need_convert {
-                        let Ok(mut conv) = recycle_rx.recv() else {
-                            break;
-                        };
-                        if let Err(e) = conv.convert(prep.frame.as_ref().unwrap()) {
-                            prep_err = Some(e);
-                            break;
-                        }
-                        prep.converted_is_new = false;
-                        converted = Some(conv);
-                    }
-                    let convert_done = Instant::now();
-
-                    // Build GUI preview while overlays are still painted (skipped if behind).
-                    if prep_preview_visible.load(Ordering::Relaxed)
-                        && p0.duration_since(last_preview) >= PREVIEW_INTERVAL
-                        && (is_auto || clock.due(rec_now()) == 0)
-                    {
-                        last_preview = p0;
-                        let img = prep.previewer.make(prep.frame.as_ref().unwrap());
-                        *prep_preview.image.lock().unwrap() = Some(img);
-                        if let Some(cb) = prep_on_preview {
-                            cb();
-                        }
-                    }
-
-                    // Restore overlay patches immediately now that both YUV conversion
-                    // and preview took their snapshot, keeping the reusable frame clean.
-                    let r0 = Instant::now();
-                    if painted {
-                        MouseFx::restore(prep.frame.as_mut().unwrap(), &mut prep.patches);
-                    }
-                    let prep_us = (convert_done - p0 + r0.elapsed()).as_micros() as u64;
-
-                    let msg = match converted {
-                        Some(conv) => PreparedSlot::Converted { slot, pts, prep_us, conv },
-                        None => PreparedSlot::RepeatPrev { slot, pts, prep_us },
                     };
+
                     if prep_tx.send(msg).is_err() {
                         break;
                     }
+                    clock.mark_emitted(pts);
                     clock.next += 1;
                     if disconnected && newest.is_none() {
                         break;
@@ -1216,9 +1485,11 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                 }
 
                 if let Some(f) = newest.take() {
-                    prep_pool.recycle(f.data);
+                    recycle_captured(prep_pool, f);
                 }
-                if let Some(f) = prep.frame.take() {
+                if let Some(mut p) = cpu_prep
+                    && let Some(f) = p.frame.take()
+                {
                     prep_pool.recycle(f.data);
                 }
                 drop(prep_tx);
@@ -1229,32 +1500,100 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
             })?;
 
         let mut last_conv: Option<Converter> = None;
+        let mut last_fallback_nv12: Option<FallbackNv12> = None;
+        #[cfg(windows)]
+        let mut last_gpu: Option<Arc<GpuNv12Slot>> = None;
+        let mut adaptive_grid = AdaptiveFrameGrid::new(resolved_fps, is_auto);
+        let mut sec_acc = SecTimingAccum::default();
         let mut last_report = Instant::now();
         let mut last_sec_report = Instant::now();
         let mut prev_cap = stats.frames_captured.load(Ordering::Relaxed);
         let mut prev_enc_in = stats.frames_to_encoder.load(Ordering::Relaxed);
+        let mut prev_slot_done = stats.slots_done.load(Ordering::Relaxed);
+        let mut prev_slot_skip = stats.slots_skipped.load(Ordering::Relaxed);
         let mut prev_drop = stats.frames_dropped.load(Ordering::Relaxed);
         let mut prev_sup = stats.frames_superseded.load(Ordering::Relaxed);
-        let mut maybe_log_sec = || {
-            let dt = last_sec_report.elapsed();
+        let gpu_mode_label = if encoder_uses_d3d11 { "GPU" } else { "CPU" };
+        let mut maybe_log_sec = |acc: &mut SecTimingAccum, grid: &mut AdaptiveFrameGrid| {
+            let now = Instant::now();
+            let dt = now.saturating_duration_since(last_sec_report);
             if dt >= Duration::from_secs(1) {
                 let cur_cap = stats.frames_captured.load(Ordering::Relaxed);
                 let cur_enc_in = stats.frames_to_encoder.load(Ordering::Relaxed);
+                let cur_done = stats.slots_done.load(Ordering::Relaxed);
+                let cur_skip = stats.slots_skipped.load(Ordering::Relaxed);
                 let cur_drop = stats.frames_dropped.load(Ordering::Relaxed);
                 let cur_sup = stats.frames_superseded.load(Ordering::Relaxed);
+                let delta_done = cur_done.saturating_sub(prev_slot_done);
+                let delta_skip = cur_skip.saturating_sub(prev_slot_skip);
+                let avg_work_us = acc.avg_bottleneck_us();
+                let summary = acc.take_summary();
                 log::info!(
-                    "1s rates ({:.2} s): wgc {} encoder_in {} dropped {} superseded {}",
+                    "1s rates ({:.2} s): wgc {} encoder_in {} skipped {} dropped {} superseded {} | mode {} grid {}fps | {summary}",
                     dt.as_secs_f64(),
                     cur_cap.saturating_sub(prev_cap),
                     cur_enc_in.saturating_sub(prev_enc_in),
+                    delta_skip,
                     cur_drop.saturating_sub(prev_drop),
                     cur_sup.saturating_sub(prev_sup),
+                    gpu_mode_label,
+                    grid.current_fps(),
                 );
+                if paused.load(Ordering::Relaxed) {
+                    grid.reset_streaks();
+                } else if let GridAction::Step { from, to, reason } =
+                    grid.observe(dt, delta_done, delta_skip, avg_work_us, now)
+                {
+                    log::info!("adaptive frame grid: {from} -> {to} fps ({reason})");
+                    shared_grid_fps.store(to, Ordering::Relaxed);
+                    stats.target_fps.store(to as u64, Ordering::Relaxed);
+                }
                 prev_cap = cur_cap;
                 prev_enc_in = cur_enc_in;
+                prev_slot_done = cur_done;
+                prev_slot_skip = cur_skip;
                 prev_drop = cur_drop;
                 prev_sup = cur_sup;
-                last_sec_report = Instant::now();
+                last_sec_report = now;
+            }
+        };
+
+        let encode_fallback_nv12 = |enc: &mut dyn VideoEncoder, nv12: &FallbackNv12, pts: Duration| -> Result<Vec<EncodedFrame>> {
+            match enc.input_layout() {
+                InputLayout::Nv12 => enc.encode(
+                    FrameInput::Nv12 {
+                        y: &nv12.y,
+                        uv: &nv12.uv,
+                        strides: (nv12.stride_y, nv12.stride_uv),
+                        dims: nv12.dims,
+                    },
+                    pts,
+                ),
+                InputLayout::I420 => {
+                    let w = nv12.dims.0 as usize;
+                    let h = nv12.dims.1 as usize;
+                    let uv_w = w / 2;
+                    let uv_h = h / 2;
+                    let mut u = Vec::with_capacity(uv_w * uv_h);
+                    let mut v = Vec::with_capacity(uv_w * uv_h);
+                    for row in 0..uv_h {
+                        let line = &nv12.uv[row * nv12.stride_uv..row * nv12.stride_uv + w];
+                        for pair in line.as_chunks::<2>().0 {
+                            u.push(pair[0]);
+                            v.push(pair[1]);
+                        }
+                    }
+                    enc.encode(
+                        FrameInput::I420 {
+                            y: &nv12.y,
+                            u: &u,
+                            v: &v,
+                            strides: (nv12.stride_y, uv_w, uv_w),
+                            dims: nv12.dims,
+                        },
+                        pts,
+                    )
+                }
             }
         };
 
@@ -1262,21 +1601,118 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
             loop {
                 match prep_rx.recv_timeout(Duration::from_millis(25)) {
                     Ok(item) => {
-                        let (slot, pts, prep_us, new_conv) = match item {
-                            PreparedSlot::Converted { slot, pts, prep_us, conv } => (slot, pts, prep_us, Some(conv)),
-                            PreparedSlot::RepeatPrev { slot, pts, prep_us } => (slot, pts, prep_us, None),
+                        #[cfg(windows)]
+                        let (slot, prep_us, vp_submit_us, gpu_wait_us, e0, encoded) = match item {
+                            PreparedSlot::Gpu { slot, pts, prep_us, vp_submit_us, frame } => {
+                                if core.encoder.supports_d3d11() {
+                                    last_gpu = Some(frame.slot.clone());
+                                    let gpu_wait_us = frame.slot.wait_complete(&frame.context);
+                                    let e0 = Instant::now();
+                                    stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                    let encoded = core.encoder.encode_d3d11(&frame.slot.texture, pts)?;
+                                    (slot, prep_us, vp_submit_us, gpu_wait_us, e0, encoded)
+                                } else {
+                                    // Rare startup race: a second GPU frame queued while frame-0 init
+                                    // fell back to CPU encoder. Read it back once without reopening the encoder.
+                                    let gpu_wait_us = frame.slot.wait_complete(&frame.context);
+                                    let (y, uv, stride_y, stride_uv) = crate::video::d3d11_vp::readback_nv12_texture(
+                                        &frame.device,
+                                        &frame.slot.texture,
+                                        cpu_spec.dims.0,
+                                        cpu_spec.dims.1,
+                                    )?;
+                                    let nv12 = FallbackNv12 { y, uv, stride_y, stride_uv, dims: cpu_spec.dims };
+                                    let e0 = Instant::now();
+                                    stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                    let encoded = encode_fallback_nv12(core.encoder.as_mut(), &nv12, pts)?;
+                                    last_fallback_nv12 = Some(nv12);
+                                    (slot, prep_us, vp_submit_us, gpu_wait_us, e0, encoded)
+                                }
+                            }
+                            PreparedSlot::GpuRepeat { slot, pts, prep_us } => {
+                                if !core.encoder.supports_d3d11() {
+                                    bail!("GPU repeat slot dispatched to CPU encoder");
+                                }
+                                let e0 = Instant::now();
+                                let gpu_slot = last_gpu.as_ref().expect("first GPU slot sets last_gpu");
+                                stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                let encoded = core.encoder.encode_d3d11(&gpu_slot.texture, pts)?;
+                                (slot, prep_us, 0, 0, e0, encoded)
+                            }
+                            PreparedSlot::FallbackNv12 { slot, pts, prep_us, nv12 } => {
+                                let e0 = Instant::now();
+                                stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                let encoded = encode_fallback_nv12(core.encoder.as_mut(), &nv12, pts)?;
+                                last_fallback_nv12 = Some(nv12);
+                                (slot, prep_us, 0, 0, e0, encoded)
+                            }
+                            PreparedSlot::Cpu { slot, pts, prep_us, conv } => {
+                                last_gpu = None;
+                                last_fallback_nv12 = None;
+                                if let Some(old) = last_conv.replace(conv) {
+                                    // Return the previous converter before starting encode
+                                    // so `openclip-prep` can convert the next frame concurrently.
+                                    let _ = recycle_tx.send(old);
+                                }
+                                let conv = last_conv.as_ref().expect("just set");
+                                if core.encoder.supports_d3d11() {
+                                    bail!("CPU prepared slot dispatched to GPU D3D11 encoder");
+                                }
+                                let e0 = Instant::now();
+                                stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                let encoded = core.encoder.encode(conv.frame(), pts)?;
+                                (slot, prep_us, 0, 0, e0, encoded)
+                            }
+                            PreparedSlot::CpuRepeat { slot, pts, prep_us } => {
+                                if core.encoder.supports_d3d11() {
+                                    bail!("CPU repeat slot dispatched to GPU D3D11 encoder");
+                                }
+                                let e0 = Instant::now();
+                                stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                let encoded = if let Some(conv) = last_conv.as_ref() {
+                                    core.encoder.encode(conv.frame(), pts)?
+                                } else if let Some(nv12) = last_fallback_nv12.as_ref() {
+                                    encode_fallback_nv12(core.encoder.as_mut(), nv12, pts)?
+                                } else {
+                                    bail!("CPU repeat slot before any CPU or fallback frame");
+                                };
+                                (slot, prep_us, 0, 0, e0, encoded)
+                            }
                         };
-                        let e0 = Instant::now();
-                        if let Some(conv) = new_conv
-                            && let Some(old) = last_conv.replace(conv)
-                        {
-                            // Return the previous converter before starting GPU encode
-                            // so `openclip-prep` can convert the next frame concurrently.
-                            let _ = recycle_tx.send(old);
-                        }
-                        let conv = last_conv.as_ref().expect("first prepared slot is converted");
-                        stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
-                        let encoded = core.encoder.encode(conv.frame(), pts)?;
+                        #[cfg(not(windows))]
+                        let (slot, prep_us, vp_submit_us, gpu_wait_us, e0, encoded) = match item {
+                            PreparedSlot::FallbackNv12 { slot, pts, prep_us, nv12 } => {
+                                let e0 = Instant::now();
+                                stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                let encoded = encode_fallback_nv12(core.encoder.as_mut(), &nv12, pts)?;
+                                last_fallback_nv12 = Some(nv12);
+                                (slot, prep_us, 0u64, 0u64, e0, encoded)
+                            }
+                            PreparedSlot::Cpu { slot, pts, prep_us, conv } => {
+                                last_fallback_nv12 = None;
+                                if let Some(old) = last_conv.replace(conv) {
+                                    let _ = recycle_tx.send(old);
+                                }
+                                let conv = last_conv.as_ref().expect("just set");
+                                let e0 = Instant::now();
+                                stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                let encoded = core.encoder.encode(conv.frame(), pts)?;
+                                (slot, prep_us, 0u64, 0u64, e0, encoded)
+                            }
+                            PreparedSlot::CpuRepeat { slot, pts, prep_us } => {
+                                let e0 = Instant::now();
+                                stats.frames_to_encoder.fetch_add(1, Ordering::Relaxed);
+                                let encoded = if let Some(conv) = last_conv.as_ref() {
+                                    core.encoder.encode(conv.frame(), pts)?
+                                } else if let Some(nv12) = last_fallback_nv12.as_ref() {
+                                    encode_fallback_nv12(core.encoder.as_mut(), nv12, pts)?
+                                } else {
+                                    bail!("CPU repeat slot before any CPU or fallback frame");
+                                };
+                                (slot, prep_us, 0u64, 0u64, e0, encoded)
+                            }
+                        };
+                        let stage = core.encoder.last_timing().unwrap_or_default();
                         let e1 = Instant::now();
                         if encoded.is_empty() {
                             stats.frames_skipped.fetch_add(1, Ordering::Relaxed);
@@ -1291,21 +1727,31 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
 
                         let encode_us = (e1 - e0).as_micros() as u64;
                         let mux_us = (e2 - e1).as_micros() as u64;
-                        let encode_stage_us = (e3 - e0).as_micros() as u64;
+                        let encode_stage_us = gpu_wait_us + (e3 - e0).as_micros() as u64;
                         let bottleneck_us = prep_us.max(encode_stage_us);
-                        Stats::rolling(&stats.encode_us, encode_us);
+                        Stats::rolling(&stats.encode_us, encode_us + gpu_wait_us);
                         Stats::rolling(&stats.mux_us, mux_us);
                         Stats::rolling(&stats.slot_us, bottleneck_us);
+                        sec_acc.record(prep_us, vp_submit_us, gpu_wait_us, stage, encode_us, mux_us, bottleneck_us);
 
-                        if Duration::from_micros(bottleneck_us) > slot_interval * 2 {
+                        let cur_grid_fps = shared_grid_fps.load(Ordering::Relaxed).max(1) as u64;
+                        let cur_slot_interval = Duration::from_nanos(NS / cur_grid_fps);
+                        if Duration::from_micros(bottleneck_us) > cur_slot_interval * 2 {
                             log::warn!(
-                                "slow slot {slot}: prepare {:.1} ms, encode {:.1} ms, mux {:.1} ms",
+                                "slow slot {slot}: prepare {:.1} ms (vp_submit {:.1}), gpu_wait {:.1} ms, encode {:.1} ms (mft_in {:.1}, mft_wait {:.1} [need_in {:.1}, proc_in {:.1}, out {:.1}]), mux {:.1} ms",
                                 prep_us as f64 / 1e3,
+                                vp_submit_us as f64 / 1e3,
+                                gpu_wait_us as f64 / 1e3,
                                 (e1 - e0).as_secs_f64() * 1e3,
-                                (e2 - e1).as_secs_f64() * 1e3
+                                stage.mft_in_us as f64 / 1e3,
+                                stage.mft_wait_us as f64 / 1e3,
+                                stage.mft_need_in_us as f64 / 1e3,
+                                stage.mft_process_in_us as f64 / 1e3,
+                                stage.mft_out_us as f64 / 1e3,
+                                (e2 - e1).as_secs_f64() * 1e3,
                             );
                         }
-                        maybe_log_sec();
+                        maybe_log_sec(&mut sec_acc, &mut adaptive_grid);
                         if last_report.elapsed() >= Duration::from_secs(5) {
                             last_report = Instant::now();
                             log::info!(
@@ -1323,7 +1769,7 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         push_audio(&mut core.mux, &stats)?;
-                        maybe_log_sec();
+                        maybe_log_sec(&mut sec_acc, &mut adaptive_grid);
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -1336,6 +1782,8 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
         drop(prep_rx);
         drop(recycle_tx);
         drop(last_conv);
+        #[cfg(windows)]
+        drop(last_gpu);
         let prep_res = prep_handle.join().map_err(|_| anyhow!("prep thread panicked"))?;
         encode_res?;
         prep_res?;
@@ -1346,9 +1794,11 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
         core.push(&enc, &stats)?;
     }
     if is_auto {
+        let cur_grid_fps = shared_grid_fps.load(Ordering::Relaxed).max(1) as u64;
+        let final_slot_interval = Duration::from_nanos(NS / cur_grid_fps);
         let mut end_pts = stats.stop_pts.get().unwrap_or_else(rec_now);
         if let Some(last_pts) = core.last_video_pts {
-            end_pts = end_pts.max(last_pts + slot_interval);
+            end_pts = end_pts.max(last_pts + final_slot_interval);
         }
         core.mux.finish_video(end_pts)?;
     }
@@ -1363,6 +1813,226 @@ fn encode_loop(args: EncodeArgs) -> Result<()> {
     stats.bytes_written.store(mux.bytes_written(), Ordering::Relaxed);
     mux.finalize()?;
     Ok(())
+}
+
+/// Consecutive overloaded seconds before stepping down the adaptive frame grid.
+const GRID_STEP_DOWN_SECS: u32 = 3;
+/// Consecutive seconds with sufficient headroom before stepping the grid back up.
+const GRID_STEP_UP_SECS: u32 = 5;
+const GRID_INITIAL_COOLDOWN_SECS: u64 = 10;
+const GRID_MAX_COOLDOWN_SECS: u64 = 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GridAction {
+    None,
+    Step { from: u32, to: u32, reason: String },
+}
+
+fn grid_ladder(base_fps: u32) -> Vec<u32> {
+    if base_fps <= 60 {
+        return vec![base_fps.max(1)];
+    }
+    let mut ladder = vec![base_fps];
+    for cand in [120u32, 90, 72, 60] {
+        let prev = *ladder.last().unwrap();
+        if cand < prev && (cand == 60 || cand * 100 <= prev * 94) {
+            ladder.push(cand);
+        }
+    }
+    if *ladder.last().unwrap() > 60 {
+        ladder.push(60);
+    }
+    ladder
+}
+
+#[derive(Default)]
+struct SecTimingAccum {
+    frames: u64,
+    prep_us: u64,
+    vp_submit_us: u64,
+    gpu_wait_us: u64,
+    mft_in_us: u64,
+    mft_wait_us: u64,
+    encode_us: u64,
+    mux_us: u64,
+    bottleneck_us: u64,
+}
+
+impl SecTimingAccum {
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        prep_us: u64,
+        vp_submit_us: u64,
+        gpu_wait_us: u64,
+        stage: EncodeStageTiming,
+        encode_us: u64,
+        mux_us: u64,
+        bottleneck_us: u64,
+    ) {
+        self.frames += 1;
+        self.prep_us += prep_us;
+        self.vp_submit_us += vp_submit_us;
+        self.gpu_wait_us += gpu_wait_us;
+        self.mft_in_us += stage.mft_in_us;
+        self.mft_wait_us += stage.mft_wait_us;
+        self.encode_us += encode_us;
+        self.mux_us += mux_us;
+        self.bottleneck_us += bottleneck_us;
+    }
+
+    fn avg_bottleneck_us(&self) -> u64 {
+        self.bottleneck_us.checked_div(self.frames).unwrap_or(0)
+    }
+
+    fn take_summary(&mut self) -> String {
+        let n = self.frames;
+        if n == 0 {
+            return "no frames".into();
+        }
+        let avg = |v: u64| v as f64 / n as f64 / 1e3;
+        let out = format!(
+            "prep {:.2}ms (vp_submit {:.2}ms) gpu_wait {:.2}ms encode {:.2}ms (mft_in {:.2}ms mft_wait {:.2}ms) mux {:.2}ms",
+            avg(self.prep_us),
+            avg(self.vp_submit_us),
+            avg(self.gpu_wait_us),
+            avg(self.encode_us),
+            avg(self.mft_in_us),
+            avg(self.mft_wait_us),
+            avg(self.mux_us),
+        );
+        *self = Self::default();
+        out
+    }
+}
+
+struct AdaptiveFrameGrid {
+    is_auto: bool,
+    ladder: Vec<u32>,
+    idx: usize,
+    over_secs: u32,
+    under_secs: u32,
+    last_step_down: Option<Instant>,
+    last_step_up: Option<Instant>,
+    cooldown_secs: u64,
+}
+
+impl AdaptiveFrameGrid {
+    fn new(base_fps: u32, is_auto: bool) -> Self {
+        Self {
+            is_auto,
+            ladder: grid_ladder(base_fps),
+            idx: 0,
+            over_secs: 0,
+            under_secs: 0,
+            last_step_down: None,
+            last_step_up: None,
+            cooldown_secs: GRID_INITIAL_COOLDOWN_SECS,
+        }
+    }
+
+    fn current_fps(&self) -> u32 {
+        self.ladder[self.idx]
+    }
+
+    fn reset_streaks(&mut self) {
+        self.over_secs = 0;
+        self.under_secs = 0;
+    }
+
+    fn observe(
+        &mut self,
+        dt: Duration,
+        slots_done: u64,
+        slots_skipped: u64,
+        avg_work_us: u64,
+        now: Instant,
+    ) -> GridAction {
+        if self.ladder.len() <= 1 {
+            return GridAction::None;
+        }
+        let cur_fps = self.current_fps();
+        let budget_us = 1_000_000u64 / cur_fps as u64;
+        let expected = ((cur_fps as f64) * dt.as_secs_f64()).round().max(1.0) as u64;
+        let active = slots_done + slots_skipped;
+
+        let overloaded = if self.is_auto {
+            // Auto FPS pauses emission on static screens; only judge capacity when
+            // frames are actively flowing and either slots skipped or encode lags.
+            active >= (cur_fps as u64 / 3).max(12)
+                && ((slots_done * 100 < active * 90) || (slots_skipped >= 3 && avg_work_us > budget_us))
+        } else {
+            (slots_done * 100 < expected * 90) || (slots_skipped >= 3 && avg_work_us > budget_us)
+        };
+
+        if overloaded && self.idx + 1 < self.ladder.len() {
+            self.under_secs = 0;
+            self.over_secs += 1;
+            if self.over_secs >= GRID_STEP_DOWN_SECS {
+                self.over_secs = 0;
+                let quick_relapse = self
+                    .last_step_up
+                    .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(25));
+                if quick_relapse {
+                    self.cooldown_secs = (self.cooldown_secs * 2).min(GRID_MAX_COOLDOWN_SECS);
+                } else {
+                    self.cooldown_secs = GRID_INITIAL_COOLDOWN_SECS;
+                }
+                self.last_step_down = Some(now);
+                let from = cur_fps;
+                self.idx += 1;
+                let to = self.current_fps();
+                let denom = if self.is_auto { active } else { expected };
+                let reason = format!(
+                    "{slots_done}/{denom} slots kept, skipped {slots_skipped}, work avg {:.1} ms > budget {:.1} ms for {}s",
+                    avg_work_us as f64 / 1e3,
+                    budget_us as f64 / 1e3,
+                    GRID_STEP_DOWN_SECS,
+                );
+                return GridAction::Step { from, to, reason };
+            }
+            return GridAction::None;
+        }
+
+        self.over_secs = 0;
+
+        if self.idx > 0 {
+            let up_fps = self.ladder[self.idx - 1];
+            let up_budget_us = 1_000_000u64 / up_fps as u64;
+            let active_enough = if self.is_auto {
+                slots_done >= (cur_fps as u64 / 2).max(15)
+            } else {
+                slots_done * 100 >= expected * 95
+            };
+            if active_enough && slots_skipped == 0 && avg_work_us * 100 <= up_budget_us * 82 {
+                self.under_secs += 1;
+            } else {
+                self.under_secs = 0;
+            }
+            if self.under_secs >= GRID_STEP_UP_SECS
+                && self
+                    .last_step_down
+                    .is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_secs(self.cooldown_secs))
+            {
+                self.under_secs = 0;
+                self.last_step_up = Some(now);
+                let from = cur_fps;
+                self.idx -= 1;
+                let to = self.current_fps();
+                let reason = format!(
+                    "headroom recovered after {}s cooldown (work avg {:.1} ms <= 82% of {} fps budget {:.1} ms for {}s)",
+                    self.cooldown_secs,
+                    avg_work_us as f64 / 1e3,
+                    up_fps,
+                    up_budget_us as f64 / 1e3,
+                    GRID_STEP_UP_SECS,
+                );
+                return GridAction::Step { from, to, reason };
+            }
+        }
+
+        GridAction::None
+    }
 }
 
 struct PrepState {
@@ -1381,7 +2051,6 @@ struct PrepState {
     /// True when `frame` changed since the converter last saw it.
     converted_is_new: bool,
     previewer: Previewer,
-    dims: (u32, u32),
     /// Encoded-frame / source ratio per axis, for mouse-effect placement.
     fx_scale: (f32, f32),
     patches: Vec<Patch>,
@@ -1398,15 +2067,56 @@ struct EncodeCore {
     last_video_pts: Option<Duration>,
 }
 
+struct CpuPipelineSpec {
+    src: (u32, u32),
+    scaled: (u32, u32),
+    dims: (u32, u32),
+    half: bool,
+    layout: InputLayout,
+}
+
+type Nv12Planes = (Vec<u8>, Vec<u8>, usize, usize);
+
+struct InitEncodePipeline {
+    cpu_spec: CpuPipelineSpec,
+    core: EncodeCore,
+    cpu: Option<(PrepState, Converter, Converter)>,
+    fallback_nv12: Option<Nv12Planes>,
+    resolved_fps: u32,
+}
+
+fn build_cpu_prep(config: &RecordConfig, spec: &CpuPipelineSpec) -> Result<(PrepState, Converter, Converter)> {
+    let conv1 = Converter::new(spec.scaled.0, spec.scaled.1, spec.layout)?;
+    let conv2 = Converter::new(spec.scaled.0, spec.scaled.1, spec.layout)?;
+    let scaler = (!spec.half && spec.scaled != spec.src).then(|| Scaler::new(spec.src, spec.scaled));
+    let fx_scale = (spec.dims.0 as f32 / spec.src.0.max(1) as f32, spec.dims.1 as f32 / spec.src.1.max(1) as f32);
+    let prep = PrepState {
+        half: spec.half,
+        scaler,
+        src: spec.src,
+        scaled: spec.scaled,
+        letterbox: None,
+        frame: None,
+        converted_is_new: false,
+        previewer: Previewer::new(spec.scaled.0, spec.scaled.1, PREVIEW_MAX_SIDE),
+        fx_scale,
+        patches: Vec::new(),
+        watermark: config.watermark.any_overlay().then(WatermarkRenderer::new).flatten(),
+        last_fx: None,
+    };
+    Ok((prep, conv1, conv2))
+}
+
 fn init_encode_pipeline(
     config: &RecordConfig,
     nominal_fps: u32,
-    first: &RawFrame,
+    first: &CapturedFrame,
     audio: Vec<AudioTrackConfig>,
     stats: &Stats,
-) -> Result<(PrepState, EncodeCore, Converter, Converter, u32)> {
+    gpu_active: &AtomicBool,
+) -> Result<InitEncodePipeline> {
     let fmt = &config.format;
-    let src = (first.width, first.height);
+    let src = first.src_size();
     let (half, scaled) = match fmt.size {
         SizeMode::Full => (false, src),
         SizeMode::Half if src.0 >= 64 && src.1 >= 64 => (true, ((src.0 / 2).max(1), (src.1 / 2).max(1))),
@@ -1428,12 +2138,27 @@ fn init_encode_pipeline(
         profiles: fmt.profiles,
     };
     let mut resolved_fps = nominal_fps;
-    let (encoder, note) = match create_video_encoder(&make_req(resolved_fps)) {
+    #[cfg(windows)]
+    let d3d_device = match first {
+        CapturedFrame::Gpu(g) => Some(&g.device),
+        CapturedFrame::Cpu(_) => None,
+    };
+    let create = |req: &EncoderRequest| {
+        #[cfg(windows)]
+        {
+            create_video_encoder_with_d3d(req, d3d_device)
+        }
+        #[cfg(not(windows))]
+        {
+            create_video_encoder(req)
+        }
+    };
+    let (encoder, note) = match create(&make_req(resolved_fps)) {
         Ok(res) => res,
         Err(e) if config.is_auto_fps() && resolved_fps != 60 => {
             log::warn!("encoder init failed at {resolved_fps} fps ({e:#}); falling back to 60 fps");
             resolved_fps = 60;
-            create_video_encoder(&make_req(resolved_fps))?
+            create(&make_req(resolved_fps))?
         }
         Err(e) => return Err(e),
     };
@@ -1442,9 +2167,7 @@ fn init_encode_pipeline(
     }
     *stats.encoder.lock().unwrap() = Some(encoder.describe());
     let layout = encoder.input_layout();
-    let conv1 = Converter::new(scaled.0, scaled.1, layout)?;
-    let conv2 = Converter::new(scaled.0, scaled.1, layout)?;
-    let scaler = (!half && scaled != src).then(|| Scaler::new(src, scaled));
+    let spec = CpuPipelineSpec { src, scaled, dims, half, layout };
     let video = VideoTrackConfig {
         width: dims.0,
         height: dims.1,
@@ -1452,7 +2175,6 @@ fn init_encode_pipeline(
         codec: if encoder.is_hevc() { VideoCodecConfig::Hevc } else { VideoCodecConfig::H264 },
     };
     let mux = Muxer::create_multi(fmt.container, &config.output, video, audio)?;
-    let fx_scale = (dims.0 as f32 / src.0.max(1) as f32, dims.1 as f32 / src.1.max(1) as f32);
     log::info!(
         "encoding {}×{} → {}×{} @ {} fps into {} with {}",
         src.0,
@@ -1463,23 +2185,31 @@ fn init_encode_pipeline(
         fmt.container.label(),
         encoder.describe()
     );
-    let prep = PrepState {
-        half,
-        scaler,
-        src,
-        scaled,
-        letterbox: None,
-        frame: None,
-        converted_is_new: false,
-        previewer: Previewer::new(scaled.0, scaled.1, PREVIEW_MAX_SIDE),
-        dims,
-        fx_scale,
-        patches: Vec::new(),
-        watermark: config.watermark.any_overlay().then(WatermarkRenderer::new).flatten(),
-        last_fx: None,
+    let (cpu, fallback_nv12) = match first {
+        #[cfg(windows)]
+        CapturedFrame::Gpu(g) if encoder.supports_d3d11() => {
+            let _ = g;
+            log::info!("video capture pipeline: GPU zero-readback (ID3D11VideoProcessor BGRA→NV12 + DXGI MFT)");
+            (None, None)
+        }
+        #[cfg(windows)]
+        CapturedFrame::Gpu(g) => {
+            gpu_active.store(false, Ordering::SeqCst);
+            log::info!(
+                "video capture pipeline: CPU readback (fallback: encoder {} does not accept D3D11 textures)",
+                encoder.describe()
+            );
+            let nv12 = crate::video::d3d11_vp::readback_nv12_texture(&g.device, &g.slot.texture, dims.0, dims.1)?;
+            (Some(build_cpu_prep(config, &spec)?), Some(nv12))
+        }
+        CapturedFrame::Cpu(_) => {
+            gpu_active.store(false, Ordering::SeqCst);
+            log::info!("video capture pipeline: CPU readback + Converter");
+            (Some(build_cpu_prep(config, &spec)?), None)
+        }
     };
     let core = EncodeCore { encoder, mux, params_sent: false, last_video_pts: None };
-    Ok((prep, core, conv1, conv2, resolved_fps))
+    Ok(InitEncodePipeline { cpu_spec: spec, core, cpu, fallback_nv12, resolved_fps })
 }
 
 impl PrepState {
@@ -1877,14 +2607,16 @@ mod tests {
         let pool = FramePool::new(4);
         let stats = Arc::new(Stats::default());
         let (tx, rx) = frame_mailbox(pool, stats.clone());
-        let mk = |pts_ms: u64| RawFrame {
-            data: vec![pts_ms as u8; 16],
-            width: 2,
-            height: 2,
-            stride: 8,
-            format: PixelFormat::Bgra,
-            pts: ms(pts_ms),
-            mouse: None,
+        let mk = |pts_ms: u64| {
+            CapturedFrame::Cpu(RawFrame {
+                data: vec![pts_ms as u8; 16],
+                width: 2,
+                height: 2,
+                stride: 8,
+                format: PixelFormat::Bgra,
+                pts: ms(pts_ms),
+                mouse: None,
+            })
         };
         assert!(tx.send(mk(10)));
         assert!(tx.send(mk(20)));
@@ -1897,9 +2629,10 @@ mod tests {
         assert_eq!(stats.frames_superseded.load(Ordering::Relaxed), 1);
         assert_eq!(stats.frames_dropped.load(Ordering::Relaxed), 0);
         let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        let pts: Vec<_> = got.iter().map(|f| f.pts).collect();
+        let pts: Vec<_> = got.iter().map(CapturedFrame::pts).collect();
         assert_eq!(pts, vec![ms(20), ms(30), ms(40), ms(50)]);
-        assert_eq!(got.last().unwrap().data[0], 50);
+        let CapturedFrame::Cpu(last) = got.last().unwrap() else { unreachable!() };
+        assert_eq!(last.data[0], 50);
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
         drop(rx);
         assert!(!tx.send(mk(60)));
@@ -1949,5 +2682,121 @@ mod tests {
             resolve_audio_tracks(true, true, AudioTrackMode::MixedAndSeparate),
             vec![TrackRole::Mixed, TrackRole::System, TrackRole::Mic]
         );
+    }
+
+    #[test]
+    fn frame_clock_set_fps_keeps_monotonic_smooth_cadence() {
+        let mut c = FrameClock::new(120, ms(0));
+        let mut pts = Vec::new();
+        // Emit 120 slots at 120 fps.
+        for _ in 0..120 {
+            let p = c.slot_pts(c.next);
+            c.mark_emitted(p);
+            pts.push(p);
+            c.next += 1;
+        }
+        assert_eq!(pts.last().unwrap().as_micros(), 991_666);
+
+        // Step down 120 -> 90 -> 72 -> 60 -> 90, emitting a few frames at each rung.
+        for target_fps in [90u32, 72, 60, 90] {
+            assert!(c.set_fps(target_fps));
+            assert!(!c.set_fps(target_fps), "no-op if unchanged");
+            let expected_step_us = 1_000_000i64 / target_fps as i64;
+            for _ in 0..5 {
+                let p = c.slot_pts(c.next);
+                let prev = *pts.last().unwrap();
+                assert!(p > prev, "pts must strictly increase: {p:?} vs {prev:?}");
+                let delta_us = (p - prev).as_micros() as i64;
+                assert!(
+                    (delta_us - expected_step_us).abs() <= 1,
+                    "transition/step delta {delta_us} us vs expected {expected_step_us} us at {target_fps} fps",
+                );
+                c.mark_emitted(p);
+                pts.push(p);
+                c.next += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_frame_grid_steps_down_recovers_and_ignores_auto_idle() {
+        assert_eq!(grid_ladder(60), vec![60]);
+        assert_eq!(grid_ladder(30), vec![30]);
+        assert_eq!(grid_ladder(120), vec![120, 90, 72, 60]);
+        assert_eq!(grid_ladder(144), vec![144, 120, 90, 72, 60]);
+
+        let sec = Duration::from_secs(1);
+        let mut t = Instant::now();
+
+        // Fixed 60 fps never adapts.
+        let mut g60 = AdaptiveFrameGrid::new(60, false);
+        for _ in 0..10 {
+            t += sec;
+            assert_eq!(g60.observe(sec, 30, 30, 20_000, t), GridAction::None);
+        }
+
+        // Fixed 120 fps under game load (~75 fps capability, avg work ~12 ms):
+        // steps 120 -> 90 after 3 overloaded seconds, then 90 -> 72 after 3 more.
+        let mut g120 = AdaptiveFrameGrid::new(120, false);
+        for i in 0..3 {
+            t += sec;
+            let act = g120.observe(sec, 78, 42, 12_500, t);
+            if i < 2 {
+                assert_eq!(act, GridAction::None);
+            } else {
+                assert!(matches!(act, GridAction::Step { from: 120, to: 90, .. }));
+            }
+        }
+        assert_eq!(g120.current_fps(), 90);
+
+        // At 90 fps, if encoder still averages 13 ms (>11.1 ms) and keeps 75/90 slots -> steps to 72.
+        for i in 0..3 {
+            t += sec;
+            let act = g120.observe(sec, 75, 15, 13_000, t);
+            if i < 2 {
+                assert_eq!(act, GridAction::None);
+            } else {
+                assert!(matches!(act, GridAction::Step { from: 90, to: 72, .. }));
+            }
+        }
+        assert_eq!(g120.current_fps(), 72);
+
+        // At 72 fps with encoder at 10.2 ms (>82% of 90 fps budget = 9.11 ms): stays at 72 even after cooldown.
+        for _ in 0..12 {
+            t += sec;
+            assert_eq!(g120.observe(sec, 72, 0, 10_200, t), GridAction::None);
+        }
+        assert_eq!(g120.current_fps(), 72);
+
+        // Game closes: avg work drops to 4 ms (<= 82% of 90 fps budget) -> steps back up after 5s.
+        let mut stepped_up = false;
+        for _ in 0..5 {
+            t += sec;
+            if let GridAction::Step { from: 72, to: 90, .. } = g120.observe(sec, 72, 0, 4_000, t) {
+                stepped_up = true;
+            }
+        }
+        assert!(stepped_up);
+        assert_eq!(g120.current_fps(), 90);
+
+        // Auto FPS on static desktop (2 frames/sec, 0 skipped, avg work 4 ms): never steps down.
+        let mut g_auto = AdaptiveFrameGrid::new(120, true);
+        for _ in 0..20 {
+            t += sec;
+            assert_eq!(g_auto.observe(sec, 2, 0, 4_000, t), GridAction::None);
+            assert_eq!(g_auto.observe(sec, 30, 0, 4_000, t), GridAction::None);
+        }
+        assert_eq!(g_auto.current_fps(), 120);
+
+        // Auto FPS under heavy game load (75 done + 45 skipped): steps down 120 -> 90.
+        for i in 0..3 {
+            t += sec;
+            let act = g_auto.observe(sec, 75, 45, 13_000, t);
+            if i < 2 {
+                assert_eq!(act, GridAction::None);
+            } else {
+                assert!(matches!(act, GridAction::Step { from: 120, to: 90, .. }));
+            }
+        }
     }
 }

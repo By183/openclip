@@ -96,6 +96,7 @@ fn main() -> anyhow::Result<()> {
     let config = RecordConfig {
         source,
         format,
+        color_conversion: Default::default(),
         mouse_fx: fx,
         watermark,
         system_audio: audio,

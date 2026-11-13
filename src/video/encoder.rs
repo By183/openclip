@@ -67,6 +67,21 @@ impl FrameInput<'_> {
     }
 }
 
+/// Sub-stage timings (in microseconds) of the last `encode` / `encode_d3d11` call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncodeStageTiming {
+    /// Wrapping input surface/buffer + `ProcessInput` ("вход в MFT").
+    pub mft_in_us: u64,
+    /// Waiting for encoder availability / output (`METransformNeedInput` + `ProcessOutput`).
+    pub mft_wait_us: u64,
+    /// Time spent waiting for `METransformNeedInput` before `ProcessInput`.
+    pub mft_need_in_us: u64,
+    /// Time inside `IMFTransform::ProcessInput` alone.
+    pub mft_process_in_us: u64,
+    /// Time pulling/converting encoder output (`METransformHaveOutput` + `ProcessOutput`).
+    pub mft_out_us: u64,
+}
+
 /// Encoders are created and used on one thread (the encode thread): Media
 /// Foundation objects are not `Send`.
 pub trait VideoEncoder {
@@ -82,6 +97,23 @@ pub trait VideoEncoder {
     /// Parameter sets, available once the first keyframe has been produced.
     fn codec_params(&self) -> Option<&CodecParams>;
     fn force_keyframe(&mut self);
+    /// Sub-stage timing breakdown from the most recent `encode` / `encode_d3d11` call.
+    fn last_timing(&self) -> Option<EncodeStageTiming> {
+        None
+    }
+    /// Whether this encoder accepts GPU `ID3D11Texture2D` (`DXGI_FORMAT_NV12`)
+    /// textures directly via `encode_d3d11` without CPU readback.
+    fn supports_d3d11(&self) -> bool {
+        false
+    }
+    #[cfg(windows)]
+    fn encode_d3d11(
+        &mut self,
+        _tex: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        _pts: Duration,
+    ) -> Result<Vec<EncodedFrame>> {
+        anyhow::bail!("D3D11 texture input is not supported by this encoder")
+    }
     /// Human-readable description for logs and the status strip.
     fn describe(&self) -> String;
 }
@@ -186,18 +218,18 @@ pub fn refresh_encoders() -> Vec<EncoderInfo> {
     }
 }
 
-/// Creates the requested encoder. When a Media Foundation encoder is missing
-/// or refuses the configuration, other encoders of the same family are tried
-/// (hardware first), then OpenH264. The note explains any substitution.
-pub fn create_video_encoder(req: &EncoderRequest) -> Result<(Box<dyn VideoEncoder>, Option<String>)> {
+/// Creates the requested encoder, optionally sharing `d3d_device` so hardware
+/// Media Foundation encoders can accept GPU `NV12` textures without CPU readback.
+#[cfg(windows)]
+pub fn create_video_encoder_with_d3d(
+    req: &EncoderRequest,
+    d3d_device: Option<&windows::Win32::Graphics::Direct3D11::ID3D11Device>,
+) -> Result<(Box<dyn VideoEncoder>, Option<String>)> {
     if req.codec == VideoCodec::Auto {
         let resolved = VideoCodec::resolve_auto(&available_encoders());
         log::info!("Auto codec → {}", resolved.generic_label());
         let software = resolved == VideoCodec::OpenH264;
-        let (enc, note) = create_video_encoder(&EncoderRequest { codec: resolved, ..req.clone() })?;
-        // Auto settling on OpenH264 means no hardware encoder was enumerated or
-        // survived probing. That is the difference between 30 and 20 fps at
-        // 1080p, so say it instead of silently recording on the CPU.
+        let (enc, note) = create_video_encoder_with_d3d(&EncoderRequest { codec: resolved, ..req.clone() }, d3d_device)?;
         let note = note.or_else(|| software.then(|| crate::t!(NOTE_NO_HARDWARE_ENCODER).to_string()));
         return Ok((enc, note));
     }
@@ -206,38 +238,58 @@ pub fn create_video_encoder(req: &EncoderRequest) -> Result<(Box<dyn VideoEncode
     };
     let wanted = req.codec.family();
     let mut failures: Vec<String> = Vec::new();
-    #[cfg(windows)]
-    {
-        let list = super::mf::available_encoders();
-        let requested = list.iter().find(|e| &e.clsid == clsid);
-        let mut candidates: Vec<&EncoderInfo> = requested.into_iter().collect();
-        let mut others: Vec<&EncoderInfo> = list.iter().filter(|e| e.hevc == *hevc && &e.clsid != clsid).collect();
-        others.sort_by_key(|e| !e.hardware);
-        candidates.extend(others);
-        if requested.is_none() {
-            failures.push(crate::t!(NOTE_ENCODER_NOT_FOUND, wanted));
-        }
-        for info in candidates {
-            match super::mf::video::MfVideoEncoder::new(info, req) {
-                Ok(enc) => {
-                    let note = (Some(&info.clsid) != Some(clsid)).then(|| {
-                        crate::t!(NOTE_USING_ENCODER, failures.join("; "), info.label)
-                    });
-                    return Ok((Box::new(enc), note));
-                }
-                Err(e) => {
-                    log::warn!("{} failed: {e:#}", info.label);
-                    failures.push(crate::t!(NOTE_ENCODER_FAILED, info.label, e));
-                }
+    let list = super::mf::available_encoders();
+    let requested = list.iter().find(|e| &e.clsid == clsid);
+    let mut candidates: Vec<&EncoderInfo> = requested.into_iter().collect();
+    let mut others: Vec<&EncoderInfo> = list.iter().filter(|e| e.hevc == *hevc && &e.clsid != clsid).collect();
+    others.sort_by_key(|e| !e.hardware);
+    candidates.extend(others);
+    if requested.is_none() {
+        failures.push(crate::t!(NOTE_ENCODER_NOT_FOUND, wanted));
+    }
+    for info in candidates {
+        match super::mf::video::MfVideoEncoder::new_with_d3d(info, req, d3d_device) {
+            Ok(enc) => {
+                let note = (Some(&info.clsid) != Some(clsid))
+                    .then(|| crate::t!(NOTE_USING_ENCODER, failures.join("; "), info.label));
+                return Ok((Box::new(enc), note));
+            }
+            Err(e) => {
+                log::warn!("{} failed: {e:#}", info.label);
+                failures.push(crate::t!(NOTE_ENCODER_FAILED, info.label, e));
             }
         }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (hevc, clsid);
-        failures.push(crate::t!(NOTE_HW_NEEDS_WINDOWS, wanted));
     }
     let enc = super::openh264::H264Encoder::new(req)?;
     let note = crate::t!(NOTE_FELL_BACK_OPENH264, failures.join("; "));
     Ok((Box::new(enc), Some(note)))
+}
+
+/// Creates the requested encoder. When a Media Foundation encoder is missing
+/// or refuses the configuration, other encoders of the same family are tried
+/// (hardware first), then OpenH264. The note explains any substitution.
+pub fn create_video_encoder(req: &EncoderRequest) -> Result<(Box<dyn VideoEncoder>, Option<String>)> {
+    #[cfg(windows)]
+    {
+        create_video_encoder_with_d3d(req, None)
+    }
+    #[cfg(not(windows))]
+    {
+        if req.codec == VideoCodec::Auto {
+            let resolved = VideoCodec::resolve_auto(&available_encoders());
+            log::info!("Auto codec → {}", resolved.generic_label());
+            let software = resolved == VideoCodec::OpenH264;
+            let (enc, note) = create_video_encoder(&EncoderRequest { codec: resolved, ..req.clone() })?;
+            let note = note.or_else(|| software.then(|| crate::t!(NOTE_NO_HARDWARE_ENCODER).to_string()));
+            return Ok((enc, note));
+        }
+        let VideoCodec::Mf { hevc: _, clsid: _ } = &req.codec else {
+            return Ok((Box::new(super::openh264::H264Encoder::new(req)?), None));
+        };
+        let wanted = req.codec.family();
+        let failures = vec![crate::t!(NOTE_HW_NEEDS_WINDOWS, wanted)];
+        let enc = super::openh264::H264Encoder::new(req)?;
+        let note = crate::t!(NOTE_FELL_BACK_OPENH264, failures.join("; "));
+        Ok((Box::new(enc), Some(note)))
+    }
 }

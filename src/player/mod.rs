@@ -14,7 +14,7 @@
 //! `image` crate on every platform.
 
 #[cfg(windows)]
-mod decode;
+pub mod decode;
 pub mod output;
 #[cfg(windows)]
 mod worker;
@@ -54,7 +54,9 @@ const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_nanos(33_366_667);
 const FRAME_QUEUE: usize = 2;
 
 /// Most frames the worker may hold back when that queue is full.
-pub(crate) const MAX_HELD: usize = 8;
+/// Needs ~200 ms of headroom at 120 fps (~24 frames) so audio high-water reads
+/// and video buffering do not oscillate and starve each other.
+pub(crate) const MAX_HELD: usize = 24;
 
 /// Buffers kept for reuse. Everything that can be alive at once: the queue, the
 /// frame on screen, the one held back until it is due, and the worker's

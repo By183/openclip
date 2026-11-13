@@ -31,7 +31,7 @@ use crate::capture::monitors::{
 use crate::capture::{self as cap, CaptureConfig, CaptureHandle, Rect, Source};
 use crate::i18n::{self, Lang};
 use crate::pipeline::{RecordConfig, Recorder, Stats};
-use crate::settings::{AudioTrackMode, BitratePreset, FormatSettings, Settings};
+use crate::settings::{AudioTrackMode, BitratePreset, ColorConversion, FormatSettings, Settings};
 use crate::t;
 use crate::video::encoder::{available_encoders, refresh_encoders, EncoderInfo};
 use crate::video::mouse_fx::{MouseFx, MouseSampler, ARROW, CLICK_DURATION};
@@ -294,6 +294,10 @@ pub struct App {
     file_prefix: String,
     countdown_enabled: bool,
     countdown_secs: u32,
+    color_conversion: ColorConversion,
+    hotkey: crate::hotkey::HotkeyConfig,
+    hotkey_manager: crate::hotkey::HotkeyManager,
+    capturing_hotkey: bool,
     language: Lang,
     /// Preserved from settings.json for compatibility; update checks are disabled.
     check_updates: bool,
@@ -421,6 +425,10 @@ impl App {
             file_prefix: settings.file_prefix,
             countdown_enabled: settings.countdown_enabled,
             countdown_secs: settings.countdown_secs.clamp(1, 10),
+            color_conversion: settings.color_conversion,
+            hotkey: settings.hotkey,
+            hotkey_manager: crate::hotkey::HotkeyManager::new(settings.hotkey),
+            capturing_hotkey: false,
             language: settings.language,
             check_updates: settings.check_updates,
             repair: match crate::update::sidecar_missing() {
@@ -519,6 +527,8 @@ impl App {
             game_ignored: self.game_ignored.clone(),
             countdown_enabled: self.countdown_enabled,
             countdown_secs: self.countdown_secs,
+            color_conversion: self.color_conversion,
+            hotkey: self.hotkey,
             language: self.language,
             check_updates: self.check_updates,
         };
@@ -693,6 +703,34 @@ impl App {
         self.start_recording_now(ctx);
     }
 
+    /// Global hotkey trigger: toggles recording or cancels countdown.
+    fn handle_global_hotkey(&mut self, ctx: &egui::Context) {
+        match &self.state {
+            State::Idle => {
+                if self.hotkey.sound {
+                    crate::hotkey::play_feedback_sound(true);
+                }
+                self.start_recording(ctx);
+            }
+            State::Countdown { .. } => {
+                self.cancel_countdown();
+                if self.hotkey.sound {
+                    crate::hotkey::play_feedback_sound(false);
+                }
+                self.message = Some((t!(MSG_CANCELLED).into(), false));
+                ctx.request_repaint();
+            }
+            State::Recording(_) => {
+                if self.hotkey.sound {
+                    crate::hotkey::play_feedback_sound(false);
+                }
+                self.stop_recording();
+                ctx.request_repaint();
+            }
+            State::Picking(_) => {}
+        }
+    }
+
     fn cancel_countdown(&mut self) {
         if matches!(self.state, State::Countdown { .. }) {
             self.state = State::Idle;
@@ -746,6 +784,7 @@ impl App {
         let config = RecordConfig {
             source,
             format,
+            color_conversion: self.color_conversion,
             // The pointer is somewhere on the desktop, not in the game's back
             // buffer, so cursor and click effects would land in an unrelated
             // corner of the picture. The watermark is frame-relative and fine.
@@ -1625,7 +1664,8 @@ impl App {
             }
             GeneralTab::Recording => {
                 section_header(ui, t!(SECTION_RECORDING));
-                let before = (self.countdown_enabled, self.countdown_secs);
+                let recording = self.is_recording();
+                let before = (self.countdown_enabled, self.countdown_secs, self.color_conversion);
                 Card::show(ui, |card| {
                     switch_row(card, t!(COUNTDOWN_CHECKBOX), &mut self.countdown_enabled);
                     card.row(t!(ROW_COUNTDOWN), |ui| {
@@ -1639,7 +1679,86 @@ impl App {
                     });
                 });
                 footnote(ui, t!(COUNTDOWN_NOTE));
-                if before != (self.countdown_enabled, self.countdown_secs) {
+                ui.add_space(12.0);
+                Card::show(ui, |card| {
+                    card.row(t!(ROW_COLOR_CONVERSION), |ui| {
+                        ui.add_enabled_ui(!recording, |ui| {
+                            segmented(
+                                ui,
+                                "color_conversion",
+                                &[
+                                    (ColorConversion::Auto, None, ColorConversion::Auto.label()),
+                                    (ColorConversion::Gpu, None, ColorConversion::Gpu.label()),
+                                    (ColorConversion::Cpu, None, ColorConversion::Cpu.label()),
+                                ],
+                                &mut self.color_conversion,
+                            );
+                        });
+                    });
+                });
+                footnote(ui, t!(COLOR_CONVERSION_NOTE));
+                if before != (self.countdown_enabled, self.countdown_secs, self.color_conversion) {
+                    self.save_settings();
+                }
+
+                ui.add_space(16.0);
+                section_header(ui, t!(SECTION_HOTKEY));
+                let before_hotkey = self.hotkey;
+                Card::show(ui, |card| {
+                    switch_row(card, t!(HOTKEY_SOUND), &mut self.hotkey.sound);
+                    card.row(t!(ROW_HOTKEY), |ui| {
+                        let btn_text = if self.capturing_hotkey {
+                            t!(HOTKEY_RECORDING).to_string()
+                        } else if self.hotkey.is_empty() {
+                            "—".into()
+                        } else {
+                            self.hotkey.display_string()
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(btn_text)
+                                .color(if self.capturing_hotkey { ORANGE } else { LABEL }),
+                        );
+                        if ui.add(btn).clicked() {
+                            self.capturing_hotkey = !self.capturing_hotkey;
+                        }
+
+                        if tinted_button_small(ui, t!(HOTKEY_RESET)).clicked() {
+                            self.hotkey = crate::hotkey::HotkeyConfig::default();
+                            self.capturing_hotkey = false;
+                        }
+
+                        if self.capturing_hotkey {
+                            ui.ctx().input(|i| {
+                                for event in &i.raw.events {
+                                    if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
+                                        if *key == egui::Key::Escape {
+                                            self.capturing_hotkey = false;
+                                        } else if let Some(new_cfg) = crate::hotkey::egui_map::from_egui(*modifiers, *key, self.hotkey.sound) {
+                                            self.hotkey = new_cfg;
+                                            self.capturing_hotkey = false;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+
+                match self.hotkey_manager.status() {
+                    crate::hotkey::HotkeyStatus::Conflict(vk) => {
+                        let name = crate::hotkey::vk_to_name(vk);
+                        footnote(ui, &t!(HOTKEY_STATUS_CONFLICT, name));
+                    }
+                    crate::hotkey::HotkeyStatus::HookFallback => {
+                        footnote(ui, t!(HOTKEY_STATUS_FALLBACK));
+                    }
+                    _ => {
+                        footnote(ui, t!(HOTKEY_SOUND_NOTE));
+                    }
+                }
+
+                if before_hotkey != self.hotkey {
+                    self.hotkey_manager.update(self.hotkey);
                     self.save_settings();
                 }
             }
@@ -2256,6 +2375,9 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.hotkey_manager.poll_triggered() {
+            self.handle_global_hotkey(&ctx);
+        }
         self.poll_encoders();
         if self.thumbs.poll(&ctx) {
             ctx.request_repaint();
