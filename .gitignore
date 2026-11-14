@@ -4,3 +4,5 @@
 *.wav
 *.mp3
 *.avi
+*.err
+*.out

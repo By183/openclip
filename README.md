@@ -56,7 +56,7 @@ git tag v0.2.0 && git push origin main v0.2.0
 
 Running the workflow manually (Actions → Release → Run workflow) only builds and uploads the archives as artifacts, which is handy for checking a build before tagging.
 
-The in-app updater relies on this layout: it looks for the asset named `openclip-<version>-<target>.<zip|tar.gz>` on the latest release and takes `openclip[.exe]` — and, on Windows, `openclip_hook64.dll` — out of the folder inside. The DLL is replaced first and a failure there abandons the update, because the two share a compiled-in ABI version and must never end up from different builds. An archive from before the hook existed simply has no DLL and still updates cleanly. `cargo run --example check_update` prints what the updater sees; with `OPENCLIP_UPDATE_PRETEND_VERSION=0.1.0` and `-- --install` it runs the whole download → verify → replace path on the example's own executable.
+The in-app updater relies on this layout: it looks for the asset named `openclip-<version>-<target>.<zip|tar.gz>` on the latest release and takes `openclip[.exe]` — and, on Windows, `openclip_hook64.dll` — out of the folder inside. The DLL is replaced first and a failure there abandons the update, because the two share a compiled-in ABI version and must never end up from different builds. An archive from before the hook existed simply has no DLL and still updates cleanly.
 
 ## Usage
 

@@ -23,7 +23,6 @@ cargo run --release --example capture_to_mp4 -- 10 out.mp4   # record primary mo
 #          --codec openh264|h264-hw|h264-sw|hevc|<label substring> --audio mp3|aac|pcm --avi --fps N --quality Q
 cargo run --release --example bench_encode -- 1920 1080 5 out.mp4 --codec nvenc   # encoder throughput on synthetic content
 cargo run --example list_encoders                            # every Media Foundation encoder + whether it activates
-cargo run --example check_update                             # what the updater sees; `-- --install` runs the full self-update on the example exe
 
 # Game capture, without needing a game installed
 cargo run --example gfx_sandbox -- --vsync --verify           # a D3D11 app that reports whether the overlay is in its back buffer
