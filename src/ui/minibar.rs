@@ -300,6 +300,9 @@ impl App {
                     State::Picking(_) => {
                         status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::REGION, t!(SELECT_REGION)), None, None, None);
                     }
+                    State::Snipping(_) => {
+                        status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::CAMERA, t!(ROW_REGION_SCREENSHOT)), None, None, None);
+                    }
                     State::Countdown { started } => {
                         let left = (self.countdown_secs as f32 - started.elapsed().as_secs_f32()).ceil().max(1.0);
                         status_capsule(ui, Tint::Orange, &t!(BAR_STARTING_IN, left), None, None, Some(t!(BAR_ESC_CANCELS)));

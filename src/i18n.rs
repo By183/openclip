@@ -419,6 +419,41 @@ strings! {
     ROW_CAPTURE => "Capture", "Captură", "Съёмка", "Зйомка";
     TAKE_SNAPSHOT_NOW => "Take snapshot now", "Fă o captură acum", "Сделать снимок сейчас", "Зробити знімок зараз";
     ROW_SOURCE => "Source", "Sursă", "Источник", "Джерело";
+    ROW_REGION_SCREENSHOT => "Interactive region capture", "Captură interactivă de regiune",
+        "Выделение области при снимке экрана", "Виділення області при знімку екрана";
+    ROW_REGION_SCREENSHOT_HINT => "Freeze the screen and select an area with the mouse",
+        "Îngheață ecranul și selectează o zonă cu mouse-ul",
+        "Зафиксировать экран и выделить нужную область мышью",
+        "Зафіксувати екран і виділити потрібну область мишею";
+    ROW_ANNOTATE_SCREENSHOT => "Open editor after selection", "Deschide editorul după selectare",
+        "Открывать редактор после выделения", "Відкривати редактор після виділення";
+    ROW_ANNOTATE_SCREENSHOT_HINT => "Show drawing and annotation tools immediately after selecting region",
+        "Afișează instrumentele de desenat și adnotare imediat după selectarea regiunii",
+        "Показывать инструменты рисования и аннотаций сразу после выделения",
+        "Показувати інструменти малювання та анотацій одразу після виділення";
+    ROW_SCREENSHOT_HOTKEY => "Screenshot hotkey", "Tastă rapidă pentru captură",
+        "Горячая клавиша снимка экрана", "Гаряча клавіша знімка екрана";
+
+    // ----- Snipping & Annotation tool --------------------------------------
+    SNIP_HINT => "Drag to select area · Esc to cancel", "Trage pentru a selecta zona · Esc pentru anulare",
+        "Зажмите ЛКМ и выделите область · Esc — отмена", "Затисніть ЛКМ та виділіть область · Esc — скасування";
+    SNIP_TOOL_MOVE => "Move / Select", "Mutare / Selectare", "Перемещение / Выбор", "Переміщення / Вибір";
+    SNIP_TOOL_RECT => "Rectangle", "Dreptunghi", "Прямоугольник", "Прямокутник";
+    SNIP_TOOL_ARROW => "Arrow", "Săgeată", "Стрелка", "Стрілка";
+    SNIP_TOOL_LINE => "Line", "Linie", "Линия", "Лінія";
+    SNIP_TOOL_PEN => "Pen", "Stilou", "Карандаш", "Олівець";
+    SNIP_TOOL_MARKER => "Highlighter", "Evidențiator", "Маркер", "Маркер";
+    SNIP_TOOL_TEXT => "Text", "Text", "Текст", "Текст";
+    SNIP_TOOL_PIXELATE => "Blur / Pixelate", "Estompare / Pixelare", "Размытие / Пикселизация", "Розмиття / Пікселізація";
+    SNIP_TOOL_UNDO => "Undo (Ctrl+Z)", "Anulează (Ctrl+Z)", "Отменить (Ctrl+Z)", "Скасувати (Ctrl+Z)";
+    SNIP_TOOL_DELETE => "Delete selected (Del)", "Șterge selecția (Del)", "Удалить выбранное (Del)", "Видалити вибране (Del)";
+    SNIP_TOOL_SAVE => "Save & Copy (Enter)", "Salvează și copiază (Enter)", "Сохранить и скопировать (Enter)", "Зберегти та скопіювати (Enter)";
+    SNIP_TOOL_COPY => "Copy (Ctrl+C)", "Copiază (Ctrl+C)", "Скопировать (Ctrl+C)", "Скопіювати (Ctrl+C)";
+    SNIP_TOOL_CANCEL => "Cancel (Esc)", "Anulează (Esc)", "Отмена (Esc)", "Скасувати (Esc)";
+    SNIP_TOOL_TEXT_SMALLER => "Decrease font size", "Micșorează fontul", "Уменьшить шрифт", "Зменшити шрифт";
+    SNIP_TOOL_TEXT_LARGER => "Increase font size", "Mărește fontul", "Увеличить шрифт", "Збільшити шрифт";
+    MSG_SNAPSHOT_COPIED => "Screenshot copied to clipboard", "Captura a fost copiată în clipboard",
+        "Снимок скопирован в буфер обмена", "Знімок скопійовано в буфер обміну";
 
     // ----- About page ------------------------------------------------------
     ABOUT_VERSION => "Version {0}", "Versiunea {0}", "Версия {0}", "Версія {0}";
@@ -426,6 +461,10 @@ strings! {
         "Un recorder de ecran de sine stătător: fără ffmpeg, fără pachete de codecuri.",
         "Самодостаточная программа записи экрана: без ffmpeg и наборов кодеков.",
         "Самодостатня програма запису екрана: без ffmpeg та сторонніх кодек-паків.";
+    ABOUT_FORK_NOTICE => "Based on OpenClip (catalingrigoriev285/openclip), Apache 2.0 License. Modified fork (v0.2.0).",
+        "Bazat pe OpenClip (catalingrigoriev285/openclip), licența Apache 2.0. Versiune modificată (v0.2.0).",
+        "Основано на OpenClip (catalingrigoriev285/openclip), лицензия Apache 2.0. Доработанная версия (v0.2.0).",
+        "Базується на OpenClip (catalingrigoriev285/openclip), ліцензія Apache 2.0. Доопрацьована версія (v0.2.0).";
     ABOUT_VIDEO => "Video: H.264 via bundled OpenH264, plus hardware H.264 / HEVC (NVENC, AMF, Quick Sync) through Windows Media Foundation",
         "Video: H.264 prin OpenH264 inclus, plus H.264 / HEVC hardware (NVENC, AMF, Quick Sync) prin Windows Media Foundation",
         "Видео: H.264 через встроенный OpenH264, а также аппаратные H.264 / HEVC (NVENC, AMF, Quick Sync) через Windows Media Foundation",

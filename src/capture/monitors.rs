@@ -136,6 +136,12 @@ pub fn screenshot_monitor(id: u32) -> Result<RawFrame> {
     Ok(image_to_frame(m.capture_image().context("monitor screenshot")?))
 }
 
+/// Takes a screenshot of a monitor returning the full `RgbaImage`.
+pub fn screenshot_monitor_image(id: u32) -> Result<xcap::image::RgbaImage> {
+    let m = find_monitor(id)?;
+    m.capture_image().context("monitor screenshot")
+}
+
 /// Takes a screenshot of a window (RGBA).
 pub fn screenshot_window(id: u32) -> Result<RawFrame> {
     let w = find_window(id)?;

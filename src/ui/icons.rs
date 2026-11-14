@@ -49,3 +49,16 @@ pub const IMAGE: &str = "\u{f03e}";
 pub const MUSIC: &str = "\u{f001}"; // music
 pub const INFO: &str = "\u{f05a}"; // circle-info
 pub const MOUSE: &str = "\u{f8cc}"; // computer-mouse
+
+// Annotation & Snipping
+pub const SQUARE: &str = "\u{f0c8}"; // square
+pub const ARROW_RIGHT: &str = "\u{f061}"; // arrow-right
+pub const MINUS: &str = "\u{f068}"; // minus / line
+pub const PEN: &str = "\u{f304}"; // pen
+pub const HIGHLIGHTER: &str = "\u{f591}"; // highlighter
+pub const FONT: &str = "\u{f031}"; // font / text
+pub const EYE_SLASH: &str = "\u{f070}"; // eye-slash / blur
+pub const COPY: &str = "\u{f0c5}"; // copy
+pub const UNDO: &str = "\u{f0e2}"; // rotate-left / undo
+pub const ARROWS_ALT: &str = "\u{f0b2}"; // arrows-up-down-left-right / move
+

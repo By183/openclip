@@ -8,6 +8,7 @@ mod library;
 mod minibar;
 pub mod picker;
 pub mod region_frame;
+pub mod snipping;
 mod theme;
 mod thumbs;
 mod updater;
@@ -135,6 +136,7 @@ enum GeneralTab {
 enum State {
     Idle,
     Picking(Picker),
+    Snipping(snipping::SnippingTool),
     /// Start feedback sound is playing; recording launches when playback completes.
     Starting { rx: Receiver<()> },
     /// REC was pressed; recording starts when the countdown ends.
@@ -301,11 +303,15 @@ pub struct App {
     countdown_secs: u32,
     color_conversion: ColorConversion,
     hotkey: crate::hotkey::HotkeyConfig,
+    screenshot_hotkey: crate::hotkey::HotkeyConfig,
     hotkey_manager: crate::hotkey::HotkeyManager,
     capturing_hotkey: bool,
+    capturing_screenshot_hotkey: bool,
     language: Lang,
     /// Preserved from settings.json for compatibility; update checks are disabled.
     check_updates: bool,
+    region_capture_on_screenshot: bool,
+    annotate_screenshot: bool,
     /// Whether the game-capture sidecar is where it should be.
     repair: updater::RepairState,
     tab: Tab,
@@ -432,10 +438,21 @@ impl App {
             countdown_secs: settings.countdown_secs.clamp(1, 10),
             color_conversion: settings.color_conversion,
             hotkey: settings.hotkey,
-            hotkey_manager: crate::hotkey::HotkeyManager::new(settings.hotkey),
+            screenshot_hotkey: settings.screenshot_hotkey,
+            hotkey_manager: crate::hotkey::HotkeyManager::with_screenshot(
+                settings.hotkey,
+                settings.screenshot_hotkey,
+                Some({
+                    let ctx = cc.egui_ctx.clone();
+                    Arc::new(move || ctx.request_repaint())
+                }),
+            ),
             capturing_hotkey: false,
+            capturing_screenshot_hotkey: false,
             language: settings.language,
             check_updates: settings.check_updates,
+            region_capture_on_screenshot: settings.region_capture_on_screenshot,
+            annotate_screenshot: settings.annotate_screenshot,
             repair: match crate::update::sidecar_missing() {
                 Some(name) => {
                     log::warn!("{name} is not beside the executable; Game mode needs it restored");
@@ -534,6 +551,9 @@ impl App {
             countdown_secs: self.countdown_secs,
             color_conversion: self.color_conversion,
             hotkey: self.hotkey,
+            screenshot_hotkey: self.screenshot_hotkey,
+            region_capture_on_screenshot: self.region_capture_on_screenshot,
+            annotate_screenshot: self.annotate_screenshot,
             language: self.language,
             check_updates: self.check_updates,
         };
@@ -746,10 +766,19 @@ impl App {
                 self.stop_recording();
                 ctx.request_repaint();
             }
-            State::Starting { .. } | State::Stopping { .. } | State::Picking(_) => {
+            State::Starting { .. } | State::Stopping { .. } | State::Picking(_) | State::Snipping(_) => {
                 // Debounce: ignore repeated presses while starting or stopping
             }
         }
+    }
+
+    /// Global screenshot hotkey trigger: takes screenshot or starts interactive snipping.
+    fn handle_global_screenshot_hotkey(&mut self, ctx: &egui::Context) {
+        if matches!(self.state, State::Snipping(_)) {
+            return;
+        }
+        self.take_snapshot();
+        ctx.request_repaint();
     }
 
     fn cancel_countdown(&mut self) {
@@ -884,6 +913,22 @@ impl App {
     }
 
     fn take_snapshot(&mut self) {
+        if matches!(self.state, State::Snipping(_)) {
+            return;
+        }
+
+        if self.region_capture_on_screenshot {
+            match snipping::SnippingTool::new(&self.monitors, self.annotate_screenshot) {
+                Ok(tool) => {
+                    self.state = State::Snipping(tool);
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("failed to launch snipping tool: {e:#}; falling back to standard snapshot");
+                }
+            }
+        }
+
         let Some(source) = self.selected_source() else {
             self.message = Some((t!(MSG_SELECT_CAPTURE_FIRST).into(), true));
             return;
@@ -903,6 +948,42 @@ impl App {
         match result {
             Ok(()) => self.saved(path, t!(WHAT_SNAPSHOT)),
             Err(e) => self.message = Some((t!(MSG_SNAPSHOT_FAILED, format!("{e:#}")), true)),
+        }
+    }
+
+    fn save_snipped_image(&mut self, mut img: xcap::image::RgbaImage) {
+        let path = self.timestamped("png");
+        let wm = *self.watermark.read().unwrap();
+        if wm.any_overlay() {
+            let mut frame = crate::video::RawFrame {
+                data: img.clone().into_raw(),
+                width: img.width(),
+                height: img.height(),
+                stride: img.width() * 4,
+                format: crate::video::PixelFormat::Rgba,
+                pts: Duration::ZERO,
+                mouse: None,
+            };
+            if let Some(r) = self.watermark_renderer() {
+                r.apply(&wm, &mut frame);
+            }
+            if let Some(rebuilt) = xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.data) {
+                img = rebuilt;
+            }
+        }
+
+        std::fs::create_dir_all(&self.output_dir).ok();
+        match img.save(&path) {
+            Ok(()) => {
+                if let Err(e) = snipping::copy_image_to_clipboard(&img) {
+                    log::warn!("clipboard copy failed: {e:#}");
+                }
+                self.saved(path, t!(WHAT_SNAPSHOT));
+            }
+            Err(e) => {
+                self.message = Some((t!(MSG_SNAPSHOT_FAILED, format!("{e:#}")), true));
+                self.message_at = Some(Instant::now());
+            }
         }
     }
 
@@ -938,7 +1019,7 @@ impl App {
                     self.live.stop();
                 }
             }
-            State::Picking(_) | State::Starting { .. } | State::Stopping { .. } => {}
+            State::Picking(_) | State::Starting { .. } | State::Stopping { .. } | State::Snipping(_) => {}
         }
     }
 
@@ -1342,6 +1423,10 @@ impl App {
                 State::Picking(_) => {
                     status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::REGION, t!(MODE_REGION)), None, None, None);
                     ui.label(secondary(t!(STATUS_PICKING)));
+                }
+                State::Snipping(_) => {
+                    status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::CAMERA, t!(ROW_REGION_SCREENSHOT)), None, None, None);
+                    ui.label(secondary(t!(SNIP_HINT)));
                 }
                 State::Countdown { .. } => {
                     let left = self.countdown_remaining().unwrap_or(0).max(1);
@@ -2309,6 +2394,7 @@ impl App {
 
     fn page_image(&mut self, ui: &mut egui::Ui) {
         section_header(ui, t!(SECTION_SNAPSHOT));
+        let before_screenshot_hotkey = self.screenshot_hotkey;
         Card::show(ui, |card| {
             card.text_row(t!(BOX_IMAGE), &format!("PNG · {}", t!(SNAPSHOT_DETAIL)));
             card.row(t!(ROW_CAPTURE), |ui| {
@@ -2317,12 +2403,85 @@ impl App {
                 }
             });
             card.text_row(t!(ROW_SOURCE), &self.source_label());
+
+            let before_reg = self.region_capture_on_screenshot;
+            switch_row(card, t!(ROW_REGION_SCREENSHOT), &mut self.region_capture_on_screenshot);
+            if before_reg != self.region_capture_on_screenshot {
+                self.save_settings();
+            }
+
+            if self.region_capture_on_screenshot {
+                let before_ann = self.annotate_screenshot;
+                switch_row(card, t!(ROW_ANNOTATE_SCREENSHOT), &mut self.annotate_screenshot);
+                if before_ann != self.annotate_screenshot {
+                    self.save_settings();
+                }
+            }
+
             let on = self.watermark.read().unwrap().any_overlay();
             if card.nav_row(t!(ROW_WATERMARK), if on { t!(ON) } else { t!(OFF) }).clicked() {
                 self.tab = Tab::Video;
                 self.video_tab = VideoTab::Watermark;
             }
+
+            card.row(t!(ROW_SCREENSHOT_HOTKEY), |ui| {
+                let btn_text = if self.capturing_screenshot_hotkey {
+                    t!(HOTKEY_RECORDING).to_string()
+                } else if self.screenshot_hotkey.is_empty() {
+                    "—".into()
+                } else {
+                    self.screenshot_hotkey.display_string()
+                };
+                let btn = egui::Button::new(
+                    RichText::new(btn_text)
+                        .color(if self.capturing_screenshot_hotkey { ORANGE } else { LABEL }),
+                );
+                if ui.add(btn).clicked() {
+                    self.capturing_screenshot_hotkey = !self.capturing_screenshot_hotkey;
+                    if self.capturing_screenshot_hotkey {
+                        self.capturing_hotkey = false;
+                    }
+                }
+
+                if tinted_button_small(ui, t!(HOTKEY_RESET)).clicked() {
+                    self.screenshot_hotkey = crate::hotkey::HotkeyConfig::screenshot_default();
+                    self.capturing_screenshot_hotkey = false;
+                }
+
+                if self.capturing_screenshot_hotkey {
+                    ui.ctx().input(|i| {
+                        for event in &i.raw.events {
+                            if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
+                                if *key == egui::Key::Escape {
+                                    self.capturing_screenshot_hotkey = false;
+                                } else if let Some(new_cfg) = crate::hotkey::egui_map::from_egui(*modifiers, *key, self.screenshot_hotkey.sound) {
+                                    self.screenshot_hotkey = new_cfg;
+                                    self.capturing_screenshot_hotkey = false;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
         });
+
+        match self.hotkey_manager.screenshot_status() {
+            crate::hotkey::HotkeyStatus::Conflict(vk) => {
+                let name = crate::hotkey::vk_to_name(vk);
+                footnote(ui, &t!(HOTKEY_STATUS_CONFLICT, name));
+            }
+            crate::hotkey::HotkeyStatus::HookFallback => {
+                footnote(ui, t!(HOTKEY_STATUS_FALLBACK));
+            }
+            _ => {
+                footnote(ui, t!(ROW_REGION_SCREENSHOT_HINT));
+            }
+        }
+
+        if before_screenshot_hotkey != self.screenshot_hotkey {
+            self.hotkey_manager.update_screenshot(self.screenshot_hotkey);
+            self.save_settings();
+        }
     }
 
     fn page_about(&mut self, ui: &mut egui::Ui) {
@@ -2347,6 +2506,7 @@ impl App {
                 ui.label(secondary(t!(ABOUT_AUDIO)));
             });
             card.custom(|ui| {
+                ui.label(RichText::new(t!(ABOUT_FORK_NOTICE)).color(LABEL).small());
                 ui.label(secondary(t!(ABOUT_LICENSE)).small());
             });
             card.row_inline("", |ui| {
@@ -2443,6 +2603,9 @@ impl eframe::App for App {
         if self.hotkey_manager.poll_triggered() {
             self.handle_global_hotkey(&ctx);
         }
+        if self.hotkey_manager.poll_screenshot_triggered() {
+            self.handle_global_screenshot_hotkey(&ctx);
+        }
         self.poll_encoders();
         if self.thumbs.poll(&ctx) {
             ctx.request_repaint();
@@ -2474,6 +2637,27 @@ impl eframe::App for App {
                     self.place_bar_near_region(&ctx);
                 }
                 PickerOutcome::Cancelled => self.state = State::Idle,
+            }
+        }
+
+        if let State::Snipping(tool) = &mut self.state {
+            match tool.show(&ctx) {
+                snipping::SnippingOutcome::Pending => {}
+                snipping::SnippingOutcome::Saved(img) => {
+                    self.save_snipped_image(img);
+                    self.state = State::Idle;
+                }
+                snipping::SnippingOutcome::CopiedOnly(img) => {
+                    if let Err(e) = snipping::copy_image_to_clipboard(&img) {
+                        log::warn!("clipboard copy failed: {e:#}");
+                    }
+                    self.message = Some((t!(MSG_SNAPSHOT_COPIED).into(), false));
+                    self.message_at = Some(Instant::now());
+                    self.state = State::Idle;
+                }
+                snipping::SnippingOutcome::Cancelled => {
+                    self.state = State::Idle;
+                }
             }
         }
 

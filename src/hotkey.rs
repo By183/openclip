@@ -44,6 +44,18 @@ impl Default for HotkeyConfig {
 }
 
 impl HotkeyConfig {
+    pub fn screenshot_default() -> Self {
+        Self {
+            enabled: true,
+            ctrl: true,
+            alt: true,
+            shift: false,
+            win: false,
+            vk: 0x51, // 'Q'
+            sound: false,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.vk == 0
     }
@@ -258,9 +270,16 @@ pub enum HotkeyStatus {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyEvent {
+    Record,
+    Screenshot,
+}
+
 #[cfg(windows)]
 enum WorkerCmd {
-    Update(HotkeyConfig),
+    UpdateRecord(HotkeyConfig),
+    UpdateScreenshot(HotkeyConfig),
     Stop,
 }
 
@@ -269,23 +288,44 @@ pub struct HotkeyManager {
     cmd_tx: Sender<WorkerCmd>,
     #[cfg(windows)]
     worker: Option<JoinHandle<()>>,
-    event_rx: Receiver<()>,
-    status: Arc<std::sync::Mutex<HotkeyStatus>>,
+    event_rx: Receiver<HotkeyEvent>,
+    pending_record: AtomicBool,
+    pending_screenshot: AtomicBool,
+    record_status: Arc<std::sync::Mutex<HotkeyStatus>>,
+    screenshot_status: Arc<std::sync::Mutex<HotkeyStatus>>,
 }
 
 impl HotkeyManager {
     pub fn new(initial: HotkeyConfig) -> Self {
+        Self::with_screenshot(initial, HotkeyConfig::screenshot_default(), None)
+    }
+
+    pub fn with_screenshot(
+        record_cfg: HotkeyConfig,
+        screenshot_cfg: HotkeyConfig,
+        repaint_cb: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         let (event_tx, event_rx) = channel();
-        let status = Arc::new(std::sync::Mutex::new(HotkeyStatus::Disabled));
+        let record_status = Arc::new(std::sync::Mutex::new(HotkeyStatus::Disabled));
+        let screenshot_status = Arc::new(std::sync::Mutex::new(HotkeyStatus::Disabled));
 
         #[cfg(windows)]
         {
             let (cmd_tx, cmd_rx) = channel();
-            let status_clone = status.clone();
+            let rec_clone = record_status.clone();
+            let sc_clone = screenshot_status.clone();
             let worker = std::thread::Builder::new()
                 .name("openclip-hotkey".into())
                 .spawn(move || {
-                    run_hotkey_worker(initial, cmd_rx, event_tx, status_clone);
+                    run_hotkey_worker(
+                        record_cfg,
+                        screenshot_cfg,
+                        cmd_rx,
+                        event_tx,
+                        rec_clone,
+                        sc_clone,
+                        repaint_cb,
+                    );
                 })
                 .ok();
 
@@ -293,38 +333,76 @@ impl HotkeyManager {
                 cmd_tx,
                 worker,
                 event_rx,
-                status,
+                pending_record: AtomicBool::new(false),
+                pending_screenshot: AtomicBool::new(false),
+                record_status,
+                screenshot_status,
             }
         }
 
         #[cfg(not(windows))]
         {
-            let _ = initial;
-            let _ = event_tx;
-            Self { event_rx, status }
+            let _ = (record_cfg, screenshot_cfg, event_tx, repaint_cb);
+            Self {
+                event_rx,
+                pending_record: AtomicBool::new(false),
+                pending_screenshot: AtomicBool::new(false),
+                record_status,
+                screenshot_status,
+            }
         }
     }
 
-    /// Sets or updates the active hotkey configuration.
+    /// Sets or updates the active recording hotkey configuration.
     pub fn update(&self, config: HotkeyConfig) {
         #[cfg(windows)]
-        let _ = self.cmd_tx.send(WorkerCmd::Update(config));
+        let _ = self.cmd_tx.send(WorkerCmd::UpdateRecord(config));
         #[cfg(not(windows))]
         let _ = config;
     }
 
-    /// Returns the current registration status of the hotkey.
-    pub fn status(&self) -> HotkeyStatus {
-        *self.status.lock().unwrap()
+    /// Alias for updating the recording hotkey.
+    pub fn update_record(&self, config: HotkeyConfig) {
+        self.update(config);
     }
 
-    /// Non-blocking check whether the hotkey was triggered.
-    pub fn poll_triggered(&self) -> bool {
-        let mut triggered = false;
-        while self.event_rx.try_recv().is_ok() {
-            triggered = true;
+    /// Sets or updates the active screenshot hotkey configuration.
+    pub fn update_screenshot(&self, config: HotkeyConfig) {
+        #[cfg(windows)]
+        let _ = self.cmd_tx.send(WorkerCmd::UpdateScreenshot(config));
+        #[cfg(not(windows))]
+        let _ = config;
+    }
+
+    /// Returns the current registration status of the recording hotkey.
+    pub fn status(&self) -> HotkeyStatus {
+        *self.record_status.lock().unwrap()
+    }
+
+    /// Returns the current registration status of the screenshot hotkey.
+    pub fn screenshot_status(&self) -> HotkeyStatus {
+        *self.screenshot_status.lock().unwrap()
+    }
+
+    fn drain_events(&self) {
+        while let Ok(evt) = self.event_rx.try_recv() {
+            match evt {
+                HotkeyEvent::Record => self.pending_record.store(true, Ordering::Relaxed),
+                HotkeyEvent::Screenshot => self.pending_screenshot.store(true, Ordering::Relaxed),
+            }
         }
-        triggered
+    }
+
+    /// Non-blocking check whether the recording hotkey was triggered.
+    pub fn poll_triggered(&self) -> bool {
+        self.drain_events();
+        self.pending_record.swap(false, Ordering::Relaxed)
+    }
+
+    /// Non-blocking check whether the screenshot hotkey was triggered.
+    pub fn poll_screenshot_triggered(&self) -> bool {
+        self.drain_events();
+        self.pending_screenshot.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -341,26 +419,147 @@ impl Drop for HotkeyManager {
 }
 
 #[cfg(windows)]
+struct HotkeyAtomicState {
+    enabled: AtomicBool,
+    ctrl: AtomicBool,
+    alt: AtomicBool,
+    shift: AtomicBool,
+    win: AtomicBool,
+    vk: std::sync::atomic::AtomicU64,
+    last_trigger: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+#[cfg(windows)]
+impl HotkeyAtomicState {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            ctrl: AtomicBool::new(false),
+            alt: AtomicBool::new(false),
+            shift: AtomicBool::new(false),
+            win: AtomicBool::new(false),
+            vk: std::sync::atomic::AtomicU64::new(0),
+            last_trigger: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn update(&self, cfg: &HotkeyConfig) {
+        self.enabled.store(cfg.enabled && cfg.vk != 0, Ordering::Relaxed);
+        self.ctrl.store(cfg.ctrl, Ordering::Relaxed);
+        self.alt.store(cfg.alt, Ordering::Relaxed);
+        self.shift.store(cfg.shift, Ordering::Relaxed);
+        self.win.store(cfg.win, Ordering::Relaxed);
+        self.vk.store(cfg.vk as u64, Ordering::Relaxed);
+    }
+
+    fn matches(&self, vk_code: u32, ctrl_down: bool, alt_down: bool, shift_down: bool, win_down: bool) -> bool {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let target_vk = self.vk.load(Ordering::Relaxed) as u32;
+        if target_vk == 0 || vk_code != target_vk {
+            return false;
+        }
+        self.ctrl.load(Ordering::Relaxed) == ctrl_down
+            && self.alt.load(Ordering::Relaxed) == alt_down
+            && self.shift.load(Ordering::Relaxed) == shift_down
+            && self.win.load(Ordering::Relaxed) == win_down
+    }
+
+    fn debounce_and_trigger(&self) -> bool {
+        let mut last = self.last_trigger.lock().unwrap();
+        let debounce = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(300));
+        if debounce {
+            *last = Some(std::time::Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+struct HookState {
+    record: HotkeyAtomicState,
+    screenshot: HotkeyAtomicState,
+    event_tx: std::sync::Mutex<Option<Sender<HotkeyEvent>>>,
+    repaint_cb: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+#[cfg(windows)]
+static HOOK_STATE: std::sync::OnceLock<Arc<HookState>> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: windows::Win32::Foundation::WPARAM, lparam: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU, VK_CONTROL as WIN_VK_CONTROL, VK_SHIFT as WIN_VK_SHIFT};
+    use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN};
+
+    if code >= 0
+        && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN)
+        && let Some(state) = HOOK_STATE.get()
+    {
+        let kbd = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        let ctrl_down = unsafe { (GetAsyncKeyState(WIN_VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 };
+        let alt_down = unsafe { (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
+        let shift_down = unsafe { (GetAsyncKeyState(WIN_VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 };
+        let win_down = unsafe {
+            (GetAsyncKeyState(0x5B) as u16 & 0x8000) != 0 // VK_LWIN
+                || (GetAsyncKeyState(0x5C) as u16 & 0x8000) != 0 // VK_RWIN
+        };
+
+        if state.record.matches(kbd.vkCode, ctrl_down, alt_down, shift_down, win_down)
+            && state.record.debounce_and_trigger()
+        {
+            if let Ok(guard) = state.event_tx.lock()
+                && let Some(tx) = guard.as_ref()
+            {
+                let _ = tx.send(HotkeyEvent::Record);
+            }
+            if let Ok(guard) = state.repaint_cb.lock()
+                && let Some(cb) = guard.as_ref()
+            {
+                cb();
+            }
+        } else if state.screenshot.matches(kbd.vkCode, ctrl_down, alt_down, shift_down, win_down)
+            && state.screenshot.debounce_and_trigger()
+        {
+            if let Ok(guard) = state.event_tx.lock()
+                && let Some(tx) = guard.as_ref()
+            {
+                let _ = tx.send(HotkeyEvent::Screenshot);
+            }
+            if let Ok(guard) = state.repaint_cb.lock()
+                && let Some(cb) = guard.as_ref()
+            {
+                cb();
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+#[cfg(windows)]
 fn run_hotkey_worker(
-    initial: HotkeyConfig,
+    initial_record: HotkeyConfig,
+    initial_screenshot: HotkeyConfig,
     cmd_rx: Receiver<WorkerCmd>,
-    event_tx: Sender<()>,
-    status: Arc<std::sync::Mutex<HotkeyStatus>>,
+    event_tx: Sender<HotkeyEvent>,
+    record_status: Arc<std::sync::Mutex<HotkeyStatus>>,
+    screenshot_status: Arc<std::sync::Mutex<HotkeyStatus>>,
+    repaint_cb: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
-    use std::sync::atomic::AtomicU64;
-    use std::time::Instant;
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
-        MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_MENU, VK_CONTROL as WIN_VK_CONTROL, VK_SHIFT as WIN_VK_SHIFT,
+        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+        MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         MsgWaitForMultipleObjectsEx, PeekMessageW, RegisterClassExW, SetWindowsHookExW,
-        TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MWMO_INPUTAVAILABLE,
+        TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG, MWMO_INPUTAVAILABLE,
         PEEK_MESSAGE_REMOVE_TYPE, QS_ALLINPUT, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_HOTKEY, WM_KEYDOWN, WM_SYSKEYDOWN, WNDCLASSEXW,
+        WM_HOTKEY, WNDCLASSEXW,
     };
 
     struct HookGuard(Option<HHOOK>);
@@ -374,68 +573,19 @@ fn run_hotkey_worker(
         }
     }
 
-    const HOTKEY_ID: i32 = 0x4F43; // "OC" (OpenClip)
-
-    struct HookState {
-        enabled: AtomicBool,
-        ctrl: AtomicBool,
-        alt: AtomicBool,
-        shift: AtomicBool,
-        win: AtomicBool,
-        vk: AtomicU64,
-        last_trigger: std::sync::Mutex<Option<Instant>>,
-        event_tx: Sender<()>,
-    }
-
-    static HOOK_STATE: std::sync::OnceLock<Arc<HookState>> = std::sync::OnceLock::new();
+    const HOTKEY_RECORD_ID: i32 = 0x4F43; // "OC" (OpenClip Record)
+    const HOTKEY_SCREENSHOT_ID: i32 = 0x4F53; // "OS" (OpenClip Screenshot)
 
     let hook_state = HOOK_STATE.get_or_init(|| {
         Arc::new(HookState {
-            enabled: AtomicBool::new(false),
-            ctrl: AtomicBool::new(false),
-            alt: AtomicBool::new(false),
-            shift: AtomicBool::new(false),
-            win: AtomicBool::new(false),
-            vk: AtomicU64::new(0),
-            last_trigger: std::sync::Mutex::new(None),
-            event_tx: event_tx.clone(),
+            record: HotkeyAtomicState::new(),
+            screenshot: HotkeyAtomicState::new(),
+            event_tx: std::sync::Mutex::new(None),
+            repaint_cb: std::sync::Mutex::new(None),
         })
     });
-
-    unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if code >= 0
-            && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN)
-            && let Some(state) = HOOK_STATE.get()
-            && state.enabled.load(Ordering::Relaxed)
-        {
-            let kbd = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            let target_vk = state.vk.load(Ordering::Relaxed) as u32;
-            if target_vk != 0 && kbd.vkCode == target_vk {
-                let ctrl_down = unsafe { (GetAsyncKeyState(WIN_VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 };
-                let alt_down = unsafe { (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
-                let shift_down = unsafe { (GetAsyncKeyState(WIN_VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 };
-                let win_down = unsafe {
-                    (GetAsyncKeyState(0x5B) as u16 & 0x8000) != 0 // VK_LWIN
-                        || (GetAsyncKeyState(0x5C) as u16 & 0x8000) != 0 // VK_RWIN
-                };
-
-                let matches = state.ctrl.load(Ordering::Relaxed) == ctrl_down
-                    && state.alt.load(Ordering::Relaxed) == alt_down
-                    && state.shift.load(Ordering::Relaxed) == shift_down
-                    && state.win.load(Ordering::Relaxed) == win_down;
-
-                if matches {
-                    let mut last = state.last_trigger.lock().unwrap();
-                    let debounce = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(300));
-                    if debounce {
-                        *last = Some(Instant::now());
-                        let _ = state.event_tx.send(());
-                    }
-                }
-            }
-        }
-        unsafe { CallNextHookEx(None, code, wparam, lparam) }
-    }
+    *hook_state.event_tx.lock().unwrap() = Some(event_tx.clone());
+    *hook_state.repaint_cb.lock().unwrap() = repaint_cb.clone();
 
     unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -477,21 +627,19 @@ fn run_hotkey_worker(
     let has_hook = hook_raw.is_some();
     let _hook_guard = HookGuard(hook_raw);
 
-    let mut current_cfg = initial;
+    let mut current_record_cfg = initial_record;
+    let mut current_screenshot_cfg = initial_screenshot;
 
-    let apply_config = |cfg: &HotkeyConfig,
-                        st: &Arc<std::sync::Mutex<HotkeyStatus>>,
-                        hook_st: &Arc<HookState>| {
-        hook_st.enabled.store(cfg.enabled && cfg.vk != 0, Ordering::Relaxed);
-        hook_st.ctrl.store(cfg.ctrl, Ordering::Relaxed);
-        hook_st.alt.store(cfg.alt, Ordering::Relaxed);
-        hook_st.shift.store(cfg.shift, Ordering::Relaxed);
-        hook_st.win.store(cfg.win, Ordering::Relaxed);
-        hook_st.vk.store(cfg.vk as u64, Ordering::Relaxed);
+    let apply_one = |id: i32,
+                     cfg: &HotkeyConfig,
+                     st: &Arc<std::sync::Mutex<HotkeyStatus>>,
+                     atomic_st: &HotkeyAtomicState,
+                     name: &str| {
+        atomic_st.update(cfg);
 
         if !cfg.enabled || cfg.vk == 0 {
             unsafe {
-                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+                let _ = UnregisterHotKey(Some(hwnd), id);
             }
             *st.lock().unwrap() = HotkeyStatus::Disabled;
             return;
@@ -512,14 +660,14 @@ fn run_hotkey_worker(
         }
 
         unsafe {
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-            let res = RegisterHotKey(Some(hwnd), HOTKEY_ID, HOT_KEY_MODIFIERS(mods), cfg.vk);
+            let _ = UnregisterHotKey(Some(hwnd), id);
+            let res = RegisterHotKey(Some(hwnd), id, HOT_KEY_MODIFIERS(mods), cfg.vk);
             if res.is_ok() {
-                log::info!("Registered global hotkey: {}", cfg.display_string());
+                log::info!("Registered global {name} hotkey: {}", cfg.display_string());
                 *st.lock().unwrap() = HotkeyStatus::Registered;
             } else {
                 log::warn!(
-                    "RegisterHotKey failed for '{}' (conflict with another application); using low-level keyboard hook fallback",
+                    "RegisterHotKey failed for {name} '{}' (conflict with another application); using low-level keyboard hook fallback",
                     cfg.display_string()
                 );
                 *st.lock().unwrap() = if has_hook {
@@ -531,16 +679,21 @@ fn run_hotkey_worker(
         }
     };
 
-    apply_config(&current_cfg, &status, hook_state);
+    apply_one(HOTKEY_RECORD_ID, &current_record_cfg, &record_status, &hook_state.record, "record");
+    apply_one(HOTKEY_SCREENSHOT_ID, &current_screenshot_cfg, &screenshot_status, &hook_state.screenshot, "screenshot");
 
     let mut msg = MSG::default();
     'pump: loop {
         // Drain pending worker commands
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                WorkerCmd::Update(cfg) => {
-                    current_cfg = cfg;
-                    apply_config(&current_cfg, &status, hook_state);
+                WorkerCmd::UpdateRecord(cfg) => {
+                    current_record_cfg = cfg;
+                    apply_one(HOTKEY_RECORD_ID, &current_record_cfg, &record_status, &hook_state.record, "record");
+                }
+                WorkerCmd::UpdateScreenshot(cfg) => {
+                    current_screenshot_cfg = cfg;
+                    apply_one(HOTKEY_SCREENSHOT_ID, &current_screenshot_cfg, &screenshot_status, &hook_state.screenshot, "screenshot");
                 }
                 WorkerCmd::Stop => break 'pump,
             }
@@ -549,12 +702,22 @@ fn run_hotkey_worker(
         // Dispatch all queued messages
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PEEK_MESSAGE_REMOVE_TYPE(1)).as_bool() {
-                if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_ID {
-                    let mut last = hook_state.last_trigger.lock().unwrap();
-                    let debounce = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(300));
-                    if debounce {
-                        *last = Some(Instant::now());
-                        let _ = event_tx.send(());
+                if msg.message == WM_HOTKEY {
+                    let id = msg.wParam.0 as i32;
+                    if id == HOTKEY_RECORD_ID {
+                        if hook_state.record.debounce_and_trigger() {
+                            let _ = event_tx.send(HotkeyEvent::Record);
+                            if let Some(cb) = &repaint_cb {
+                                cb();
+                            }
+                        }
+                    } else if id == HOTKEY_SCREENSHOT_ID
+                        && hook_state.screenshot.debounce_and_trigger()
+                    {
+                        let _ = event_tx.send(HotkeyEvent::Screenshot);
+                        if let Some(cb) = &repaint_cb {
+                            cb();
+                        }
                     }
                 }
                 let _ = TranslateMessage(&msg);
@@ -570,11 +733,17 @@ fn run_hotkey_worker(
     }
 
     unsafe {
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_RECORD_ID);
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SCREENSHOT_ID);
         if !hwnd.is_invalid() {
             let _ = DestroyWindow(hwnd);
         }
     }
+
+    *hook_state.event_tx.lock().unwrap() = None;
+    *hook_state.repaint_cb.lock().unwrap() = None;
+    hook_state.record.enabled.store(false, Ordering::Relaxed);
+    hook_state.screenshot.enabled.store(false, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -587,6 +756,15 @@ mod tests {
         assert_eq!(cfg.display_string(), "Ctrl+Alt+R");
         assert_eq!(cfg.to_string(), "Ctrl+Alt+R");
         assert!(!cfg.is_empty());
+    }
+
+    #[test]
+    fn hotkey_screenshot_default() {
+        let cfg = HotkeyConfig::screenshot_default();
+        assert_eq!(cfg.display_string(), "Ctrl+Alt+Q");
+        assert_eq!(cfg.to_string(), "Ctrl+Alt+Q");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.vk, 0x51);
     }
 
     #[test]

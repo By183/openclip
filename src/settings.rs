@@ -623,6 +623,14 @@ fn default_volume() -> u8 {
     100
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_screenshot_hotkey() -> crate::hotkey::HotkeyConfig {
+    crate::hotkey::HotkeyConfig::screenshot_default()
+}
+
 /// Root of `settings.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -666,6 +674,15 @@ pub struct Settings {
     /// Global hotkey for starting / stopping recording.
     #[serde(default)]
     pub hotkey: crate::hotkey::HotkeyConfig,
+    /// Global hotkey for taking a screenshot.
+    #[serde(default = "default_screenshot_hotkey")]
+    pub screenshot_hotkey: crate::hotkey::HotkeyConfig,
+    /// Whether taking a screenshot starts interactive region selection.
+    #[serde(default)]
+    pub region_capture_on_screenshot: bool,
+    /// Whether to open the annotation editor after selecting a region.
+    #[serde(default = "default_true")]
+    pub annotate_screenshot: bool,
     /// Interface language; applied to [`crate::i18n`] by [`Settings::load`].
     pub language: Lang,
     /// Look for a newer release on GitHub when the app starts (see [`crate::update`]).
@@ -695,6 +712,9 @@ impl Default for Settings {
             countdown_secs: 3,
             color_conversion: ColorConversion::default(),
             hotkey: crate::hotkey::HotkeyConfig::default(),
+            screenshot_hotkey: crate::hotkey::HotkeyConfig::screenshot_default(),
+            region_capture_on_screenshot: false,
+            annotate_screenshot: true,
             language: Lang::default(),
             check_updates: true,
         }
@@ -890,6 +910,8 @@ mod tests {
         assert_eq!(Settings::default().countdown_secs, 3);
         assert!(Settings::default().hotkey.enabled);
         assert_eq!(Settings::default().hotkey.display_string(), "Ctrl+Alt+R");
+        assert!(Settings::default().screenshot_hotkey.enabled);
+        assert_eq!(Settings::default().screenshot_hotkey.display_string(), "Ctrl+Alt+Q");
     }
 
     #[test]

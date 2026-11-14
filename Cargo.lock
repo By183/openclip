@@ -3349,9 +3349,10 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openclip"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "cpal",
  "device_query",
  "dirs",
@@ -3384,7 +3385,7 @@ dependencies = [
 
 [[package]]
 name = "openclip-hook"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "openclip-overlay",
  "windows 0.62.2",
@@ -3393,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "openclip-overlay"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "serde",
