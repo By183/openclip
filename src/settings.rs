@@ -720,7 +720,7 @@ pub struct Settings {
     pub annotate_screenshot: bool,
     /// Interface language; applied to [`crate::i18n`] by [`Settings::load`].
     pub language: Lang,
-    /// Look for a newer release on GitHub when the app starts (see [`crate::update`]).
+    /// Legacy setting for update checks (network updates are disabled).
     pub check_updates: bool,
 }
 

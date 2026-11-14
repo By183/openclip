@@ -457,12 +457,20 @@ impl App {
             check_updates: settings.check_updates,
             region_capture_on_screenshot: settings.region_capture_on_screenshot,
             annotate_screenshot: settings.annotate_screenshot,
-            repair: match crate::update::sidecar_missing() {
-                Some(name) => {
-                    log::warn!("{name} is not beside the executable; Game mode needs it restored");
-                    updater::RepairState::Missing
+            repair: {
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                {
+                    if crate::game::inject::hook_dll_path().is_none() {
+                        log::warn!("openclip_hook64.dll is not beside the executable; Game mode needs it restored");
+                        updater::RepairState::Missing
+                    } else {
+                        updater::RepairState::Present
+                    }
                 }
-                None => updater::RepairState::Present,
+                #[cfg(not(all(windows, target_arch = "x86_64")))]
+                {
+                    updater::RepairState::Present
+                }
             },
             tab: Tab::Home,
             home_tab: HomeTab::Videos,

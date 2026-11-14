@@ -6,3 +6,8 @@
 *.avi
 *.err
 *.out
+*.log
+settings.json
+dist/
+GEMINI.md
+PROJECT_STATE.md

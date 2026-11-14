@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::capture::SharedQueue;
-use super::resample::LinearResampler;
+use super::resample::KaiserSincResampler;
 
 /// If a source's sample count lags its wall-clock position by more than this,
 /// the gap is filled with silence.
@@ -29,7 +29,7 @@ const CROSSFADE_DURATION: Duration = Duration::from_millis(5);
 struct SourceState {
     queue: SharedQueue,
     channels: usize,
-    resampler: LinearResampler,
+    resampler: KaiserSincResampler,
     /// Stereo interleaved samples at the master rate, starting at `buffer_start`.
     buffer: VecDeque<f32>,
     /// Timeline frame index of `buffer[0]` (or where the drained end stands).
@@ -65,7 +65,7 @@ impl Mixer {
         self.sources.push(SourceState {
             queue,
             channels: channels.max(1) as usize,
-            resampler: LinearResampler::new(sample_rate, self.rate, 2),
+            resampler: KaiserSincResampler::new(sample_rate, self.rate, 2),
             buffer: VecDeque::new(),
             buffer_start: 0,
             initialized: false,

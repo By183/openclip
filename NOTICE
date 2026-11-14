@@ -1,0 +1,79 @@
+# OpenClip Notices and Third-Party Software
+
+OpenClip
+Copyright 2026 OpenClip Contributors.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at:
+    http://www.apache.org/licenses/LICENSE-2.0
+
+---
+
+## 1. Third-Party Codecs and Native Libraries
+
+### OpenH264
+* **Component:** Cisco OpenH264 H.264 video codec (via `openh264` crate)
+* **License:** BSD 2-Clause License
+* **Notice:**
+  Copyright (c) 2013, Cisco Systems
+  All rights reserved.
+  Redistribution and use in source and binary forms, with or without modification,
+  are permitted provided that the following conditions are met:
+  1. Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+
+### LAME MP3 Encoder
+* **Component:** LAME MP3 audio encoder library (via `mp3lame-encoder` crate)
+* **License:** GNU Lesser General Public License (LGPL), Version 2.0 or later
+* **Notice:**
+  Copyright (c) 1999-2020 The LAME Project.
+  Distributed under the terms of the GNU LGPL v2.0+.
+
+---
+
+## 2. Bundled Fonts and Icons
+
+### Inter Font Family
+* **Component:** Inter-Regular.ttf, Inter-SemiBold.ttf
+* **Author:** Rasmus Andersson
+* **License:** SIL Open Font License 1.1 (OFL-1.1)
+* **Website:** https://rsms.me/inter/
+
+### Font Awesome Free
+* **Component:** Font Awesome 6 Free (Solid icon subset)
+* **Author:** Fonticons, Inc.
+* **License:** SIL Open Font License 1.1 (OFL-1.1) for icon fonts / CC BY 4.0 for icons
+* **Website:** https://fontawesome.com
+
+---
+
+## 3. Major Rust Crates (Cargo.toml Dependencies)
+
+The following open-source Rust crates are used under their respective licenses:
+
+* **egui / eframe** (`egui`, `eframe`): MIT License OR Apache License 2.0
+  Copyright (c) Emil Ernerfeldt
+* **cpal** (`cpal`): Apache License 2.0
+  Copyright (c) The CPAL Contributors
+* **yuv** (`yuv` / libyuv bindings): MIT License OR Apache License 2.0
+  Copyright (c) The WebRTC Project / libyuv authors
+* **xcap** (`xcap`): MIT License OR Apache License 2.0
+  Copyright (c) Nekomeowww
+* **arboard** (`arboard`): MIT License OR Apache License 2.0
+  Copyright (c) 1Password
+* **windows / windows-capture** (`windows`, `windows-capture`): MIT License OR Apache License 2.0
+  Copyright (c) Microsoft Corporation / NiiightmareXD
+* **image / fast_image_resize** (`image`, `fast_image_resize`): MIT License OR Apache License 2.0
+  Copyright (c) The Image-rs Authors / Evgenii Shirokov
+* **serde / serde_json** (`serde`, `serde_json`): MIT License OR Apache License 2.0
+  Copyright (c) Erick Tryzelaar and David Tolnay
+* **rfd** (`rfd`): MIT License
+  Copyright (c) PolyMeilex
+* **device_query** (`device_query`): MIT License
+  Copyright (c) Austin Bonander
+* **ab_glyph** (`ab_glyph`): Apache License 2.0
+  Copyright (c) Alex Butler
+* **anyhow / log / env_logger / dirs**: MIT License OR Apache License 2.0

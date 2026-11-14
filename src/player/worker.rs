@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TryS
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::audio::resample::LinearResampler;
+use crate::audio::resample::KaiserSincResampler;
 use crate::capture::FramePool;
 use crate::video::mf::ComGuard;
 
@@ -71,7 +71,7 @@ struct Worker {
     reader: Reader,
     /// `None` when the file has no sound, or no output device could be opened.
     output: Option<Output>,
-    resampler: Option<LinearResampler>,
+    resampler: Option<KaiserSincResampler>,
     shared: Arc<Shared>,
     pool: Arc<FramePool>,
     frames: SyncSender<Frame>,
@@ -123,7 +123,7 @@ impl Worker {
                 Ok(out) => {
                     shared.clock.set_audio(out.rate, out.rate / 50);
                     if info.rate != out.rate {
-                        resampler = Some(LinearResampler::new(info.rate, out.rate, 2));
+                        resampler = Some(KaiserSincResampler::new(info.rate, out.rate, 2));
                     }
                     output = Some(out);
                 }
@@ -313,7 +313,7 @@ impl Worker {
         }
         if let Some(r) = &mut self.resampler {
             // Its fractional position and previous sample belong to the old spot.
-            *r = LinearResampler::new(r.input_rate(), self.output.as_ref().map_or(48_000, |o| o.rate), 2);
+            *r = KaiserSincResampler::new(r.input_rate(), self.output.as_ref().map_or(48_000, |o| o.rate), 2);
         }
         self.ended = false;
         self.stepping = false;

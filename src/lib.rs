@@ -28,5 +28,4 @@ pub mod pipeline;
 pub mod player;
 pub mod settings;
 pub mod ui;
-pub mod update;
 pub mod video;

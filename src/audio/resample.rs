@@ -3,16 +3,15 @@
 //! Uses a 16-tap Kaiser-windowed sinc filter (`beta = 6.0`) with an adaptive
 //! low-pass cutoff when downsampling (`cutoff = 0.94 / ratio`) and a continuous
 //! ring buffer across calls, preventing linear-interpolation aliasing/warble
-//! (`44.1 kHz <-> 48 kHz`) and boundary clicks while preserving the public
-//! [`LinearResampler`] name for existing callers.
+//! (`44.1 kHz <-> 48 kHz`) and boundary clicks.
 
 const RADIUS: usize = 8;
 const LEFT_CTX: usize = RADIUS - 1;
 const TAPS: usize = LEFT_CTX + 1 + RADIUS; // 16 taps: -7..=+8
 const KAISER_BETA: f64 = 6.0;
 
-/// Resampler that maintains filter history and fractional phase state across calls.
-pub struct LinearResampler {
+/// 16-tap Kaiser-windowed sinc resampler maintaining filter history and fractional phase across calls.
+pub struct KaiserSincResampler {
     from_rate: u32,
     channels: usize,
     ratio: f64, // input frames per output frame
@@ -24,7 +23,7 @@ pub struct LinearResampler {
     primed: bool,
 }
 
-impl LinearResampler {
+impl KaiserSincResampler {
     pub fn new(from_rate: u32, to_rate: u32, channels: usize) -> Self {
         let from = from_rate.max(1);
         let to = to_rate.max(1);
@@ -162,6 +161,9 @@ impl LinearResampler {
     }
 }
 
+/// Backward-compatibility alias for [`KaiserSincResampler`].
+pub type LinearResampler = KaiserSincResampler;
+
 #[inline]
 fn sinc(x: f64) -> f64 {
     if x.abs() < 1e-8 {
@@ -194,7 +196,7 @@ mod tests {
 
     #[test]
     fn halves_sample_count() {
-        let mut r = LinearResampler::new(96000, 48000, 1);
+        let mut r = KaiserSincResampler::new(96000, 48000, 1);
         let input: Vec<f32> = (0..1000).map(|i| i as f32).collect();
         let mut out = Vec::new();
         for chunk in input.chunks(100) {
@@ -209,7 +211,7 @@ mod tests {
 
     #[test]
     fn upsamples_stereo() {
-        let mut r = LinearResampler::new(44100, 48000, 2);
+        let mut r = KaiserSincResampler::new(44100, 48000, 2);
         let input: Vec<f32> = (0..882).map(|i| (i / 2) as f32).collect();
         let mut out = Vec::new();
         r.process(&input, &mut out);
@@ -229,7 +231,7 @@ mod tests {
             input.push(s);
             input.push(-s);
         }
-        let mut r = LinearResampler::new(in_rate, out_rate, 2);
+        let mut r = KaiserSincResampler::new(in_rate, out_rate, 2);
         let mut out = Vec::new();
         // Process in irregular chunks (441 frames = 10 ms WASAPI buffers) without flush in between.
         for chunk in input.chunks(441 * 2) {
@@ -257,7 +259,7 @@ mod tests {
         let input: Vec<f32> = (0..n_in)
             .map(|i| (i as f64 * freq * std::f64::consts::TAU / in_rate as f64).sin() as f32)
             .collect();
-        let mut r = LinearResampler::new(in_rate, out_rate, 1);
+        let mut r = KaiserSincResampler::new(in_rate, out_rate, 1);
         let mut out = Vec::new();
         for chunk in input.chunks(480) {
             r.process(chunk, &mut out);
