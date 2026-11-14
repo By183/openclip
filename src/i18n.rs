@@ -185,6 +185,7 @@ strings! {
         "Міні-панель: згорнути у невелику плаваючу панель запису (закрийте панель, щоб повернутися)";
     TIP_REC_START => "Start recording", "Începe înregistrarea", "Начать запись", "Почати запис";
     TIP_REC_STOP => "Stop recording", "Oprește înregistrarea", "Остановить запись", "Зупинити запис";
+    TIP_REC_SAVING => "Saving recording…", "Se salvează înregistrarea…", "Сохранение записи…", "Збереження запису…";
     TIP_REC_CANCEL => "Cancel the countdown", "Anulează numărătoarea inversă", "Отменить обратный отсчёт",
         "Скасувати зворотний відлік";
     TIP_PAUSE => "Pause recording", "Suspendă înregistrarea", "Приостановить запись", "Призупинити запис";

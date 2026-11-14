@@ -279,6 +279,7 @@ impl GraphicsCaptureApiHandler for Handler {
                         g.gpu_active.store(false, Ordering::SeqCst);
                     }
                     self.gpu_vp = None;
+                    self.readback.reset();
                 }
                 Err(e) => {
                     return Err(format!("GPU VideoProcessor failed mid-recording: {e:#}").into());

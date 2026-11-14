@@ -310,7 +310,7 @@ impl App {
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }
                     State::Stopping { .. } => {
-                        status_capsule(ui, Tint::Blue, "✓  Сохранение...", None, None, None);
+                        status_capsule(ui, Tint::Blue, &format!("✓  {}", t!(TIP_REC_SAVING)), None, None, None);
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }
                     State::Idle => {

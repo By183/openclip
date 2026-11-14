@@ -395,8 +395,19 @@ pub fn make_sample_with(
         let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(len.max(1) as u32).context("MFCreateMemoryBuffer")?;
         let mut ptr: *mut u8 = std::ptr::null_mut();
         buffer.Lock(&mut ptr, None, None).context("Lock")?;
+
+        struct UnlockGuard<'a>(&'a IMFMediaBuffer);
+        impl Drop for UnlockGuard<'_> {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = self.0.Unlock();
+                }
+            }
+        }
+        let guard = UnlockGuard(&buffer);
         fill(std::slice::from_raw_parts_mut(ptr, len));
-        buffer.Unlock().context("Unlock")?;
+        drop(guard);
+
         buffer.SetCurrentLength(len as u32)?;
         let sample = MFCreateSample().context("MFCreateSample")?;
         sample.AddBuffer(&buffer)?;

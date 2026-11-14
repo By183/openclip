@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, InputCallbackInfo, Sample, SampleFormat, Stream, StreamConfig, I24};
 
@@ -33,16 +33,6 @@ const MAX_QUEUED_CHUNKS: usize = 512;
 /// packet end times on WASAPI.
 const MAX_CALLBACK_AGE: Duration = Duration::from_millis(250);
 
-#[allow(dead_code, clippy::large_enum_variant)]
-enum AudioBackendStream {
-    Cpal {
-        _stream: Stream,
-        _keepalive: Option<Stream>,
-    },
-    #[cfg(windows)]
-    Wasapi(wasapi::WasapiProcessLoopback),
-}
-
 /// An open input stream; drop to close. Not `Send` on every platform, so keep
 /// it on the thread that created it.
 pub struct AudioSource {
@@ -50,7 +40,8 @@ pub struct AudioSource {
     pub sample_rate: u32,
     pub channels: u16,
     pub queue: SharedQueue,
-    _backend: AudioBackendStream,
+    _stream: Stream,
+    _keepalive: Option<Stream>,
 }
 
 /// Names of available microphone / input devices.
@@ -108,26 +99,6 @@ pub fn open_system_loopback() -> Result<AudioSource> {
 
 /// Opens a loopback capture of `name`, or the default output device when `None`.
 pub fn open_system_loopback_device(name: Option<&str>) -> Result<AudioSource> {
-    #[cfg(windows)]
-    {
-        if name.is_none_or(|s| s.is_empty()) {
-            match wasapi::try_open_process_loopback() {
-                Ok(src) => {
-                    log::info!(
-                        "system audio capture: WASAPI process loopback active (excluding openclip pid {})",
-                        std::process::id()
-                    );
-                    return Ok(src);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "system audio capture: WASAPI process loopback unavailable ({e:#}); falling back to standard loopback"
-                    );
-                }
-            }
-        }
-    }
-
     let host = cpal::default_host();
     let device = match name.filter(|s| !s.is_empty()) {
         Some(n) => host
@@ -305,10 +276,8 @@ fn build(
         sample_rate: config.sample_rate,
         channels: config.channels,
         queue,
-        _backend: AudioBackendStream::Cpal {
-            _stream: stream,
-            _keepalive: keepalive,
-        },
+        _stream: stream,
+        _keepalive: keepalive,
     })
 }
 
@@ -325,320 +294,3 @@ fn promote_audio_thread() {
     }
 }
 
-#[cfg(windows)]
-mod wasapi {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread::JoinHandle;
-    use windows::core::{implement, Interface, HRESULT};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows::Win32::Media::Audio::*;
-    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-    use windows::Win32::System::Com::*;
-    use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
-
-    struct SendUnknown(windows::core::IUnknown);
-    unsafe impl Send for SendUnknown {}
-    unsafe impl Sync for SendUnknown {}
-
-    struct SendAudioWorker {
-        event: usize,
-        capture: usize,
-    }
-
-    const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
-
-    #[implement(IActivateAudioInterfaceCompletionHandler)]
-    struct ActivationHandler {
-        event: HANDLE,
-        result: Arc<Mutex<Option<windows::core::Result<SendUnknown>>>>,
-    }
-
-    impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
-        fn ActivateCompleted(
-            &self,
-            operation: windows_core::Ref<'_, IActivateAudioInterfaceAsyncOperation>,
-        ) -> windows::core::Result<()> {
-            let op = operation.ok()?;
-            let mut hr = HRESULT(0);
-            let mut unk = None;
-            unsafe {
-                op.GetActivateResult(&mut hr, &mut unk)?;
-            }
-            let res = if hr.is_ok() {
-                unk.map(SendUnknown).ok_or(windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
-            } else {
-                Err(windows::core::Error::from(hr))
-            };
-            *self.result.lock().unwrap() = Some(res);
-            unsafe {
-                let _ = SetEvent(self.event);
-            }
-            Ok(())
-        }
-    }
-
-    #[repr(C)]
-    struct WaveFormatExtensible {
-        format: WAVEFORMATEX,
-        samples: u16,
-        channel_mask: u32,
-        sub_format: windows::core::GUID,
-    }
-
-    pub struct WasapiProcessLoopback {
-        stop: Arc<AtomicBool>,
-        event: HANDLE,
-        worker: Option<JoinHandle<()>>,
-        client: IAudioClient,
-    }
-
-    unsafe impl Send for WasapiProcessLoopback {}
-
-    impl Drop for WasapiProcessLoopback {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::SeqCst);
-            unsafe {
-                let _ = SetEvent(self.event);
-            }
-            if let Some(w) = self.worker.take() {
-                let _ = w.join();
-            }
-            unsafe {
-                let _ = self.client.Stop();
-                let _ = CloseHandle(self.event);
-            }
-        }
-    }
-
-    pub fn try_open_process_loopback() -> Result<AudioSource> {
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-
-        let event = unsafe { CreateEventW(None, false, false, None)? };
-        let result = Arc::new(Mutex::new(None));
-        let handler = ActivationHandler {
-            event,
-            result: result.clone(),
-        };
-        let handler_interface: IActivateAudioInterfaceCompletionHandler = handler.into();
-
-        let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
-            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
-                ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-                    TargetProcessId: std::process::id(),
-                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-                },
-            },
-        };
-
-        let prop = PROPVARIANT {
-            Anonymous: windows::Win32::System::Com::StructuredStorage::PROPVARIANT_0 {
-                Anonymous: std::mem::ManuallyDrop::new(
-                    windows::Win32::System::Com::StructuredStorage::PROPVARIANT_0_0 {
-                        vt: windows::Win32::System::Variant::VT_BLOB,
-                        wReserved1: 0,
-                        wReserved2: 0,
-                        wReserved3: 0,
-                        Anonymous: windows::Win32::System::Com::StructuredStorage::PROPVARIANT_0_0_0 {
-                            blob: windows::Win32::System::Com::BLOB {
-                                cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                                pBlobData: &mut params as *mut _ as *mut u8,
-                            },
-                        },
-                    },
-                ),
-            },
-        };
-
-        let _op = unsafe {
-            ActivateAudioInterfaceAsync(
-                VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-                &IAudioClient::IID,
-                Some(&prop as *const _),
-                &handler_interface,
-            )
-        }
-        .map_err(|e| {
-            unsafe { let _ = CloseHandle(event); }
-            anyhow!("ActivateAudioInterfaceAsync failed: {e}")
-        })?;
-
-        // Forget prop so its Drop doesn't call PropVariantClear on non-CoTaskMemAlloc stack pointer
-        std::mem::forget(prop);
-
-        let wait_res = unsafe { WaitForSingleObject(event, 2000) };
-        if wait_res != WAIT_OBJECT_0 {
-            unsafe { let _ = CloseHandle(event); }
-            bail!("timed out waiting for process loopback audio interface activation");
-        }
-
-        let send_unknown = result
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| {
-                unsafe { let _ = CloseHandle(event); }
-                anyhow!("activation completed without result")
-            })?
-            .map_err(|e| {
-                unsafe { let _ = CloseHandle(event); }
-                anyhow!("activation result error: {e}")
-            })?;
-
-        let client: IAudioClient = send_unknown.0.cast().map_err(|e| {
-            unsafe { let _ = CloseHandle(event); }
-            anyhow!("cast to IAudioClient failed: {e}")
-        })?;
-
-        let sample_rate = 48000u32;
-        let channels = 2u16;
-        let ksd_subtype_ieee_float = windows::core::GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
-        let wf = WaveFormatExtensible {
-            format: WAVEFORMATEX {
-                wFormatTag: WAVE_FORMAT_EXTENSIBLE,
-                nChannels: channels,
-                nSamplesPerSec: sample_rate,
-                nAvgBytesPerSec: sample_rate * (channels as u32) * 4,
-                nBlockAlign: channels * 4,
-                wBitsPerSample: 32,
-                cbSize: 22,
-            },
-            samples: 32,
-            channel_mask: 0x3,
-            sub_format: ksd_subtype_ieee_float,
-        };
-
-        let sample_event = unsafe { CreateEventW(None, false, false, None)? };
-        let buffer_duration = 10_000_000i64; // 1 second buffer
-        let init_res = unsafe {
-            client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                buffer_duration,
-                0,
-                &wf as *const _ as *const _,
-                None,
-            )
-        };
-        if let Err(e) = init_res {
-            unsafe {
-                let _ = CloseHandle(sample_event);
-                let _ = CloseHandle(event);
-            }
-            bail!("IAudioClient::Initialize failed: {e}");
-        }
-
-        if let Err(e) = unsafe { client.SetEventHandle(sample_event) } {
-            unsafe {
-                let _ = CloseHandle(sample_event);
-                let _ = CloseHandle(event);
-            }
-            bail!("IAudioClient::SetEventHandle failed: {e}");
-        }
-
-        let capture_client: IAudioCaptureClient = match unsafe { client.GetService() } {
-            Ok(c) => c,
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(sample_event);
-                    let _ = CloseHandle(event);
-                }
-                bail!("IAudioClient::GetService<IAudioCaptureClient> failed: {e}");
-            }
-        };
-
-        if let Err(e) = unsafe { client.Start() } {
-            unsafe {
-                let _ = CloseHandle(sample_event);
-                let _ = CloseHandle(event);
-            }
-            bail!("IAudioClient::Start failed: {e}");
-        }
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
-        let queue: SharedQueue = Arc::new(Mutex::new(Queue::default()));
-        let queue_clone = queue.clone();
-        let worker_args = SendAudioWorker {
-            event: sample_event.0 as usize,
-            capture: unsafe { std::mem::transmute_copy(&capture_client) },
-        };
-        // Suppress Drop of capture_client here since ownership was transferred to worker thread
-        std::mem::forget(capture_client);
-
-        let worker = std::thread::Builder::new()
-            .name("wasapi-process-loopback".into())
-            .spawn(move || {
-                let sample_event = HANDLE(worker_args.event as *mut std::ffi::c_void);
-                let capture_client: IAudioCaptureClient = unsafe { std::mem::transmute_copy(&worker_args.capture) };
-                promote_audio_thread();
-                while !stop_clone.load(Ordering::Relaxed) {
-                    let wr = unsafe { WaitForSingleObject(sample_event, 50) };
-                    if stop_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if wr == WAIT_OBJECT_0 || wr == WAIT_TIMEOUT {
-                        loop {
-                            let mut p_data = std::ptr::null_mut();
-                            let mut num_frames = 0u32;
-                            let mut flags = 0u32;
-                            let mut dev_pos = 0u64;
-                            let mut qpc_pos = 0u64;
-                            let hr = unsafe {
-                                capture_client.GetBuffer(
-                                    &mut p_data,
-                                    &mut num_frames,
-                                    &mut flags,
-                                    Some(&mut dev_pos),
-                                    Some(&mut qpc_pos),
-                                )
-                            };
-                            if hr.is_err() || num_frames == 0 {
-                                break;
-                            }
-                            let is_silent = (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0;
-                            let total_floats = (num_frames as usize) * 2;
-                            let data = if is_silent {
-                                vec![0.0f32; total_floats]
-                            } else {
-                                let slice = unsafe { std::slice::from_raw_parts(p_data as *const f32, total_floats) };
-                                slice.to_vec()
-                            };
-                            unsafe {
-                                let _ = capture_client.ReleaseBuffer(num_frames);
-                            }
-                            let at = Instant::now();
-                            let mut q = queue_clone.lock().unwrap();
-                            if q.chunks.len() >= MAX_QUEUED_CHUNKS {
-                                q.chunks.pop_front();
-                                q.overflow += 1;
-                            }
-                            q.chunks.push_back(Chunk { at, data });
-                        }
-                    }
-                }
-            })
-            .ok();
-
-        unsafe {
-            let _ = CloseHandle(event);
-        }
-
-        let loopback = WasapiProcessLoopback {
-            stop,
-            event: sample_event,
-            worker,
-            client,
-        };
-
-        Ok(AudioSource {
-            name: "WASAPI Process Loopback".into(),
-            sample_rate,
-            channels,
-            queue,
-            _backend: AudioBackendStream::Wasapi(loopback),
-        })
-    }
-}

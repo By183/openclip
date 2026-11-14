@@ -831,19 +831,21 @@ impl App {
     }
 
     fn stop_recording(&mut self) {
-        if let State::Recording(rec) = std::mem::replace(&mut self.state, State::Idle) {
-            let sound = self.hotkey.sound;
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let res = rec.stop_with_feedback(|| {
-                    if sound {
-                        crate::hotkey::play_feedback_sound_sync(false);
-                    }
-                });
-                let _ = tx.send(res);
-            });
-            self.state = State::Stopping { rx };
+        if !matches!(self.state, State::Recording(_)) {
+            return;
         }
+        let State::Recording(rec) = std::mem::replace(&mut self.state, State::Idle) else { return };
+        let sound = self.hotkey.sound;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = rec.stop_with_feedback(|| {
+                if sound {
+                    crate::hotkey::play_feedback_sound_sync(false);
+                }
+            });
+            let _ = tx.send(res);
+        });
+        self.state = State::Stopping { rx };
     }
 
     fn poll_state_transition(&mut self, ctx: &egui::Context) {
@@ -1008,7 +1010,8 @@ impl App {
 
     pub(super) fn rec_mode(&self) -> RecMode {
         match &self.state {
-            State::Recording(_) | State::Starting { .. } | State::Stopping { .. } => RecMode::Recording,
+            State::Stopping { .. } => RecMode::Stopping,
+            State::Recording(_) | State::Starting { .. } => RecMode::Recording,
             State::Countdown { .. } => RecMode::Countdown(self.countdown_remaining().unwrap_or(0)),
             _ => RecMode::Idle,
         }
@@ -2527,8 +2530,14 @@ impl eframe::App for App {
         self.disarm_game_mode();
         self.save_settings();
         self.live.stop();
-        if let State::Recording(rec) = std::mem::replace(&mut self.state, State::Idle) {
-            let _ = rec.stop();
+        match std::mem::replace(&mut self.state, State::Idle) {
+            State::Recording(rec) => {
+                let _ = rec.stop();
+            }
+            State::Stopping { rx } => {
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+            }
+            _ => {}
         }
     }
 }

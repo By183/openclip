@@ -416,6 +416,7 @@ pub enum RecMode {
     /// Seconds left before recording starts.
     Countdown(u32),
     Recording,
+    Stopping,
 }
 
 pub fn rec_button(ui: &mut Ui, mode: RecMode, enabled: bool) -> RecClick {
@@ -428,10 +429,11 @@ pub fn rec_button_sized(ui: &mut Ui, mode: RecMode, enabled: bool, size: f32) ->
     let r = size / 2.0;
     let p = ui.painter();
     let active = mode != RecMode::Idle;
-    let usable = enabled || active;
+    let usable = (enabled || active) && mode != RecMode::Stopping;
     let hovered = resp.hovered() && usable;
     let ring = match mode {
         RecMode::Countdown(_) => ORANGE,
+        RecMode::Stopping => BLUE,
         _ if usable => LABEL,
         _ => LABEL_3,
     };
@@ -443,6 +445,14 @@ pub fn rec_button_sized(ui: &mut Ui, mode: RecMode, enabled: bool, size: f32) ->
                 Rect::from_center_size(center, Vec2::splat(side)),
                 CornerRadius::same((side / 4.0) as u8),
                 if hovered { RED_HOVER } else { RED },
+            );
+        }
+        RecMode::Stopping => {
+            let side = size * 0.36;
+            p.rect_filled(
+                Rect::from_center_size(center, Vec2::splat(side)),
+                CornerRadius::same((side / 4.0) as u8),
+                BLUE,
             );
         }
         RecMode::Countdown(left) => {
@@ -462,6 +472,7 @@ pub fn rec_button_sized(ui: &mut Ui, mode: RecMode, enabled: bool, size: f32) ->
     }
     let resp = resp.on_hover_text(match mode {
         RecMode::Recording => t!(TIP_REC_STOP),
+        RecMode::Stopping => t!(TIP_REC_SAVING),
         RecMode::Countdown(_) => t!(TIP_REC_CANCEL),
         RecMode::Idle => t!(TIP_REC_START),
     });
@@ -470,6 +481,7 @@ pub fn rec_button_sized(ui: &mut Ui, mode: RecMode, enabled: bool, size: f32) ->
     } else {
         match mode {
             RecMode::Recording => RecClick::Stop,
+            RecMode::Stopping => RecClick::None,
             RecMode::Countdown(_) => RecClick::Cancel,
             RecMode::Idle if enabled => RecClick::Start,
             RecMode::Idle => RecClick::None,

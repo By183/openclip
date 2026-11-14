@@ -206,7 +206,11 @@ pub fn play_feedback_sound_sync(starting: bool) {
             STOP_WAV.get_or_init(|| generate_feedback_wav(&[(750, 180)]))
         };
 
-        // SAFETY: wav is static / leaked and valid for the duration of PlaySoundW.
+        // SAFETY: `PCWSTR` expects a pointer to 16-bit characters, but when `SND_MEMORY` is passed,
+        // the Windows Multimedia API reinterprets `pszSound` as a pointer to the in-memory RIFF WAV
+        // data (`const void*`). In Rust's `windows` crate, `PCWSTR` is a wrapper around `*const u16`.
+        // Rust heap allocations (`Vec<u8>`) are aligned to at least `align_of::<u8>()` (and in practice >= 8 bytes),
+        // and RIFF headers only require byte alignment. The static buffer outlives the synchronous playback.
         let ok = unsafe {
             PlaySoundW(
                 PCWSTR(wav.as_ptr() as *const u16),
@@ -353,11 +357,22 @@ fn run_hotkey_worker(
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        PeekMessageW, RegisterClassExW, SetWindowsHookExW,
-        TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, PEEK_MESSAGE_REMOVE_TYPE,
-        WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_HOTKEY, WM_KEYDOWN, WM_SYSKEYDOWN,
-        WNDCLASSEXW,
+        MsgWaitForMultipleObjectsEx, PeekMessageW, RegisterClassExW, SetWindowsHookExW,
+        TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MWMO_INPUTAVAILABLE,
+        PEEK_MESSAGE_REMOVE_TYPE, QS_ALLINPUT, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_HOTKEY, WM_KEYDOWN, WM_SYSKEYDOWN, WNDCLASSEXW,
     };
+
+    struct HookGuard(Option<HHOOK>);
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                unsafe {
+                    let _ = UnhookWindowsHookEx(h);
+                }
+            }
+        }
+    }
 
     const HOTKEY_ID: i32 = 0x4F43; // "OC" (OpenClip)
 
@@ -456,9 +471,11 @@ fn run_hotkey_worker(
     .unwrap_or(HWND::default());
 
     // Install low-level hook as fallback for exclusive fullscreen games
-    let hook: Option<HHOOK> = unsafe {
+    let hook_raw: Option<HHOOK> = unsafe {
         SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), None, 0).ok()
     };
+    let has_hook = hook_raw.is_some();
+    let _hook_guard = HookGuard(hook_raw);
 
     let mut current_cfg = initial;
 
@@ -505,7 +522,7 @@ fn run_hotkey_worker(
                     "RegisterHotKey failed for '{}' (conflict with another application); using low-level keyboard hook fallback",
                     cfg.display_string()
                 );
-                *st.lock().unwrap() = if hook.is_some() {
+                *st.lock().unwrap() = if has_hook {
                     HotkeyStatus::HookFallback
                 } else {
                     HotkeyStatus::Conflict(cfg.vk)
@@ -529,7 +546,7 @@ fn run_hotkey_worker(
             }
         }
 
-        // Peek with 10 ms sleep or GetMessage
+        // Dispatch all queued messages
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PEEK_MESSAGE_REMOVE_TYPE(1)).as_bool() {
                 if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_ID {
@@ -545,14 +562,15 @@ fn run_hotkey_worker(
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        // Sleep-free wait: wake up immediately when any window message or input arrives,
+        // or timeout after 50 ms to check for WorkerCmd.
+        unsafe {
+            let _ = MsgWaitForMultipleObjectsEx(None, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
     }
 
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-        if let Some(h) = hook {
-            let _ = UnhookWindowsHookEx(h);
-        }
         if !hwnd.is_invalid() {
             let _ = DestroyWindow(hwnd);
         }
