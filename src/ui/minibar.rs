@@ -305,6 +305,14 @@ impl App {
                         status_capsule(ui, Tint::Orange, &t!(BAR_STARTING_IN, left), None, None, Some(t!(BAR_ESC_CANCELS)));
                         ctx.request_repaint_after(Duration::from_millis(100));
                     }
+                    State::Starting { .. } => {
+                        status_capsule(ui, Tint::Orange, "●  00:00:00", Some(timer_w), None, None);
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    }
+                    State::Stopping { .. } => {
+                        status_capsule(ui, Tint::Blue, "✓  Сохранение...", None, None, None);
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    }
                     State::Idle => {
                         // The latest message (saved file / error) takes over the capsule for a few seconds.
                         let toast = match (&self.message, self.message_at) {

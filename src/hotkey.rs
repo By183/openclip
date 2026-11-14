@@ -125,25 +125,125 @@ pub fn vk_to_name(vk: u32) -> String {
     }
 }
 
-/// Plays audio feedback for global recording actions.
+/// Generates a valid in-memory RIFF PCM WAV buffer for tone playback.
+pub fn generate_feedback_wav(tones: &[(u32, u32)]) -> Vec<u8> {
+    let sample_rate = 44100u32;
+    let mut pcm_samples: Vec<i16> = Vec::new();
+
+    for &(freq_hz, duration_ms) in tones {
+        let count = ((sample_rate as u64 * duration_ms as u64) / 1000) as usize;
+        if count == 0 {
+            continue;
+        }
+        if freq_hz == 0 {
+            pcm_samples.resize(pcm_samples.len() + count, 0);
+        } else {
+            let fade_len = (sample_rate as usize * 5 / 1000).min(count / 2); // 5 ms fade
+            let amp = 14000.0f32; // ~42% peak volume to prevent clipping
+            let two_pi = 2.0 * std::f32::consts::PI;
+            for i in 0..count {
+                let t = i as f32 / sample_rate as f32;
+                let mut env = 1.0f32;
+                if fade_len > 0 {
+                    if i < fade_len {
+                        env = i as f32 / fade_len as f32;
+                    } else if i >= count - fade_len {
+                        env = (count - i) as f32 / fade_len as f32;
+                    }
+                }
+                let sample = (t * freq_hz as f32 * two_pi).sin() * amp * env;
+                pcm_samples.push(sample.clamp(-32768.0, 32767.0) as i16);
+            }
+        }
+    }
+
+    let data_len = (pcm_samples.len() * 2) as u32;
+    let file_len = 36 + data_len;
+    let mut wav = Vec::with_capacity(44 + pcm_samples.len() * 2);
+
+    // RIFF chunk
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&file_len.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+
+    // fmt subchunk
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // subchunk1 size (16 for PCM)
+    wav.extend_from_slice(&1u16.to_le_bytes());  // audio format (1 = PCM)
+    wav.extend_from_slice(&1u16.to_le_bytes());  // 1 channel (mono)
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * 2; // sample_rate * channels * 2 bytes
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());  // block align (channels * 2)
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+    // data subchunk
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for s in pcm_samples {
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+
+    wav
+}
+
+#[cfg(windows)]
+static START_WAV: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+#[cfg(windows)]
+static STOP_WAV: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Plays audio feedback synchronously on the calling thread.
+/// Plays via `PlaySoundW` inside the process so process loopback exclusion can filter it.
+pub fn play_feedback_sound_sync(starting: bool) {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC};
+
+        let wav = if starting {
+            START_WAV.get_or_init(|| generate_feedback_wav(&[(1000, 90), (0, 30), (1500, 120)]))
+        } else {
+            STOP_WAV.get_or_init(|| generate_feedback_wav(&[(750, 180)]))
+        };
+
+        // SAFETY: wav is static / leaked and valid for the duration of PlaySoundW.
+        let ok = unsafe {
+            PlaySoundW(
+                PCWSTR(wav.as_ptr() as *const u16),
+                None,
+                SND_MEMORY | SND_SYNC | SND_NODEFAULT,
+            )
+            .as_bool()
+        };
+
+        if !ok {
+            // Kernel beep fallback if PlaySoundW fails
+            use windows::Win32::System::Diagnostics::Debug::Beep;
+            if starting {
+                unsafe {
+                    let _ = Beep(1000, 90);
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    let _ = Beep(1500, 120);
+                }
+            } else {
+                unsafe {
+                    let _ = Beep(750, 180);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = starting;
+}
+
+/// Plays audio feedback for global recording actions asynchronously.
 pub fn play_feedback_sound(starting: bool) {
     #[cfg(windows)]
     std::thread::spawn(move || {
-        use windows::Win32::System::Diagnostics::Debug::Beep;
-        if starting {
-            // High double beep for start
-            unsafe {
-                let _ = Beep(1000, 100);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                let _ = Beep(1500, 150);
-            }
-        } else {
-            // Lower tone for stop
-            unsafe {
-                let _ = Beep(800, 200);
-            }
-        }
+        play_feedback_sound_sync(starting);
     });
+    #[cfg(not(windows))]
+    let _ = starting;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,6 +606,23 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
         assert_eq!(mgr.status(), HotkeyStatus::Disabled);
+    }
+
+    #[test]
+    fn feedback_wav_generation_and_header() {
+        let wav = generate_feedback_wav(&[(1000, 100), (0, 20), (1500, 100)]);
+        assert!(wav.len() > 44);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(&wav[36..40], b"data");
+        let data_len = u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize;
+        assert_eq!(wav.len(), 44 + data_len);
+
+        // Ensure stop wav also generates valid header
+        let stop_wav = generate_feedback_wav(&[(750, 180)]);
+        assert!(stop_wav.len() > 44);
+        assert_eq!(&stop_wav[0..4], b"RIFF");
     }
 }
 

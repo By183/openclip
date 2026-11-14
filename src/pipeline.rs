@@ -633,8 +633,9 @@ impl Recorder {
         self.encode_thread.as_ref().map(|t| t.is_finished()).unwrap_or(true)
     }
 
-    /// Stops recording and finalizes the file.
-    pub fn stop(mut self) -> Result<PathBuf> {
+    /// Completely stops screen capture and audio capture threads, locking the recording stop pts.
+    /// Audio streams are closed and joined. Encode thread remains running to finish draining frames.
+    pub fn stop_capture_and_audio(&mut self) {
         self.resume();
         self.stats.stop_pts.set(self.recording_now());
         self.stop.store(true, Ordering::SeqCst);
@@ -650,6 +651,13 @@ impl Recorder {
                 _ => {}
             }
         }
+    }
+
+    /// Stops capture and audio, invokes `on_audio_stopped` (e.g. to play stop feedback tone),
+    /// and then joins the encode thread to finalize the container.
+    pub fn stop_with_feedback<F: FnOnce()>(mut self, on_audio_stopped: F) -> Result<PathBuf> {
+        self.stop_capture_and_audio();
+        on_audio_stopped();
         if let Some(t) = self.encode_thread.take() {
             match t.join() {
                 Ok(Ok(())) => {}
@@ -662,17 +670,16 @@ impl Recorder {
         }
         Ok(self.output.clone())
     }
+
+    /// Stops recording and finalizes the file.
+    pub fn stop(self) -> Result<PathBuf> {
+        self.stop_with_feedback(|| {})
+    }
 }
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(c) = self.capture.take() {
-            let _ = c.stop();
-        }
-        if let Some(t) = self.audio_thread.take() {
-            let _ = t.join();
-        }
+        self.stop_capture_and_audio();
         if let Some(t) = self.encode_thread.take() {
             let _ = t.join();
         }

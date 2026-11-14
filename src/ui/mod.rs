@@ -16,7 +16,8 @@ mod widgets;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{
@@ -134,9 +135,13 @@ enum GeneralTab {
 enum State {
     Idle,
     Picking(Picker),
+    /// Start feedback sound is playing; recording launches when playback completes.
+    Starting { rx: Receiver<()> },
     /// REC was pressed; recording starts when the countdown ends.
     Countdown { started: Instant },
     Recording(Recorder),
+    /// Audio capture stopped, stop sound playing / MP4 finalizing.
+    Stopping { rx: Receiver<anyhow::Result<PathBuf>> },
 }
 
 /// Live low-frame-rate capture of the selected source shown on the Preview
@@ -665,7 +670,10 @@ impl App {
     }
 
     fn is_recording(&self) -> bool {
-        matches!(self.state, State::Recording(_))
+        matches!(
+            self.state,
+            State::Recording(_) | State::Starting { .. } | State::Stopping { .. }
+        )
     }
 
     fn show_preview_tab(&mut self) {
@@ -694,8 +702,25 @@ impl App {
             self.message = Some((t!(MSG_SELECT_SOURCE_FIRST).into(), true));
             return;
         }
-        if self.countdown_enabled && self.countdown_secs > 0 && !self.is_recording() {
+        if self.is_recording() {
+            return;
+        }
+        if self.countdown_enabled && self.countdown_secs > 0 {
+            if self.hotkey.sound {
+                crate::hotkey::play_feedback_sound(true);
+            }
             self.state = State::Countdown { started: Instant::now() };
+            self.message = None;
+            ctx.request_repaint();
+            return;
+        }
+        if self.hotkey.sound {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                crate::hotkey::play_feedback_sound_sync(true);
+                let _ = tx.send(());
+            });
+            self.state = State::Starting { rx };
             self.message = None;
             ctx.request_repaint();
             return;
@@ -707,9 +732,6 @@ impl App {
     fn handle_global_hotkey(&mut self, ctx: &egui::Context) {
         match &self.state {
             State::Idle => {
-                if self.hotkey.sound {
-                    crate::hotkey::play_feedback_sound(true);
-                }
                 self.start_recording(ctx);
             }
             State::Countdown { .. } => {
@@ -721,13 +743,12 @@ impl App {
                 ctx.request_repaint();
             }
             State::Recording(_) => {
-                if self.hotkey.sound {
-                    crate::hotkey::play_feedback_sound(false);
-                }
                 self.stop_recording();
                 ctx.request_repaint();
             }
-            State::Picking(_) => {}
+            State::Starting { .. } | State::Stopping { .. } | State::Picking(_) => {
+                // Debounce: ignore repeated presses while starting or stopping
+            }
         }
     }
 
@@ -811,10 +832,42 @@ impl App {
 
     fn stop_recording(&mut self) {
         if let State::Recording(rec) = std::mem::replace(&mut self.state, State::Idle) {
-            match rec.stop() {
-                Ok(path) => self.saved(path, t!(WHAT_RECORDING)),
-                Err(e) => self.message = Some((t!(MSG_RECORDING_FAILED, format!("{e:#}")), true)),
+            let sound = self.hotkey.sound;
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let res = rec.stop_with_feedback(|| {
+                    if sound {
+                        crate::hotkey::play_feedback_sound_sync(false);
+                    }
+                });
+                let _ = tx.send(res);
+            });
+            self.state = State::Stopping { rx };
+        }
+    }
+
+    fn poll_state_transition(&mut self, ctx: &egui::Context) {
+        match &mut self.state {
+            State::Starting { rx } => {
+                if rx.try_recv().is_ok() {
+                    self.start_recording_now(ctx);
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                }
             }
+            State::Stopping { rx } => {
+                if let Ok(res) = rx.try_recv() {
+                    self.state = State::Idle;
+                    match res {
+                        Ok(path) => self.saved(path, t!(WHAT_RECORDING)),
+                        Err(e) => self.message = Some((t!(MSG_RECORDING_FAILED, format!("{e:#}")), true)),
+                    }
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -883,7 +936,7 @@ impl App {
                     self.live.stop();
                 }
             }
-            State::Picking(_) => {}
+            State::Picking(_) | State::Starting { .. } | State::Stopping { .. } => {}
         }
     }
 
@@ -955,7 +1008,7 @@ impl App {
 
     pub(super) fn rec_mode(&self) -> RecMode {
         match &self.state {
-            State::Recording(_) => RecMode::Recording,
+            State::Recording(_) | State::Starting { .. } | State::Stopping { .. } => RecMode::Recording,
             State::Countdown { .. } => RecMode::Countdown(self.countdown_remaining().unwrap_or(0)),
             _ => RecMode::Idle,
         }
@@ -1292,6 +1345,15 @@ impl App {
                     status_capsule(ui, Tint::Orange, &t!(BAR_STARTING_IN, left), None, None, None);
                     ui.label(secondary(t!(COUNTDOWN_ESC)));
                     ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                State::Starting { .. } => {
+                    status_capsule(ui, Tint::Orange, "●  00:00:00", None, None, None);
+                    ui.label(secondary("00:00:00"));
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                }
+                State::Stopping { .. } => {
+                    status_capsule(ui, Tint::Blue, "✓  Сохранение...", None, None, None);
+                    ctx.request_repaint_after(Duration::from_millis(16));
                 }
                 State::Idle => {
                     let ready = self.selected_source().is_some();
@@ -2383,6 +2445,7 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         self.tick_countdown(&ctx);
+        self.poll_state_transition(&ctx);
         self.poll_game(&ctx);
         self.poll_preview(&ctx);
         self.track_message();

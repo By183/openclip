@@ -135,7 +135,7 @@ impl App {
     fn frame_color(&self) -> Color32 {
         match &self.state {
             State::Recording(r) if r.is_paused() => ORANGE,
-            State::Recording(_) => RED,
+            State::Recording(_) | State::Starting { .. } | State::Stopping { .. } => RED,
             _ => REGION,
         }
     }
