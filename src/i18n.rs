@@ -317,6 +317,17 @@ strings! {
         "Redă un ton scurt la pornirea sau oprirea înregistrării",
         "Воспроизводить короткий сигнал при старте и остановке",
         "Відтворювати короткий сигнал при старті та зупинці";
+    ROW_SOUND_FEEDBACK => "Sound signal on start / stop",
+        "Semnal sonor la pornire / oprire",
+        "Звуковой сигнал при старте и остановке",
+        "Звуковий сигнал при старті та зупинці";
+    SOUND_FEEDBACK_OFF => "Off", "Oprit", "Выкл", "Вимк";
+    SOUND_FEEDBACK_HOTKEY_ONLY => "Hotkey only", "Doar comandă rapidă", "Только горячая клавиша", "Лише гаряча клавіша";
+    SOUND_FEEDBACK_ALWAYS => "Always", "Întotdeauna", "Всегда", "Завжди";
+    SOUND_FEEDBACK_NOTE => "Play an audible confirmation tone when recording starts and stops",
+        "Redă un semnal sonor de confirmare la pornirea și oprirea înregistrării",
+        "Воспроизводить звуковое подтверждение при старте и остановке записи",
+        "Відтворювати звукове підтвердження при старті та зупинці запису";
     HOTKEY_STATUS_CONFLICT => "Shortcut is in use by another app ({0})",
         "Comanda rapidă este utilizată de altă aplicație ({0})",
         "Комбинация занята другим приложением ({0})",

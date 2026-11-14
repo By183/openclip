@@ -631,6 +631,38 @@ fn default_screenshot_hotkey() -> crate::hotkey::HotkeyConfig {
     crate::hotkey::HotkeyConfig::screenshot_default()
 }
 
+/// Sound feedback mode when starting and stopping recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SoundFeedback {
+    /// Never play a sound signal. Recording starts immediately without delay.
+    Off,
+    /// Play a sound signal only when triggered by global hotkey.
+    #[default]
+    HotkeyOnly,
+    /// Play a sound signal on any trigger (hotkey, UI button, minibar, countdown).
+    Always,
+}
+
+impl SoundFeedback {
+    pub const ALL: [SoundFeedback; 3] = [SoundFeedback::Off, SoundFeedback::HotkeyOnly, SoundFeedback::Always];
+
+    pub fn is_enabled_for_hotkey(self) -> bool {
+        matches!(self, SoundFeedback::HotkeyOnly | SoundFeedback::Always)
+    }
+
+    pub fn is_enabled_for_button(self) -> bool {
+        matches!(self, SoundFeedback::Always)
+    }
+
+    pub fn is_enabled_for_source(self, from_hotkey: bool) -> bool {
+        if from_hotkey {
+            self.is_enabled_for_hotkey()
+        } else {
+            self.is_enabled_for_button()
+        }
+    }
+}
+
 /// Root of `settings.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -671,6 +703,9 @@ pub struct Settings {
     /// Color conversion path (`Auto` / `Gpu` / `Cpu`).
     #[serde(default)]
     pub color_conversion: ColorConversion,
+    /// Sound signal on start and stop recording.
+    #[serde(default)]
+    pub sound_feedback: SoundFeedback,
     /// Global hotkey for starting / stopping recording.
     #[serde(default)]
     pub hotkey: crate::hotkey::HotkeyConfig,
@@ -711,6 +746,7 @@ impl Default for Settings {
             countdown_enabled: true,
             countdown_secs: 3,
             color_conversion: ColorConversion::default(),
+            sound_feedback: SoundFeedback::default(),
             hotkey: crate::hotkey::HotkeyConfig::default(),
             screenshot_hotkey: crate::hotkey::HotkeyConfig::screenshot_default(),
             region_capture_on_screenshot: false,
@@ -783,6 +819,22 @@ impl Settings {
         settings
     }
 
+    /// Parses settings from a JSON string, ensuring backward compatibility with legacy fields.
+    pub fn parse_from_str(json: &str) -> Result<Settings, serde_json::Error> {
+        let val: serde_json::Value = serde_json::from_str(json)?;
+        let has_sound_feedback = val.get("sound_feedback").is_some();
+        let mut s: Settings = serde_json::from_value(val)?;
+        if !has_sound_feedback {
+            s.sound_feedback = if s.hotkey.sound {
+                SoundFeedback::HotkeyOnly
+            } else {
+                SoundFeedback::Off
+            };
+        }
+        s.normalize_fields();
+        Ok(s)
+    }
+
     fn load_raw() -> Settings {
         let Some(path) = Self::path() else { return Settings::default() };
         let mut candidates = vec![path];
@@ -792,12 +844,9 @@ impl Settings {
             candidates.push(legacy);
         }
         for path in candidates {
-            match std::fs::read(&path) {
-                Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
-                    // Format codec normalization runs once the app enumerates
-                    // encoders, while standalone fields are clamped right away.
-                    Ok(mut s) => {
-                        s.normalize_fields();
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match Self::parse_from_str(&content) {
+                    Ok(s) => {
                         log::info!("settings loaded from {}", path.display());
                         return s;
                     }
@@ -822,7 +871,9 @@ impl Settings {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(self)?;
+        let mut to_save = self.clone();
+        to_save.hotkey.sound = to_save.sound_feedback.is_enabled_for_hotkey();
+        let json = serde_json::to_string_pretty(&to_save)?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &path)?;
@@ -1044,5 +1095,46 @@ mod tests {
         assert_eq!(clamped.mic_volume, 200);
         assert_eq!(clamped.audio_track_mode, AudioTrackMode::Separate);
         assert_eq!(clamped.color_conversion, ColorConversion::Cpu);
+    }
+
+    #[test]
+    fn sound_feedback_modes_and_source_checks() {
+        assert_eq!(SoundFeedback::default(), SoundFeedback::HotkeyOnly);
+
+        // Off
+        assert!(!SoundFeedback::Off.is_enabled_for_hotkey());
+        assert!(!SoundFeedback::Off.is_enabled_for_button());
+        assert!(!SoundFeedback::Off.is_enabled_for_source(true));
+        assert!(!SoundFeedback::Off.is_enabled_for_source(false));
+
+        // HotkeyOnly
+        assert!(SoundFeedback::HotkeyOnly.is_enabled_for_hotkey());
+        assert!(!SoundFeedback::HotkeyOnly.is_enabled_for_button());
+        assert!(SoundFeedback::HotkeyOnly.is_enabled_for_source(true));
+        assert!(!SoundFeedback::HotkeyOnly.is_enabled_for_source(false));
+
+        // Always
+        assert!(SoundFeedback::Always.is_enabled_for_hotkey());
+        assert!(SoundFeedback::Always.is_enabled_for_button());
+        assert!(SoundFeedback::Always.is_enabled_for_source(true));
+        assert!(SoundFeedback::Always.is_enabled_for_source(false));
+    }
+
+    #[test]
+    fn sound_feedback_legacy_migration() {
+        // Legacy file with hotkey.sound = true and no sound_feedback field -> HotkeyOnly
+        let s_true = Settings::parse_from_str(r#"{"hotkey":{"sound":true}}"#).unwrap();
+        assert_eq!(s_true.sound_feedback, SoundFeedback::HotkeyOnly);
+
+        // Legacy file with hotkey.sound = false and no sound_feedback field -> Off
+        let s_false = Settings::parse_from_str(r#"{"hotkey":{"sound":false}}"#).unwrap();
+        assert_eq!(s_false.sound_feedback, SoundFeedback::Off);
+
+        // Explicit sound_feedback overrides legacy hotkey.sound
+        let s_always = Settings::parse_from_str(r#"{"hotkey":{"sound":false},"sound_feedback":"Always"}"#).unwrap();
+        assert_eq!(s_always.sound_feedback, SoundFeedback::Always);
+
+        let s_off = Settings::parse_from_str(r#"{"hotkey":{"sound":true},"sound_feedback":"Off"}"#).unwrap();
+        assert_eq!(s_off.sound_feedback, SoundFeedback::Off);
     }
 }

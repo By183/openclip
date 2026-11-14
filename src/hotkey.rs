@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HotkeyConfig {
     pub enabled: bool,
     pub ctrl: bool,

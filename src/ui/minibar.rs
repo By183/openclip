@@ -272,9 +272,9 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let can_record = self.selected_source().is_some();
                 match rec_button_sized(ui, self.rec_mode(), can_record, 52.0) {
-                    RecClick::Start => self.start_recording(ctx),
-                    RecClick::Stop => self.stop_recording(),
-                    RecClick::Cancel => self.cancel_countdown(),
+                    RecClick::Start => self.start_recording(ctx, false),
+                    RecClick::Stop => self.stop_recording(false),
+                    RecClick::Cancel => self.cancel_countdown(false),
                     RecClick::None => {}
                 }
                 if pause_button(ui, recording, paused) {
@@ -292,7 +292,7 @@ impl App {
                         let text = format!("{glyph}  {}", format_duration(elapsed));
                         status_capsule(ui, tint, &text, Some(timer_w), None, Some(&human_bytes(bytes)));
                         if s.error().is_some() || rec.is_finished() {
-                            self.stop_recording();
+                            self.stop_recording(false);
                         } else {
                             ctx.request_repaint_after(Duration::from_millis(250));
                         }

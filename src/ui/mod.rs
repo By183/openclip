@@ -33,7 +33,9 @@ use crate::capture::monitors::{
 use crate::capture::{self as cap, CaptureConfig, CaptureHandle, Rect, Source};
 use crate::i18n::{self, Lang};
 use crate::pipeline::{RecordConfig, Recorder, Stats};
-use crate::settings::{AudioTrackMode, BitratePreset, ColorConversion, FormatSettings, Settings};
+use crate::settings::{
+    AudioTrackMode, BitratePreset, ColorConversion, FormatSettings, Settings, SoundFeedback,
+};
 use crate::t;
 use crate::video::encoder::{available_encoders, refresh_encoders, EncoderInfo};
 use crate::video::mouse_fx::{MouseFx, MouseSampler, ARROW, CLICK_DURATION};
@@ -302,6 +304,7 @@ pub struct App {
     countdown_enabled: bool,
     countdown_secs: u32,
     color_conversion: ColorConversion,
+    pub(super) sound_feedback: SoundFeedback,
     hotkey: crate::hotkey::HotkeyConfig,
     screenshot_hotkey: crate::hotkey::HotkeyConfig,
     hotkey_manager: crate::hotkey::HotkeyManager,
@@ -437,6 +440,7 @@ impl App {
             countdown_enabled: settings.countdown_enabled,
             countdown_secs: settings.countdown_secs.clamp(1, 10),
             color_conversion: settings.color_conversion,
+            sound_feedback: settings.sound_feedback,
             hotkey: settings.hotkey,
             screenshot_hotkey: settings.screenshot_hotkey,
             hotkey_manager: crate::hotkey::HotkeyManager::with_screenshot(
@@ -550,7 +554,12 @@ impl App {
             countdown_enabled: self.countdown_enabled,
             countdown_secs: self.countdown_secs,
             color_conversion: self.color_conversion,
-            hotkey: self.hotkey,
+            sound_feedback: self.sound_feedback,
+            hotkey: {
+                let mut h = self.hotkey;
+                h.sound = self.sound_feedback.is_enabled_for_hotkey();
+                h
+            },
             screenshot_hotkey: self.screenshot_hotkey,
             region_capture_on_screenshot: self.region_capture_on_screenshot,
             annotate_screenshot: self.annotate_screenshot,
@@ -717,7 +726,7 @@ impl App {
     }
 
     /// REC pressed: count down first (if enabled), then start.
-    fn start_recording(&mut self, ctx: &egui::Context) {
+    fn start_recording(&mut self, ctx: &egui::Context, from_hotkey: bool) {
         if self.selected_source().is_none() {
             self.message = Some((t!(MSG_SELECT_SOURCE_FIRST).into(), true));
             return;
@@ -725,8 +734,9 @@ impl App {
         if self.is_recording() {
             return;
         }
+        let should_play = self.sound_feedback.is_enabled_for_source(from_hotkey);
         if self.countdown_enabled && self.countdown_secs > 0 {
-            if self.hotkey.sound {
+            if should_play {
                 crate::hotkey::play_feedback_sound(true);
             }
             self.state = State::Countdown { started: Instant::now() };
@@ -734,7 +744,7 @@ impl App {
             ctx.request_repaint();
             return;
         }
-        if self.hotkey.sound {
+        if should_play {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 crate::hotkey::play_feedback_sound_sync(true);
@@ -752,18 +762,15 @@ impl App {
     fn handle_global_hotkey(&mut self, ctx: &egui::Context) {
         match &self.state {
             State::Idle => {
-                self.start_recording(ctx);
+                self.start_recording(ctx, true);
             }
             State::Countdown { .. } => {
-                self.cancel_countdown();
-                if self.hotkey.sound {
-                    crate::hotkey::play_feedback_sound(false);
-                }
+                self.cancel_countdown(true);
                 self.message = Some((t!(MSG_CANCELLED).into(), false));
                 ctx.request_repaint();
             }
             State::Recording(_) => {
-                self.stop_recording();
+                self.stop_recording(true);
                 ctx.request_repaint();
             }
             State::Starting { .. } | State::Stopping { .. } | State::Picking(_) | State::Snipping(_) => {
@@ -781,9 +788,12 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn cancel_countdown(&mut self) {
+    fn cancel_countdown(&mut self, from_hotkey: bool) {
         if matches!(self.state, State::Countdown { .. }) {
             self.state = State::Idle;
+            if self.sound_feedback.is_enabled_for_source(from_hotkey) {
+                crate::hotkey::play_feedback_sound(false);
+            }
         }
     }
 
@@ -802,7 +812,7 @@ impl App {
     fn tick_countdown(&mut self, ctx: &egui::Context) {
         let State::Countdown { started } = &self.state else { return };
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.cancel_countdown();
+            self.cancel_countdown(false);
             self.message = Some((t!(MSG_CANCELLED).into(), false));
             return;
         }
@@ -859,16 +869,16 @@ impl App {
         }
     }
 
-    fn stop_recording(&mut self) {
+    fn stop_recording(&mut self, from_hotkey: bool) {
         if !matches!(self.state, State::Recording(_)) {
             return;
         }
         let State::Recording(rec) = std::mem::replace(&mut self.state, State::Idle) else { return };
-        let sound = self.hotkey.sound;
+        let should_play = self.sound_feedback.is_enabled_for_source(from_hotkey);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let res = rec.stop_with_feedback(|| {
-                if sound {
+                if should_play {
                     crate::hotkey::play_feedback_sound_sync(false);
                 }
             });
@@ -1077,9 +1087,9 @@ impl App {
                 ui.add_space(8.0);
                 let can_record = self.selected_source().is_some();
                 match rec_button(ui, self.rec_mode(), can_record) {
-                    RecClick::Start => self.start_recording(ctx),
-                    RecClick::Stop => self.stop_recording(),
-                    RecClick::Cancel => self.cancel_countdown(),
+                    RecClick::Start => self.start_recording(ctx, false),
+                    RecClick::Stop => self.stop_recording(false),
+                    RecClick::Cancel => self.cancel_countdown(false),
                     RecClick::None => {}
                 }
                 if pause_button(ui, recording, paused) {
@@ -1118,7 +1128,7 @@ impl App {
                 });
             });
         if cancel {
-            self.cancel_countdown();
+            self.cancel_countdown(false);
         }
     }
 
@@ -1415,7 +1425,7 @@ impl App {
                         ui.label(RichText::new(note).color(ORANGE));
                     }
                     if s.error().is_some() || rec.is_finished() {
-                        self.stop_recording();
+                        self.stop_recording(false);
                     } else {
                         ctx.request_repaint_after(Duration::from_millis(250));
                     }
@@ -1853,9 +1863,20 @@ impl App {
 
                 ui.add_space(16.0);
                 section_header(ui, t!(SECTION_HOTKEY));
-                let before_hotkey = self.hotkey;
+                let before_hotkey = (self.hotkey, self.sound_feedback);
                 Card::show(ui, |card| {
-                    switch_row(card, t!(HOTKEY_SOUND), &mut self.hotkey.sound);
+                    card.row(t!(ROW_SOUND_FEEDBACK), |ui| {
+                        segmented(
+                            ui,
+                            "sound_feedback",
+                            &[
+                                (SoundFeedback::Off, None, t!(SOUND_FEEDBACK_OFF)),
+                                (SoundFeedback::HotkeyOnly, None, t!(SOUND_FEEDBACK_HOTKEY_ONLY)),
+                                (SoundFeedback::Always, None, t!(SOUND_FEEDBACK_ALWAYS)),
+                            ],
+                            &mut self.sound_feedback,
+                        );
+                    });
                     card.row(t!(ROW_HOTKEY), |ui| {
                         let btn_text = if self.capturing_hotkey {
                             t!(HOTKEY_RECORDING).to_string()
@@ -1883,7 +1904,7 @@ impl App {
                                     if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
                                         if *key == egui::Key::Escape {
                                             self.capturing_hotkey = false;
-                                        } else if let Some(new_cfg) = crate::hotkey::egui_map::from_egui(*modifiers, *key, self.hotkey.sound) {
+                                        } else if let Some(new_cfg) = crate::hotkey::egui_map::from_egui(*modifiers, *key, self.sound_feedback.is_enabled_for_hotkey()) {
                                             self.hotkey = new_cfg;
                                             self.capturing_hotkey = false;
                                         }
@@ -1903,11 +1924,12 @@ impl App {
                         footnote(ui, t!(HOTKEY_STATUS_FALLBACK));
                     }
                     _ => {
-                        footnote(ui, t!(HOTKEY_SOUND_NOTE));
+                        footnote(ui, t!(SOUND_FEEDBACK_NOTE));
                     }
                 }
 
-                if before_hotkey != self.hotkey {
+                if before_hotkey != (self.hotkey, self.sound_feedback) {
+                    self.hotkey.sound = self.sound_feedback.is_enabled_for_hotkey();
                     self.hotkey_manager.update(self.hotkey);
                     self.save_settings();
                 }
