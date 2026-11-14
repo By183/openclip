@@ -36,6 +36,15 @@ pub fn footnote(ui: &mut Ui, text: &str) {
     });
 }
 
+/// Prominent warning note under a card (orange with warning icon).
+pub fn footnote_warning(ui: &mut Ui, text: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(PAD);
+        ui.set_max_width((ui.available_width() - PAD).max(1.0));
+        ui.label(RichText::new(format!("⚠ {text}")).size(12.0).color(ORANGE));
+    });
+}
+
 // ----- cards ------------------------------------------------------------------
 
 /// Inset-grouped list: rounded card whose rows are separated by hairlines

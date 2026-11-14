@@ -332,10 +332,10 @@ strings! {
         "Comanda rapidă este utilizată de altă aplicație ({0})",
         "Комбинация занята другим приложением ({0})",
         "Комбінація зайнята іншою програмою ({0})";
-    HOTKEY_STATUS_FALLBACK => "Active via keyboard hook (game/app conflict fallback)",
-        "Activ prin hook de tastatură (mod rezervă)",
-        "Активен через перехват клавиатуры (запасной режим)",
-        "Активний через перехоплення клавіатури (запасний режим)";
+    HOTKEY_STATUS_FALLBACK => "This shortcut is already used by another application and both may trigger; choose another one",
+        "Această combinație este deja folosită de altă aplicație și pot declanșa ambele; alegeți alta",
+        "Эта комбинация уже используется другой программой, может сработать и она; выберите другую",
+        "Ця комбінація вже використовується іншою програмою, може спрацювати і вона; виберіть іншу";
     SECTION_SOURCES => "Sources", "Surse", "Источники", "Джерела";
     ROW_DEVICES => "Devices", "Dispozitive", "Устройства", "Пристрої";
     REFRESH_DEVICES => "Refresh monitors, windows and devices", "Reîmprospătează monitoarele, ferestrele și dispozitivele",

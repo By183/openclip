@@ -773,15 +773,21 @@ impl App {
                 self.stop_recording(true);
                 ctx.request_repaint();
             }
-            State::Starting { .. } | State::Stopping { .. } | State::Picking(_) | State::Snipping(_) => {
-                // Debounce: ignore repeated presses while starting or stopping
+            State::Starting { .. } => {
+                self.stop_recording(true);
+                ctx.request_repaint();
+            }
+            State::Stopping { .. } | State::Picking(_) | State::Snipping(_) => {
+                // Debounce: ignore repeated presses while stopping
             }
         }
     }
 
     /// Global screenshot hotkey trigger: takes screenshot or starts interactive snipping.
     fn handle_global_screenshot_hotkey(&mut self, ctx: &egui::Context) {
-        if matches!(self.state, State::Snipping(_)) {
+        if let State::Snipping(ref mut tool) = self.state {
+            tool.cancel();
+            ctx.request_repaint();
             return;
         }
         self.take_snapshot();
@@ -870,6 +876,10 @@ impl App {
     }
 
     fn stop_recording(&mut self, from_hotkey: bool) {
+        if matches!(self.state, State::Starting { .. }) {
+            self.state = State::Idle;
+            return;
+        }
         if !matches!(self.state, State::Recording(_)) {
             return;
         }
@@ -965,11 +975,12 @@ impl App {
         let path = self.timestamped("png");
         let wm = *self.watermark.read().unwrap();
         if wm.any_overlay() {
+            let (w, h) = (img.width(), img.height());
             let mut frame = crate::video::RawFrame {
-                data: img.clone().into_raw(),
-                width: img.width(),
-                height: img.height(),
-                stride: img.width() * 4,
+                data: img.into_raw(),
+                width: w,
+                height: h,
+                stride: w * 4,
                 format: crate::video::PixelFormat::Rgba,
                 pts: Duration::ZERO,
                 mouse: None,
@@ -977,8 +988,12 @@ impl App {
             if let Some(r) = self.watermark_renderer() {
                 r.apply(&wm, &mut frame);
             }
-            if let Some(rebuilt) = xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.data) {
-                img = rebuilt;
+            match xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.data) {
+                Some(rebuilt) => img = rebuilt,
+                None => {
+                    log::error!("failed to rebuild image after watermark");
+                    return;
+                }
             }
         }
 
@@ -1918,10 +1933,10 @@ impl App {
                 match self.hotkey_manager.status() {
                     crate::hotkey::HotkeyStatus::Conflict(vk) => {
                         let name = crate::hotkey::vk_to_name(vk);
-                        footnote(ui, &t!(HOTKEY_STATUS_CONFLICT, name));
+                        footnote_warning(ui, &t!(HOTKEY_STATUS_CONFLICT, name));
                     }
                     crate::hotkey::HotkeyStatus::HookFallback => {
-                        footnote(ui, t!(HOTKEY_STATUS_FALLBACK));
+                        footnote_warning(ui, t!(HOTKEY_STATUS_FALLBACK));
                     }
                     _ => {
                         footnote(ui, t!(SOUND_FEEDBACK_NOTE));
@@ -2490,10 +2505,10 @@ impl App {
         match self.hotkey_manager.screenshot_status() {
             crate::hotkey::HotkeyStatus::Conflict(vk) => {
                 let name = crate::hotkey::vk_to_name(vk);
-                footnote(ui, &t!(HOTKEY_STATUS_CONFLICT, name));
+                footnote_warning(ui, &t!(HOTKEY_STATUS_CONFLICT, name));
             }
             crate::hotkey::HotkeyStatus::HookFallback => {
-                footnote(ui, t!(HOTKEY_STATUS_FALLBACK));
+                footnote_warning(ui, t!(HOTKEY_STATUS_FALLBACK));
             }
             _ => {
                 footnote(ui, t!(ROW_REGION_SCREENSHOT_HINT));

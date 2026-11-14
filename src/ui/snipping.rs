@@ -22,26 +22,33 @@ use openclip_overlay::text::TextRenderer;
 #[cfg(windows)]
 mod win32_overlay {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
         DWMWCP_DONOTROUND,
     };
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, CallWindowProcW, FindWindowW, GetWindowLongPtrW, GetWindowRect,
+        BringWindowToTop, CallWindowProcW, FindWindowW, GetWindowLongPtrW, GetWindowRect, IsWindow,
         SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
         GWLP_WNDPROC, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-        WM_ERASEBKGND, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WS_CAPTION,
+        WM_ACTIVATE, WM_ERASEBKGND, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_NCDESTROY, WS_CAPTION,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
         WS_SYSMENU, WS_THICKFRAME,
     };
 
     static WNDPROCS: Mutex<Option<HashMap<isize, isize>>> = Mutex::new(None);
+    static DEACTIVATED_SIGNAL: AtomicBool = AtomicBool::new(false);
+    static HAD_FOCUS_SIGNAL: AtomicBool = AtomicBool::new(false);
+
     const HTCLIENT: isize = 1;
     const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFE;
+    const WA_INACTIVE: usize = 0;
+    const WA_ACTIVE: usize = 1;
+    const WA_CLICKACTIVE: usize = 2;
 
     unsafe extern "system" fn overlay_subclass_proc(
         hwnd: HWND,
@@ -64,6 +71,43 @@ mod win32_overlay {
         // Prevent background erase flickers
         if msg == WM_ERASEBKGND {
             return LRESULT(1);
+        }
+
+        // Track focus & deactivation
+        if msg == WM_ACTIVATE {
+            let state = wparam.0 & 0xFFFF;
+            if state == WA_ACTIVE || state == WA_CLICKACTIVE {
+                HAD_FOCUS_SIGNAL.store(true, Ordering::Relaxed);
+            } else if state == WA_INACTIVE {
+                let other_hwnd = lparam.0;
+                let is_our_window = if let Ok(guard) = WNDPROCS.lock() {
+                    guard.as_ref().is_some_and(|m| m.contains_key(&other_hwnd))
+                } else {
+                    false
+                };
+                if !is_our_window {
+                    DEACTIVATED_SIGNAL.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // On window destruction, restore the original wndproc and clean up WNDPROCS
+        if msg == WM_NCDESTROY {
+            let prev = {
+                if let Ok(mut guard) = WNDPROCS.lock() {
+                    guard.as_mut().and_then(|m| m.remove(&(hwnd.0 as isize))).unwrap_or(0)
+                } else {
+                    0
+                }
+            };
+            if prev != 0 {
+                use windows::Win32::UI::WindowsAndMessaging::WNDPROC;
+                let prev_fn: WNDPROC = unsafe { std::mem::transmute(prev) };
+                unsafe {
+                    let _ = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, prev);
+                    return CallWindowProcW(prev_fn, hwnd, msg, wparam, lparam);
+                }
+            }
         }
 
         let prev = {
@@ -119,11 +163,24 @@ mod win32_overlay {
 
             // 3. Subclass to force WM_NCHITTEST -> HTCLIENT and prevent non-client painting
             let new_proc = overlay_subclass_proc as *const () as usize as isize;
-            let old_proc = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, new_proc);
-            if old_proc != 0 && old_proc != new_proc
-                && let Ok(mut guard) = WNDPROCS.lock()
-            {
-                guard.get_or_insert_with(HashMap::new).insert(hwnd.0 as isize, old_proc);
+            let already_registered = {
+                if let Ok(guard) = WNDPROCS.lock() {
+                    guard.as_ref().is_some_and(|m| m.contains_key(&(hwnd.0 as isize)))
+                } else {
+                    false
+                }
+            };
+
+            if !already_registered {
+                let current_proc = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+                if current_proc != new_proc {
+                    let old_proc = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, new_proc);
+                    if old_proc != 0 && old_proc != new_proc
+                        && let Ok(mut guard) = WNDPROCS.lock()
+                    {
+                        guard.get_or_insert_with(HashMap::new).insert(hwnd.0 as isize, old_proc);
+                    }
+                }
             }
 
             // 4. Set exact physical position and size to match monitor bounds
@@ -156,6 +213,37 @@ mod win32_overlay {
             true
         }
     }
+
+    pub fn restore_all_subclasses() {
+        if let Ok(mut guard) = WNDPROCS.lock()
+            && let Some(map) = guard.as_mut()
+        {
+            for (&hwnd_val, &prev) in map.iter() {
+                let hwnd = HWND(hwnd_val as _);
+                unsafe {
+                    if !hwnd.is_invalid() && IsWindow(Some(hwnd)).as_bool() {
+                        let _ = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, prev);
+                    }
+                }
+            }
+            map.clear();
+        }
+        DEACTIVATED_SIGNAL.store(false, Ordering::Relaxed);
+        HAD_FOCUS_SIGNAL.store(false, Ordering::Relaxed);
+    }
+
+    pub fn had_focus() -> bool {
+        HAD_FOCUS_SIGNAL.load(Ordering::Relaxed)
+    }
+
+    pub fn check_and_reset_deactivated() -> bool {
+        DEACTIVATED_SIGNAL.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn reset_signals() {
+        DEACTIVATED_SIGNAL.store(false, Ordering::Relaxed);
+        HAD_FOCUS_SIGNAL.store(false, Ordering::Relaxed);
+    }
 }
 
 #[cfg(not(windows))]
@@ -163,6 +251,10 @@ mod win32_overlay {
     pub fn setup_overlay_window(_title: &str, _info: &crate::capture::monitors::MonitorInfo) -> bool {
         true
     }
+    pub fn restore_all_subclasses() {}
+    pub fn had_focus() -> bool { false }
+    pub fn check_and_reset_deactivated() -> bool { false }
+    pub fn reset_signals() {}
 }
 
 #[cfg(windows)]
@@ -533,6 +625,8 @@ pub struct SnippingTool {
     configured_views: std::collections::HashSet<u32>,
     was_esc_down: bool,
     was_enter_down: bool,
+    created_at: std::time::Instant,
+    had_focus: bool,
 }
 
 const PALETTE: [Color32; 7] = [
@@ -545,12 +639,19 @@ const PALETTE: [Color32; 7] = [
     Color32::from_rgb(0, 0, 0),       // Black
 ];
 
+impl Drop for SnippingTool {
+    fn drop(&mut self) {
+        win32_overlay::restore_all_subclasses();
+    }
+}
+
 impl SnippingTool {
     /// Captures full-resolution screenshots of all monitors up front (freeze-frame).
     pub fn new(monitors: &[MonitorInfo], annotate_enabled: bool) -> Result<Self> {
         if monitors.is_empty() {
             anyhow::bail!("no monitors available for snapshot");
         }
+        win32_overlay::reset_signals();
         let mut views = Vec::new();
         for m in monitors {
             let raw = screenshot_monitor_image(m.id)?;
@@ -573,11 +674,51 @@ impl SnippingTool {
             configured_views: std::collections::HashSet::new(),
             was_esc_down: false,
             was_enter_down: false,
+            created_at: std::time::Instant::now(),
+            had_focus: false,
         })
+    }
+
+    /// Explicitly cancel snipping session (used by repeated hotkey or UI cancel).
+    pub fn cancel(&mut self) {
+        self.outcome = Some(SnippingOutcome::Cancelled);
     }
 
     /// Renders overlays on all monitors and processes events.
     pub fn show(&mut self, ctx: &egui::Context) -> SnippingOutcome {
+        if let Some(outcome) = self.outcome.take() {
+            return outcome;
+        }
+
+        // Track focus
+        if win32_overlay::had_focus() || ctx.input(|i| i.focused) {
+            self.had_focus = true;
+        }
+
+        // Deactivation check: cancel when focus is lost (WM_ACTIVATE with WA_INACTIVE),
+        // but ONLY after window had focus, not earlier than 300 ms after creation,
+        // and NOT while editing text, pointer is down, dragging, or hovering toolbar.
+        let lost_focus = win32_overlay::check_and_reset_deactivated();
+        if lost_focus {
+            let elapsed = self.created_at.elapsed();
+            let is_editing_text = self.text_input.is_some();
+            let is_pointer_down = ctx.input(|i| i.pointer.any_down());
+            let is_dragging = !matches!(self.drag, DragState::None);
+
+            let pointer_pos = ctx.input(|inp| inp.pointer.hover_pos().or_else(|| inp.pointer.interact_pos()));
+            let is_in_toolbar = self.toolbar_rect.is_some_and(|r| pointer_pos.is_some_and(|p| r.contains(p)));
+
+            if elapsed >= std::time::Duration::from_millis(300)
+                && self.had_focus
+                && !is_editing_text
+                && !is_pointer_down
+                && !is_dragging
+                && !is_in_toolbar
+            {
+                log::info!("[Snipping] Overlay deactivated after loss of focus, cancelling");
+                return SnippingOutcome::Cancelled;
+            }
+        }
         #[cfg(windows)]
         let (raw_esc, raw_enter) = {
             use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
