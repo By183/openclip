@@ -4,6 +4,58 @@ All notable changes to OpenClip in this fork compared to the original project ([
 
 ---
 
+## [0.3.0] — 2026-11-15
+
+### English
+
+#### Added
+- **Crash-Resistant Fragmented MP4 (`ISO BMFF fMP4`)**:
+  - Migrated MP4 multiplexer to progressive fragmented ISO BMFF format (`ftyp` + initial `moov` with `mvex`/`trex`, followed by sequential `moof` + `mdat` fragments with progressive disk `flush()`).
+  - New fragments start on keyframes (IDRs) with duration threshold $\ge 1.5$ s and safety flush at $\ge 3.0$ s.
+  - Complete crash resilience: unfinalized recordings (due to power cuts, game crashes, or unexpected process termination) remain intact and immediately playable in standard media players (VLC, Windows Media Player) without data corruption.
+  - Generates optional `mfra` index on clean finalization for instant seeking.
+- **Hardware GPU Overlay Compositing (Direct3D 11 HLSL)**:
+  - Cursor halo highlight, animated click ripple rings, cursor pointer, and watermark overlays are now composited entirely in GPU VRAM via dedicated Direct3D 11 HLSL vertex and pixel shaders (`GpuOverlayCompositor`).
+  - Analytical SDF antialiasing for cursor highlight and smooth ripple rings without bitmap artifacts.
+  - Eliminates CPU readback fallback when overlays are enabled: recording at 1440p120 with mouse effects and watermark operates on the 100% hardware zero-readback GPU path with CPU usage <2%.
+  - Live preview in settings now renders GPU overlays in real-time.
+- **Dynamic Custom Text Watermark**:
+  - Replaced static watermark image with dynamic RGBA rasterization powered by the bundled high-legibility **Inter** font with full Latin and Cyrillic character support.
+  - Renders a sleek translucent pill container that automatically scales to text length. Preserves classic branded badge when default `"openclip"` is used.
+  - New settings field in Video $\rightarrow$ Watermark with instant live preview on every keystroke, 48-character limit, and one-click reset to default.
+- **Audio Hot-Plug & Automatic Stream Recovery**:
+  - Integrated Windows Core Audio device notifications (`IMMNotificationClient`) to instantly detect device arrival, removal, state changes, and default audio endpoint switches.
+  - Seamless CPAL stream recreation for loopback playback and microphone input with ~300 ms debounce for Windows USB driver initialization and 1 s retry interval.
+  - Recording timeline origin remains strictly anchored during disconnects; mixer automatically pads absent device periods with smooth silence maintaining perfect audio-video synchronization.
+  - Dynamic `KaiserSincResampler` re-initialization and channel mapping via `Mixer::update_source` when reconnected device changes sample rate (e.g. 48 kHz $\leftrightarrow$ 44.1 kHz) or channel count.
+
+---
+
+### Русский
+
+#### Добавлено
+- **Устойчивый к сбоям фрагментированный MP4 (`ISO BMFF fMP4`)**:
+  - Перевод MP4-мультиплексора на прогрессивный фрагментированный формат ISO BMFF (`ftyp` + инициализационный `moov` с блоками `mvex`/`trex`, затем периодические фрагменты `moof` + `mdat` с непрерывным сбросом на диск `flush()`).
+  - Нарезка фрагментов по ключевым кадрам (IDR) с порогом $\ge 1.5$ с и аварийным сбросом $\ge 3.0$ с.
+  - Полная защита от потери записей: при внезапном отключении питания, краше игры или принудительном завершении процесса файл не повреждается и открывается стандартными плеерами (VLC, Проигрыватель Windows).
+  - Запись индекса `mfra` при штатном завершении для мгновенной перемотки.
+- **Аппаратный GPU-композитинг оверлеев (Direct3D 11 HLSL)**:
+  - Подсветка курсора, анимированные кольца кликов мыши, стрелка указателя и водяной знак теперь накладываются прямо в видеопамяти через пиксельные и вершинные HLSL-шейдеры Direct3D 11 (`GpuOverlayCompositor`).
+  - Аналитическое SDF-сглаживание круга подсветки и колец кликов без ступенек и артефактов растеризации.
+  - Устранено падение в CPU-память при включении эффектов: запись 1440p120 с подсветкой, кликами и плашкой идет по аппаратному конвейеру с нагрузкой на CPU <2%.
+  - Встроенный предпросмотр в настройках отображает оверлеи мыши и водяного знака в реальном времени.
+- **Кастомный текстовый водяной знак**:
+  - Динамическая растеризация плашки с использованием встроенного шрифта **Inter** с полной поддержкой кириллицы и латиницы.
+  - Автоматическая подгонка ширины аккуратной полупрозрачной плашки со скруглёнными углами под длину текста; сохранение оригинального фирменного стиля при значении `"openclip"`.
+  - Поле ввода в разделе «Видео → Водяной знак» с мгновенным предпросмотром на каждый символ, лимитом в 48 символов и кнопкой быстрого сброса.
+- **Горячая смена и автовосстановление звуковых устройств**:
+  - Интеграция наблюдателя Windows Core Audio (`IMMNotificationClient`) для отслеживания подключения, отключения и смены системных устройств вывода и ввода по умолчанию.
+  - Бесшовное пересоздание потоков CPAL (loopback и микрофон) с задержкой debounce ~300 мс (необходимой для инициализации USB-драйвера Windows) и повторными попытками раз в 1 с.
+  - Таймлайн записи не сдвигается: на время отсутствия устройства микшер выдает плавную тишину, сохраняя идеальную синхронизацию звука и видео.
+  - Автоматическая переинициализация sinc-ресемплера Кайзера (`KaiserSincResampler`) и раскладки каналов при смене частоты (например, 48 кГц $\leftrightarrow$ 44.1 кГц) без сброса таймлайна.
+
+---
+
 ## [0.2.1] — 2026-11-15
 
 ### English

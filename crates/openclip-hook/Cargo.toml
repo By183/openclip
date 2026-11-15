@@ -1,10 +1,10 @@
 [package]
 name = "openclip-hook"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "openclip in-game capture hook"
-repository = "https://github.com/catalingrigoriev285/openclip"
+repository = "https://github.com/By183/openclip"
 
 # Loaded into other people's game processes. Named plainly and carrying a full
 # version resource on purpose: anti-cheat vendors whitelist by name and

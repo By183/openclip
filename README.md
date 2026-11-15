@@ -26,8 +26,8 @@ A lightweight, high-performance screen recording and screenshot application for 
 - **Game recording** (Windows 64-bit): Captures frames directly from DirectX 11, DirectX 12, or OpenGL swap-chain back buffers for minimal performance overhead in exclusive fullscreen, complete with an in-game FPS overlay (**green** when armed, **red** when recording).
 - **System audio and microphone**: Captures loopback desktop sound and input microphone audio with independent gain controls (up to 200%) and optional separate audio tracks.
 - **Live preview**: Real-time rendering of what is currently being recorded.
-- **Standard container formats**: Produces standard MP4 and AVI 2.0 (OpenDML) files playable everywhere without transcoding.
-- **Hardware GPU encoding**: Windows Media Foundation hardware encoders (AMD AMF verified; NVIDIA NVENC and Intel Quick Sync supported in code) plus bundled CPU fallback encoders.
+- **Crash-resilient container formats**: Produces progressive fragmented MP4 (`ISO BMFF fMP4`) and AVI 2.0 (OpenDML) files playable everywhere. Recordings survive power loss, BSODs, and game crashes without file corruption.
+- **Hardware GPU encoding & overlay compositing**: Windows Media Foundation hardware encoders (AMD AMF verified; NVIDIA NVENC and Intel Quick Sync supported in code), zero-readback Direct3D 11 video processor, and HLSL GPU overlay compositing for mouse effects and watermarks.
 - **No external runtime dependencies**: No ffmpeg, no external DLLs, and no codec packs required. Bundled H.264 ([OpenH264](https://www.openh264.org/)) and MP3 ([LAME](https://lame.sourceforge.io/)) encoders are built into the binary.
 
 ---
@@ -38,12 +38,16 @@ A lightweight, high-performance screen recording and screenshot application for 
 * **Interactive Screenshot Editor (`Ctrl+Alt+Q`)**: Instant freeze-frame screen capture overlay with interactive vector annotations — rectangle, arrow, straight line, freehand pen, highlighter/marker, text labels, and pixelate blur. Supports selection move/resize, Undo (`Ctrl+Z`), direct save to PNG, and instant copy to clipboard.
 * **Global Recording Hotkey (`Ctrl+Alt+R`) with Sound Feedback**: Toggle recording from anywhere with audio cue beeps that are isolated from the recorded audio stream. Configurable feedback modes: *Off*, *Hotkey only*, or *Always*.
 * **Zero-Readback GPU Color Conversion**: Dedicated Direct3D 11 Video Processor (`ID3D11VideoProcessor`) converting capture textures from `BGRA` to `NV12` entirely within GPU VRAM, feeding Media Foundation hardware encoders (AMD AMF verified) with under 2% CPU utilization.
+* **Hardware GPU Overlay Compositing (Direct3D 11 HLSL)**: Cursor halo highlight, animated click ripple rings, cursor pointer, and watermark overlays are composited directly in GPU VRAM via Direct3D 11 shaders with analytical SDF antialiasing. Overlays no longer drop the video pipeline into CPU memory.
+* **Crash-Resistant Fragmented MP4 (`ISO BMFF fMP4`)**: MP4 files are written as sequential fragments (`moof` + `mdat`) with regular disk flushes. In the event of a sudden power outage, BSOD, or game crash, all recorded video up to the last second is completely preserved and playable.
+* **Dynamic Custom Text Watermark**: Customizable watermark badge rasterized dynamically using the bundled **Inter** font with full Cyrillic and Latin character support, auto-scaling width, and instant live preview.
+* **Audio Hot-Plug & Stream Recovery**: Windows Core Audio observer (`IMMNotificationClient`) automatically re-establishes loopback and microphone streams on device disconnect/reconnect or default endpoint switch without drifting from the video timeline.
 * **Color Conversion Mode Setting**: User-selectable color conversion pipeline: *Auto* (prefers GPU Video Processor, falls back to CPU), *GPU* (enforces hardware pipeline), or *CPU* (SIMD YUV fallback).
 * **Adaptive Frame Clock ("Auto" FPS)**: Dynamically aligns frame pacing to display refresh rate (vsync grid) and suppresses redundant encoding during static desktop scenes to save disk space and power.
 * **Audio Device & Track Enhancements**: Select specific playback loopback and microphone input devices, adjust gain up to 200%, or record system audio and microphone into separate audio tracks.
 * **Hardware GPU Decoding in Built-in Player**: Video playback acceleration with Direct3D 11 NV12-to-RGBA hardware color conversion.
 * **Ukrainian Language Localization**: Complete Ukrainian (`uk`) UI translation alongside supplemented English, Romanian, and Russian localizations.
-* **Diagnostic Logging & Automated Tests**: Comprehensive logging to `openclip.log` and a suite of 178 integration tests covering container muxers, audio synchronization, and hotkey sequencing.
+* **Diagnostic Logging & Automated Tests**: Comprehensive logging to `openclip.log` and a suite of 185 integration tests covering container muxers, audio synchronization, and hotkey sequencing.
 
 ### Improved
 * **High-Fidelity Audio Resampling**: Upgraded to a 16-tap Kaiser-windowed sinc resampler (`KaiserSincResampler`, $\beta=6.0$), eliminating aliasing distortion between 44.1 kHz and 48 kHz sample rates.
@@ -56,7 +60,6 @@ A lightweight, high-performance screen recording and screenshot application for 
 ### Unchanged
 * Core capture backends for Monitor, Window, Region, and Game (64-bit).
 * Standard output containers: MP4 and AVI 2.0.
-* Mouse click rings, cursor highlight, and watermark overlay (note: mouse effects and watermarks route frames through the CPU staging path).
 
 ---
 
@@ -111,7 +114,7 @@ cargo build --release --workspace
 
 | Parameter | Options | Description |
 |---|---|---|
-| **Container** | MP4, AVI | MP4 produces compact, widely compatible files; AVI 2.0 (OpenDML) is index-backed. |
+| **Container** | MP4 (fMP4), AVI | **MP4** writes progressive ISO BMFF fragments (`fMP4`) resilient against crashes; **AVI 2.0** (OpenDML) is index-backed. |
 | **Video Encoder** | Hardware (MF), OpenH264 | Hardware uses GPU MFT (AMD AMF, NVENC, Quick Sync); OpenH264 runs on CPU. |
 | **Color Conversion** | Auto, GPU, CPU | **Auto** prefers Direct3D 11 Video Processor; **GPU** enforces VRAM conversion; **CPU** uses SIMD YUV. |
 | **Audio Encoder** | AAC (MF), MP3 (LAME), PCM | Media Foundation AAC or bundled LAME MP3 for compressed audio; uncompressed 16-bit PCM for AVI. |
@@ -120,11 +123,11 @@ cargo build --release --workspace
 
 ---
 
-## Mouse Effects
+## Mouse Effects & Overlays
 
-* **Cursor Highlight & Click Rings**: Highlight cursor position and visualize left/right mouse clicks.
-* **Watermark Overlay**: Stamp custom text or timestamp onto video frames.
-* *Note*: Because cursor effects and watermarks modify pixels directly in system memory, enabling them switches the video pipeline to the CPU staging path.
+* **Cursor Highlight & Click Rings**: Highlight cursor position and visualize left/right mouse clicks with smooth analytical SDF antialiasing.
+* **Custom Text Watermark**: Stamp customizable text or channel nicknames onto video frames with adaptive width, Cyrillic/Latin Inter font, and live preview.
+* *GPU Compositing*: All mouse effects and watermarks are composited directly on the GPU in Direct3D 11 HLSL shaders, preserving the zero-readback hardware path without CPU memory transfers.
 
 ---
 
@@ -135,18 +138,18 @@ cargo build --release --workspace
           │
      (GPU Texture)
           │
-          ├──▶ [GPU Path] ──▶ ID3D11VideoProcessor (BGRA ➔ NV12) ──▶ Media Foundation Hardware MFT (AMF/NVENC/QSV) ──┐
-          │                                                                                                        │
-          └──▶ [CPU Path] ──▶ Staging Copy ──▶ SIMD YUV Convert ──▶ OpenH264 Software Encoder ────────────────────┤
-                                                                                                                  ▼
-[Audio WASAPI Loopback / Mic] ──▶ Kaiser Sinc Resampler ──▶ Audio Mixer ──▶ Media Foundation AAC / LAME MP3 ──▶ MP4 / AVI Muxer ──▶ File
+          ├──▶ [GPU Path] ──▶ GpuOverlayCompositor (HLSL) ──▶ ID3D11VideoProcessor (BGRA ➔ NV12) ──▶ MF Hardware MFT (AMF/NVENC/QSV) ──┐
+          │                                                                                                                             │
+          └──▶ [CPU Path] ──▶ Staging Copy ──▶ SIMD YUV Convert ──▶ OpenH264 Software Encoder ──────────────────────────────────────────┤
+                                                                                                                                        ▼
+[Audio WASAPI Loopback / Mic] ──▶ Kaiser Sinc Resampler ──▶ Audio Mixer ──▶ Media Foundation AAC / LAME MP3 ──▶ Progressive fMP4 / AVI Muxer ──▶ File
 ```
 
 * **Capture** (`src/capture`): Windows Graphics Capture (WGC) provides hardware-accelerated desktop textures. In the GPU path, textures stay in VRAM. In the CPU fallback path, frames are read back through double-buffered staging textures without runtime memory allocations.
-* **GPU Video Processing** (`src/video/d3d11_vp.rs`): Uses Direct3D 11 Video Processor interfaces to execute hardware color conversion (`DXGI_FORMAT_B8G8R8A8_UNORM` $\rightarrow$ `DXGI_FORMAT_NV12`) directly on the GPU.
+* **GPU Overlay Compositing & Color Conversion** (`src/video/d3d11_vp.rs`): Uses Direct3D 11 HLSL shaders for analytical SDF overlays and Direct3D 11 Video Processor interfaces to execute hardware color conversion (`DXGI_FORMAT_B8G8R8A8_UNORM` $\rightarrow$ `DXGI_FORMAT_NV12`) directly on the GPU.
 * **Video Encoders** (`src/video`): Media Foundation Transform (MFT) interfaces stream NV12 buffers into hardware ASICs (tested on AMD AMF) or bundled CPU OpenH264.
-* **Audio Engine** (`src/audio`): WASAPI loopback and microphone streams are aligned to the recording timeline. Sample rate conversion uses a 16-tap Kaiser sinc filter ($\beta=6.0$) to avoid aliasing artifacts.
-* **Muxers** (`src/mux`): Native MP4 writer (64-bit `mdat` and `moov`) and OpenDML AVI writer (`RIFF`/`AVIX` chunks with super-indexing).
+* **Audio Engine** (`src/audio`): WASAPI loopback and microphone streams are aligned to the recording timeline with automatic hot-reconnection via `IMMNotificationClient`. Sample rate conversion uses a 16-tap Kaiser sinc filter ($\beta=6.0$) to avoid aliasing artifacts.
+* **Muxers** (`src/mux`): Native progressive fragmented MP4 writer (`ISO BMFF fMP4` with `moof` + `mdat` fragments and `mfra` index) and OpenDML AVI writer (`RIFF`/`AVIX` chunks with super-indexing).
 * **Snipping Tool** (`src/ui/snipping.rs`): Captures a pristine desktop freeze-frame, paints non-destructive vector overlays, and allows instant clipping.
 
 ---
@@ -155,8 +158,6 @@ cargo build --release --workspace
 
 * **Windows Only**: Designed specifically for the Windows graphics and audio subsystem (Direct3D 11, DXGI, Media Foundation, WASAPI).
 * **Hardware Compatibility**: GPU video processing and AMF encoding are verified on AMD Radeon RX 6600. NVIDIA NVENC and Intel Quick Sync pipelines are implemented via standard Media Foundation transforms but have not been physically verified on those hardware architectures.
-* **Crash Resilience of MP4**: Standard MP4 files write the indexing metadata (`moov` atom) when recording stops cleanly. Sudden process termination or power loss will leave an unfinalized MP4 file unplayable.
-* **Audio Device Disconnection**: If an active audio device is unplugged during recording, that audio stream terminates; dynamic re-enumeration mid-recording is not currently supported.
 * **Game Capture**: Hooking is supported for 64-bit DirectX 11, DirectX 12, and OpenGL applications. It does not bypass aggressive third-party anti-cheat systems (e.g., Easy Anti-Cheat, BattlEye, Riot Vanguard).
 * **Unsigned Executable**: The binary is not signed with an expensive EV code signing certificate; Windows SmartScreen may show an unknown publisher warning upon first launch.
 
@@ -197,6 +198,8 @@ Based on the original [openclip](https://github.com/catalingrigoriev285/openclip
 
 ## Roadmap
 
-* [ ] **Fragmented MP4 (`fMP4`)**: Real-time progressive fragment muxing to make recordings crash-resilient against power loss.
-* [ ] **GPU Cursor Overlays**: Render cursor highlights and click effects directly in D3D11 shaders without falling back to CPU memory.
-* [ ] **Dynamic Audio Device Recovery**: Hot-reconnection of audio endpoints if a USB microphone or headset is unplugged during a session.
+* [x] **Fragmented MP4 (`fMP4`)**: Real-time progressive fragment muxing protecting recordings from power loss.
+* [x] **GPU Cursor Overlays**: Direct3D 11 HLSL shader rendering of cursor highlights, click ripples, and watermarks without CPU fallback.
+* [x] **Dynamic Custom Text Watermark**: Inter font Cyrillic and Latin badge with live preview.
+* [x] **Dynamic Audio Device Recovery**: Hot-reconnection of audio endpoints if a USB microphone or headset is unplugged during a session.
+* [ ] **Multi-Monitor Annotation Offsets**: Multi-monitor coordinate normalization for screenshot crop frame selections.
