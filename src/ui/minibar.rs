@@ -3,6 +3,7 @@
 //! Closing the bar window (title-bar X) does not quit the app — it restores
 //! the full window instead.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Layout, RichText, Sense, Vec2, ViewportCommand, WindowLevel};
@@ -86,7 +87,11 @@ impl App {
     /// In compact mode the title-bar X restores the full window instead of
     /// quitting. Returns true when a close was intercepted this frame.
     pub(super) fn intercept_close(&mut self, ctx: &egui::Context) -> bool {
-        if !self.compact || !ctx.input(|i| i.viewport().close_requested()) {
+        if !self.compact
+            || !ctx.input(|i| i.viewport().close_requested())
+            || self.quitting
+            || self.force_quit.load(Ordering::Relaxed)
+        {
             return false;
         }
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -300,9 +305,6 @@ impl App {
                     State::Picking(_) => {
                         status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::REGION, t!(SELECT_REGION)), None, None, None);
                     }
-                    State::Snipping(_) => {
-                        status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::CAMERA, t!(ROW_REGION_SCREENSHOT)), None, None, None);
-                    }
                     State::Countdown { started } => {
                         let left = (self.countdown_secs as f32 - started.elapsed().as_secs_f32()).ceil().max(1.0);
                         status_capsule(ui, Tint::Orange, &t!(BAR_STARTING_IN, left), None, None, Some(t!(BAR_ESC_CANCELS)));
@@ -317,22 +319,26 @@ impl App {
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }
                     State::Idle => {
-                        // The latest message (saved file / error) takes over the capsule for a few seconds.
-                        let toast = match (&self.message, self.message_at) {
-                            (Some((msg, is_err)), Some(at)) if at.elapsed() < TOAST_TTL => Some((msg.clone(), *is_err)),
-                            _ => None,
-                        };
-                        match toast {
-                            Some((msg, is_err)) => {
-                                let tint = if is_err { Tint::Red } else { Tint::Green };
-                                status_capsule(ui, tint, &msg, None, Some(toast_max), Some(&msg));
-                                ctx.request_repaint_after(Duration::from_millis(500));
-                            }
-                            None if can_record => {
-                                status_capsule(ui, Tint::Green, t!(BAR_READY), None, None, None);
-                            }
-                            None => {
-                                status_capsule(ui, Tint::Gray, t!(BAR_PICK_SOURCE), None, None, None);
+                        if self.snipping.is_some() {
+                            status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::CAMERA, t!(ROW_REGION_SCREENSHOT)), None, None, None);
+                        } else {
+                            // The latest message (saved file / error) takes over the capsule for a few seconds.
+                            let toast = match (&self.message, self.message_at) {
+                                (Some((msg, is_err)), Some(at)) if at.elapsed() < TOAST_TTL => Some((msg.clone(), *is_err)),
+                                _ => None,
+                            };
+                            match toast {
+                                Some((msg, is_err)) => {
+                                    let tint = if is_err { Tint::Red } else { Tint::Green };
+                                    status_capsule(ui, tint, &msg, None, Some(toast_max), Some(&msg));
+                                    ctx.request_repaint_after(Duration::from_millis(500));
+                                }
+                                None if can_record => {
+                                    status_capsule(ui, Tint::Green, t!(BAR_READY), None, None, None);
+                                }
+                                None => {
+                                    status_capsule(ui, Tint::Gray, t!(BAR_PICK_SOURCE), None, None, None);
+                                }
                             }
                         }
                     }

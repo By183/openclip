@@ -12,13 +12,14 @@ use super::capture::SharedQueue;
 use super::resample::KaiserSincResampler;
 
 /// If a source's sample count lags its wall-clock position by more than this,
-/// the gap is filled with silence.
-const GAP_THRESHOLD: Duration = Duration::from_millis(60);
+/// the gap is filled with silence. Set to 150 ms to accommodate normal
+/// scheduling jitter and natural micro-pauses without false gap insertions.
+const GAP_THRESHOLD: Duration = Duration::from_millis(150);
 
 /// If a source accumulates more than this much buffered audio ahead of its
 /// wall-clock position (e.g. a fast hardware clock over a long session),
 /// trim excess lead so audio never drifts permanently late relative to video.
-const MAX_LEAD: Duration = Duration::from_millis(400);
+const MAX_LEAD: Duration = Duration::from_millis(500);
 
 /// Short click-free ramp applied after silence gaps.
 const FADE_DURATION: Duration = Duration::from_millis(2);
@@ -27,6 +28,7 @@ const FADE_DURATION: Duration = Duration::from_millis(2);
 const CROSSFADE_DURATION: Duration = Duration::from_millis(5);
 
 struct SourceState {
+    name: String,
     queue: SharedQueue,
     channels: usize,
     resampler: KaiserSincResampler,
@@ -61,9 +63,17 @@ impl Mixer {
         Self { rate, epoch, origin, sources: Vec::new(), out_pos: 0, silence_inserted: 0 }
     }
 
-    pub fn add_source(&mut self, queue: SharedQueue, sample_rate: u32, channels: u16, gain: f32) -> usize {
+    pub fn add_source(
+        &mut self,
+        name: impl Into<String>,
+        queue: SharedQueue,
+        sample_rate: u32,
+        channels: u16,
+        gain: f32,
+    ) -> usize {
         let id = self.sources.len();
         self.sources.push(SourceState {
+            name: name.into(),
             queue,
             channels: channels.max(1) as usize,
             resampler: KaiserSincResampler::new(sample_rate, self.rate, 2),
@@ -175,6 +185,12 @@ impl Mixer {
                         - src.resampler.pending_out_frames().round() as i64
                         - approx_out;
                     if approx_start - buffer_end > gap_frames {
+                        log::warn!(
+                            "audio: [{}] silence gap detected (gap: {:.1} ms > {:.1} ms), resetting resampler",
+                            src.name,
+                            (approx_start - buffer_end) as f64 * 1000.0 / rate,
+                            gap_frames as f64 * 1000.0 / rate
+                        );
                         src.resampler.reset();
                     }
                 }
@@ -206,6 +222,12 @@ impl Mixer {
                     src.trim_frames = 0;
                     src.crossfade = false;
                     let pad = (expected_start - buffer_end) as usize;
+                    log::warn!(
+                        "audio: [{}] silence gap: inserting {pad} frames ({} samples, ~{:.1} ms)",
+                        src.name,
+                        pad * 2,
+                        pad as f64 * 1000.0 / rate
+                    );
                     if src.buffer.is_empty() {
                         src.buffer_start = expected_start;
                     } else {
@@ -219,8 +241,16 @@ impl Mixer {
                         // Hardware clock ran noticeably fast ahead of wall clock:
                         // schedule a single trim back toward `max_lead_frames / 2`
                         // followed by an overlap-add crossfade at the seam.
-                        src.trim_frames = (buffer_end - expected_start - max_lead_frames / 2).max(1) as usize;
+                        let trim = (buffer_end - expected_start - max_lead_frames / 2).max(1) as usize;
+                        src.trim_frames = trim;
                         src.crossfade = true;
+                        log::warn!(
+                            "audio: [{}] clock drift lead detected: trimming {} frames (lead: {:.1} ms > max {:.1} ms)",
+                            src.name,
+                            src.trim_frames,
+                            (buffer_end - expected_start) as f64 * 1000.0 / rate,
+                            max_lead_frames as f64 * 1000.0 / rate
+                        );
                     }
                     if src.trim_frames >= frames_out {
                         src.trim_frames -= frames_out;
@@ -273,10 +303,18 @@ impl Mixer {
         let dst = &mut out[start..];
         for src in &mut self.sources {
             // Discard anything older than the output position.
-            while src.buffer_start < self.out_pos && !src.buffer.is_empty() {
-                src.buffer.pop_front();
-                src.buffer.pop_front();
-                src.buffer_start += 1;
+            if src.buffer_start < self.out_pos && !src.buffer.is_empty() {
+                let late = ((self.out_pos - src.buffer_start) as usize).min(src.buffer.len() / 2);
+                if late > 0 {
+                    src.buffer.drain(..late * 2);
+                    src.buffer_start += late as i64;
+                    log::warn!(
+                        "audio: [{}] dropped {} late frames ({:.1} ms) older than out_pos",
+                        src.name,
+                        late,
+                        late as f64 * 1000.0 / self.rate as f64
+                    );
+                }
             }
             if src.buffer.is_empty() {
                 src.buffer_start = src.buffer_start.max(self.out_pos);
@@ -296,6 +334,18 @@ impl Mixer {
             *s = s.clamp(-1.0, 1.0);
         }
         self.out_pos = target;
+    }
+
+    /// Returns the name, current buffered frame count, and duration in ms for each source.
+    pub fn buffer_status(&self) -> Vec<(&str, usize, f64)> {
+        self.sources
+            .iter()
+            .map(|s| {
+                let frames = s.buffer.len() / 2;
+                let ms = frames as f64 * 1000.0 / self.rate as f64;
+                (s.name.as_str(), frames, ms)
+            })
+            .collect()
     }
 }
 
@@ -394,7 +444,7 @@ mod tests {
         let epoch = Instant::now();
         let q = make_queue();
         let mut mixer = Mixer::new(48_000, epoch, Duration::ZERO);
-        mixer.add_source(q.clone(), 48_000, 1, 1.0);
+        mixer.add_source("test", q.clone(), 48_000, 1, 1.0);
 
         // Chunk 1: 0..20 ms at amplitude +0.5
         q.lock().unwrap().chunks.push_back(Chunk {
@@ -406,19 +456,18 @@ mod tests {
         mixer.mix_until(epoch + Duration::from_millis(100), &mut out1);
         assert_eq!(out1.len(), 4800 * 2);
 
-        // Chunk 2 arrives after an 80 ms gap (> GAP_THRESHOLD = 60 ms): covers 100..120 ms!
+        // Chunk 2 arrives after a 180 ms gap (> GAP_THRESHOLD = 150 ms): covers 180..200 ms!
         q.lock().unwrap().chunks.push_back(Chunk {
-            at: epoch + Duration::from_millis(120),
+            at: epoch + Duration::from_millis(200),
             data: vec![0.8; 960],
         });
         let mut out2 = Vec::new();
-        mixer.mix_until(epoch + Duration::from_millis(120), &mut out2);
-        assert_eq!(out2.len(), 960 * 2);
+        mixer.mix_until(epoch + Duration::from_millis(200), &mut out2);
+        assert_eq!(out2.len(), 4800 * 2);
 
-        // Previously `buffer_start` was 100ms while `next_pos` remained 20ms, shifting
-        // chunk 2 late by +80ms into silence! Now samples after the 2ms click fade
-        // must immediately be +0.8 inside this 100..120ms window.
-        let steady_idx = 200 * 2;
+        // 100..180 ms is inserted silence (0.0). Samples at 185 ms (after the 2 ms click fade)
+        // must immediately be +0.8 inside this 180..200 ms window.
+        let steady_idx = (85 * 48) * 2;
         assert!((out2[steady_idx] - 0.8).abs() < 1e-4, "got {} (shifted gap bug!)", out2[steady_idx]);
         assert!((out2[out2.len() - 2] - 0.8).abs() < 1e-4);
     }
@@ -429,7 +478,7 @@ mod tests {
         let epoch = Instant::now();
         let q = make_queue();
         let mut mixer = Mixer::new(rate, epoch, Duration::ZERO);
-        mixer.add_source(q.clone(), rate, 1, 1.0);
+        mixer.add_source("test", q.clone(), rate, 1, 1.0);
 
         let chunk_frames = 480usize; // 10 ms chunks
         let total_chunks = 40usize; // 400 ms
@@ -480,7 +529,7 @@ mod tests {
         let epoch = Instant::now();
         let q = make_queue();
         let mut mixer = Mixer::new(48_000, epoch, Duration::ZERO);
-        mixer.add_source(q.clone(), 44_100, 1, 1.0);
+        mixer.add_source("test", q.clone(), 44_100, 1, 1.0);
 
         q.lock().unwrap().chunks.push_back(Chunk {
             at: epoch + Duration::from_millis(20),
@@ -508,22 +557,22 @@ mod tests {
         let epoch = Instant::now();
         let q = make_queue();
         let mut mixer = Mixer::new(rate, epoch, Duration::ZERO);
-        mixer.add_source(q.clone(), rate, 1, 1.0);
+        mixer.add_source("test", q.clone(), rate, 1, 1.0);
 
         let chunk_frames = 480usize; // 10 ms
         let mut all = Vec::new();
         // Feed 150 chunks slightly faster than wall clock (+15% synthetic drift)
-        // so buffered lead reliably exceeds MAX_LEAD (400 ms) and triggers trimming.
+        // so buffered lead reliably exceeds MAX_LEAD (500 ms) and triggers trimming.
         for k in 0..150usize {
             let mut data = Vec::with_capacity(chunk_frames);
             for i in 0..chunk_frames {
                 let n = k * chunk_frames + i;
                 data.push((n as f32 * 220.0 * std::f32::consts::TAU / rate as f32).sin() * 0.6);
             }
-            let at = epoch + Duration::from_secs_f64((k + 1) as f64 * 0.0085);
+            let at = epoch + Duration::from_secs_f64((k + 1) as f64 * 0.0075);
             q.lock().unwrap().chunks.push_back(Chunk { at, data });
             if k >= 25 && k % 2 == 0 {
-                mixer.mix_until(epoch + Duration::from_secs_f64(k as f64 * 0.0085 - 0.05), &mut all);
+                mixer.mix_until(epoch + Duration::from_secs_f64(k as f64 * 0.0075 - 0.05), &mut all);
             }
         }
         mixer.mix_until(epoch + Duration::from_secs_f64(1.25), &mut all);
@@ -545,7 +594,7 @@ mod tests {
         let mut mixer = Mixer::new(master_rate, epoch, Duration::ZERO);
 
         // Initial device: 48 kHz stereo (2 ch)
-        let src_id = mixer.add_source(q1.clone(), 48_000, 2, 1.0);
+        let src_id = mixer.add_source("sys", q1.clone(), 48_000, 2, 1.0);
 
         // Deliver 200 ms of audio (20 chunks of 10 ms = 480 frames * 2 ch = 960 floats)
         let chunk_frames_48k = 480usize;
@@ -590,5 +639,83 @@ mod tests {
         // Verify audio after reconnect is present and resampled cleanly to ~0.8
         let reconnected_sample = out[43200 * 2]; // Around 900 ms
         assert!((reconnected_sample - 0.8).abs() < 0.05, "got {}", reconnected_sample);
+    }
+
+    #[test]
+    fn simultaneous_mic_and_jittery_loopback_mixes_cleanly() {
+        let rate = 48_000u32;
+        let epoch = Instant::now();
+        let mic_q = make_queue();
+        let sys_q = make_queue();
+        let mut mixer = Mixer::new(rate, epoch, Duration::ZERO);
+        mixer.add_source("mic", mic_q.clone(), rate, 1, 1.0);
+        mixer.add_source("sys", sys_q.clone(), rate, 2, 1.0);
+
+        // Simulate 1.0 second of audio (100 blocks of 10 ms = 480 frames each).
+        // Mic delivers a constant 0.3 amplitude tone steadily every 10 ms.
+        // Sys delivers a constant 0.5 amplitude tone with jitter, micro-pauses (70 ms), and bursts.
+        let chunk_frames = 480usize;
+        let mut mixed_output = Vec::new();
+
+        // 100 chunks for mic (steady every 10 ms)
+        for k in 0..100 {
+            let data = vec![0.3f32; chunk_frames];
+            mic_q.lock().unwrap().chunks.push_back(Chunk {
+                at: epoch + Duration::from_millis(((k + 1) * 10) as u64),
+                data,
+            });
+        }
+
+        // 100 chunks for sys delivered with jitter, a 70 ms delivery stall, and bursts
+        let mut k = 0;
+        while k < 100 {
+            if k == 30 {
+                // Simulate a 70 ms delivery stall, then a burst of 7 chunks delivered together
+                let stall_end = 37;
+                for j in 30..stall_end {
+                    let data = vec![0.5f32; chunk_frames * 2];
+                    sys_q.lock().unwrap().chunks.push_back(Chunk {
+                        at: epoch + Duration::from_millis(((j + 1) * 10) as u64),
+                        data,
+                    });
+                }
+                k = stall_end;
+            } else {
+                let jitter_offset = match k % 5 {
+                    0 => 0i64,
+                    1 => 12,
+                    2 => -8,
+                    3 => 15,
+                    _ => -5,
+                };
+                let at_ms = (((k + 1) * 10) as i64 + jitter_offset).max(1) as u64;
+                let data = vec![0.5f32; chunk_frames * 2];
+                sys_q.lock().unwrap().chunks.push_back(Chunk {
+                    at: epoch + Duration::from_millis(at_ms),
+                    data,
+                });
+                k += 1;
+            }
+        }
+
+        // Drain incrementally every 20 ms up to 1000 ms, simulating the audio thread loop
+        for t in (20..=1000).step_by(20) {
+            mixer.mix_until(epoch + Duration::from_millis(t as u64), &mut mixed_output);
+        }
+
+        // 1. Exactly 48000 frames (1 second) * 2 channels = 96000 floats
+        assert_eq!(mixed_output.len(), 48_000 * 2);
+
+        // 2. Both signals are mixed: mic (0.3) + sys (0.5) = 0.8
+        // Check energy across the timeline past initial fade-in (e.g. 50ms to 950ms)
+        let start_sample = (50 * 48) * 2;
+        let end_sample = (950 * 48) * 2;
+        for s in &mixed_output[start_sample..end_sample] {
+            assert!(!s.is_nan(), "mixed sample is NaN");
+            assert!(*s >= 0.25 && *s <= 0.85, "sample dropped or corrupted: got {s}");
+        }
+
+        // 3. No silence was mistakenly inserted during continuous audio
+        assert_eq!(mixer.silence_inserted, 0, "silence was unexpectedly inserted!");
     }
 }

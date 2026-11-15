@@ -34,6 +34,14 @@ const MAX_QUEUED_CHUNKS: usize = 512;
 /// packet end times on WASAPI.
 const MAX_CALLBACK_AGE: Duration = Duration::from_millis(250);
 
+/// Telemetry statistics for an audio source stream.
+#[derive(Debug, Default)]
+pub struct AudioSourceStats {
+    pub total_frames: std::sync::atomic::AtomicU64,
+    pub last_chunk_instant: Mutex<Option<Instant>>,
+    pub max_interval_us: std::sync::atomic::AtomicU64,
+}
+
 /// An open input stream; drop to close. Not `Send` on every platform, so keep
 /// it on the thread that created it.
 pub struct AudioSource {
@@ -42,6 +50,7 @@ pub struct AudioSource {
     pub channels: u16,
     pub queue: SharedQueue,
     pub reconnect: Arc<AtomicBool>,
+    pub stats: Arc<AudioSourceStats>,
     _stream: Stream,
     _keepalive: Option<Stream>,
 }
@@ -118,7 +127,7 @@ pub fn open_microphone(name: Option<&str>) -> Result<AudioSource> {
             .ok_or_else(|| anyhow!("input device '{n}' not found"))?
     };
     let config = device.default_input_config().context("microphone default config")?;
-    build(device, config, "microphone", None)
+    build(device, config, "microphone", None, None)
 }
 
 /// Opens a loopback capture of the default output device (what the speakers
@@ -145,7 +154,9 @@ pub fn open_system_loopback_device(name: Option<&str>) -> Result<AudioSource> {
         "system audio capture: standard loopback active ('{}')",
         device_name(&device).unwrap_or_else(|| "default".into())
     );
-    build(device, config, "system audio", keepalive)
+    // Explicit enlarged buffer: ~96 ms (e.g. 4608 frames at 48 kHz) to prevent driver underruns
+    let target_buffer_frames = ((config.sample_rate() as f64) * 0.096).round() as u32;
+    build(device, config, "system audio", keepalive, Some(target_buffer_frames))
 }
 
 /// Opens a shared-mode silent output stream on the loopback playback device.
@@ -206,15 +217,20 @@ fn start_loopback_keepalive(device: &Device) -> Option<Stream> {
         match res {
             Ok(stream) => {
                 if let Err(e) = stream.play() {
-                    log::debug!("loopback keepalive play failed: {e}");
+                    log::warn!("loopback keepalive play failed: {e}");
                     None
                 } else {
-                    log::debug!("loopback silent keepalive active ({format:?}, {} Hz)", config.sample_rate);
+                    log::info!(
+                        "_keepalive: '{}' {} Hz, {} ch, {format:?}, buffer: Default",
+                        device_name(device).unwrap_or_else(|| "default".into()),
+                        config.sample_rate,
+                        config.channels
+                    );
                     Some(stream)
                 }
             }
             Err(e) => {
-                log::debug!("loopback keepalive unavailable: {e}");
+                log::warn!("loopback keepalive unavailable: {e}");
                 None
             }
         }
@@ -226,43 +242,17 @@ fn start_loopback_keepalive(device: &Device) -> Option<Stream> {
     }
 }
 
-fn build(
-    device: Device,
-    supported: cpal::SupportedStreamConfig,
-    what: &str,
-    keepalive: Option<Stream>,
-) -> Result<AudioSource> {
-    let name = device_name(&device).unwrap_or_else(|| what.to_string());
-    let sample_format = supported.sample_format();
-    let config: StreamConfig = supported.into();
-    let queue: SharedQueue = Arc::new(Mutex::new(Queue::default()));
-    let reconnect = Arc::new(AtomicBool::new(false));
-    let err_fn = {
-        let what = what.to_string();
-        let rec = reconnect.clone();
-        move |e| {
-            log::warn!("{what} stream: {e}");
-            rec.store(true, Ordering::SeqCst);
-        }
-    };
-    let q = queue.clone();
-    let mut boosted = false;
-    let mut push = move |data: Vec<f32>, info: &InputCallbackInfo| {
-        if !boosted {
-            boosted = true;
-            #[cfg(windows)]
-            promote_audio_thread();
-        }
-        let ts = info.timestamp();
-        let age = ts.callback.duration_since(ts.capture).min(MAX_CALLBACK_AGE);
-        let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-        let mut q = q.lock().unwrap();
-        if q.chunks.len() >= MAX_QUEUED_CHUNKS {
-            q.chunks.pop_front();
-            q.overflow += 1;
-        }
-        q.chunks.push_back(Chunk { at, data });
-    };
+fn build_input_stream_for_format<F, E>(
+    device: &Device,
+    sample_format: SampleFormat,
+    config: StreamConfig,
+    mut push: F,
+    err_fn: E,
+) -> Result<Stream>
+where
+    F: FnMut(Vec<f32>, &InputCallbackInfo) + Send + 'static,
+    E: FnMut(cpal::Error) + Send + 'static,
+{
     let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
             config,
@@ -300,20 +290,130 @@ fn build(
             err_fn,
             None,
         )?,
-        other => return Err(anyhow!("unsupported sample format {other:?} for {what}")),
+        other => return Err(anyhow!("unsupported sample format {other:?}")),
     };
+    Ok(stream)
+}
+
+fn build(
+    device: Device,
+    supported: cpal::SupportedStreamConfig,
+    what: &str,
+    keepalive: Option<Stream>,
+    target_buffer_frames: Option<u32>,
+) -> Result<AudioSource> {
+    let name = device_name(&device).unwrap_or_else(|| what.to_string());
+    let sample_format = supported.sample_format();
+    let sample_rate = supported.sample_rate();
+    let channels = supported.channels();
+    let queue: SharedQueue = Arc::new(Mutex::new(Queue::default()));
+    let reconnect = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(AudioSourceStats::default());
+
+    let err_fn_gen = {
+        let what = what.to_string();
+        let rec = reconnect.clone();
+        move || {
+            let what = what.clone();
+            let rec = rec.clone();
+            move |e: cpal::Error| {
+                let err_str = e.to_string();
+                let lower = err_str.to_lowercase();
+                let is_transient = e.kind() == cpal::ErrorKind::Xrun
+                    || e.kind() == cpal::ErrorKind::DeviceChanged
+                    || lower.contains("underrun")
+                    || lower.contains("overrun");
+                if is_transient {
+                    log::warn!("audio: {what} stream glitch (transient underrun/overrun, continuing): {err_str}");
+                } else {
+                    log::error!("audio: {what} fatal stream error: {err_str}, triggering reconnect");
+                    rec.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    };
+
+    let push_gen = {
+        let q = queue.clone();
+        let stats = stats.clone();
+        let what = what.to_string();
+        let channels = channels as usize;
+        move || {
+            let q = q.clone();
+            let stats = stats.clone();
+            let what = what.clone();
+            let mut boosted = false;
+            move |data: Vec<f32>, info: &InputCallbackInfo| {
+                if !boosted {
+                    boosted = true;
+                    #[cfg(windows)]
+                    promote_audio_thread();
+                }
+                let now = Instant::now();
+                let frames = data.len() / channels.max(1);
+                stats.total_frames.fetch_add(frames as u64, Ordering::Relaxed);
+                {
+                    let mut last = stats.last_chunk_instant.lock().unwrap();
+                    if let Some(prev) = *last {
+                        let interval_us = now.duration_since(prev).as_micros() as u64;
+                        stats.max_interval_us.fetch_max(interval_us, Ordering::Relaxed);
+                    }
+                    *last = Some(now);
+                }
+                let ts = info.timestamp();
+                let age = ts.callback.duration_since(ts.capture).min(MAX_CALLBACK_AGE);
+                let at = now.checked_sub(age).unwrap_or(now);
+                let mut q = q.lock().unwrap();
+                if q.chunks.len() >= MAX_QUEUED_CHUNKS
+                    && let Some(dropped) = q.chunks.pop_front()
+                {
+                    let dropped_samples = dropped.data.len();
+                    let dropped_frames = dropped_samples / channels.max(1);
+                    q.overflow += 1;
+                    log::warn!(
+                        "audio: [{what}] queue overflow! Dropped chunk with {dropped_frames} frames ({dropped_samples} samples), total overflows: {}",
+                        q.overflow
+                    );
+                }
+                q.chunks.push_back(Chunk { at, data });
+            }
+        }
+    };
+
+    let (stream, buffer_desc) = if let Some(target_frames) = target_buffer_frames {
+        let mut fixed_config: StreamConfig = supported.into();
+        fixed_config.buffer_size = cpal::BufferSize::Fixed(target_frames);
+        match build_input_stream_for_format(&device, sample_format, fixed_config, push_gen(), err_fn_gen()) {
+            Ok(s) => {
+                let ms = target_frames as f64 * 1000.0 / fixed_config.sample_rate as f64;
+                (s, format!("Fixed({target_frames} frames, ~{ms:.1} ms)"))
+            }
+            Err(e) => {
+                log::warn!("audio: {what} failed with fixed buffer {target_frames} frames ({e:#}), falling back to default buffer");
+                let default_config: StreamConfig = supported.into();
+                let s = build_input_stream_for_format(&device, sample_format, default_config, push_gen(), err_fn_gen())?;
+                (s, "Default (fallback)".to_string())
+            }
+        }
+    } else {
+        let default_config: StreamConfig = supported.into();
+        let s = build_input_stream_for_format(&device, sample_format, default_config, push_gen(), err_fn_gen())?;
+        (s, "Default".to_string())
+    };
+
     stream.play().with_context(|| format!("starting {what} stream"))?;
     log::info!(
-        "{what}: '{name}' {} Hz, {} ch, {sample_format:?}",
-        config.sample_rate,
-        config.channels
+        "{what}: '{name}' {} Hz, {} ch, {sample_format:?}, buffer: {buffer_desc}",
+        sample_rate,
+        channels
     );
     Ok(AudioSource {
         name,
-        sample_rate: config.sample_rate,
-        channels: config.channels,
+        sample_rate,
+        channels,
         queue,
         reconnect,
+        stats,
         _stream: stream,
         _keepalive: keepalive,
     })

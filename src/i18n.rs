@@ -460,6 +460,7 @@ strings! {
     SNIP_TOOL_TEXT => "Text", "Text", "Текст", "Текст";
     SNIP_TOOL_PIXELATE => "Blur / Pixelate", "Estompare / Pixelare", "Размытие / Пикселизация", "Розмиття / Пікселізація";
     SNIP_TOOL_UNDO => "Undo (Ctrl+Z)", "Anulează (Ctrl+Z)", "Отменить (Ctrl+Z)", "Скасувати (Ctrl+Z)";
+    SNIP_TOOL_REDO => "Redo (Ctrl+Y)", "Refă (Ctrl+Y)", "Повторить (Ctrl+Y)", "Повторити (Ctrl+Y)";
     SNIP_TOOL_DELETE => "Delete selected (Del)", "Șterge selecția (Del)", "Удалить выбранное (Del)", "Видалити вибране (Del)";
     SNIP_TOOL_SAVE => "Save & Copy (Enter)", "Salvează și copiază (Enter)", "Сохранить и скопировать (Enter)", "Зберегти та скопіювати (Enter)";
     SNIP_TOOL_COPY => "Copy (Ctrl+C)", "Copiază (Ctrl+C)", "Скопировать (Ctrl+C)", "Скопіювати (Ctrl+C)";
@@ -926,6 +927,14 @@ strings! {
         "Вибір області — виділіть мишею, Esc для скасування";
     PICKER_HINT => "Drag to select a region · Esc to cancel", "Trage pentru a selecta o regiune · Esc pentru anulare",
         "Выделите область мышью · Esc для отмены", "Виділіть область мишею · Esc для скасування";
+
+    // ----- System tray -----------------------------------------------------
+    TRAY_OPEN => "Open OpenClip", "Deschide OpenClip", "Открыть OpenClip", "Відкрити OpenClip";
+    TRAY_START_REC => "Start Recording", "Începe înregistrarea", "Начать запись", "Почати запис";
+    TRAY_STOP_REC => "Stop Recording", "Oprește înregistrarea", "Остановить запись", "Зупинити запис";
+    TRAY_EXIT => "Exit", "Ieșire", "Выход", "Вихід";
+    TRAY_TOOLTIP => "OpenClip - Screen Recorder", "OpenClip - Înregistrator de ecran",
+        "OpenClip — запись экрана", "OpenClip — запис екрана";
 }
 
 #[cfg(test)]

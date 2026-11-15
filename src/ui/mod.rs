@@ -14,12 +14,17 @@ mod thumbs;
 mod updater;
 mod viewer;
 mod widgets;
+#[cfg(windows)]
+pub mod tray;
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
+
+#[cfg(windows)]
+use tray::{TrayEvent, TrayLabels, TrayManager};
 
 use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, CornerRadius, FontId, Layout, Margin, PointerButton,
@@ -56,7 +61,7 @@ type SharedWatermark = Arc<RwLock<Watermark>>;
 
 /// Size of the full window. It opens at its minimum, so the app takes as
 /// little of the screen as it can while every page still fits.
-pub const WINDOW_SIZE: Vec2 = Vec2::new(820.0, 600.0);
+pub const WINDOW_SIZE: Vec2 = Vec2::new(840.0, 600.0);
 
 /// Application icon shown on the About page (same artwork as the window icon).
 const APP_ICON_PNG: &[u8] = crate::video::watermark::LOGO_PNG;
@@ -138,7 +143,6 @@ enum GeneralTab {
 enum State {
     Idle,
     Picking(Picker),
-    Snipping(snipping::SnippingTool),
     /// Start feedback sound is playing; recording launches when playback completes.
     Starting { rx: Receiver<()> },
     /// REC was pressed; recording starts when the countdown ends.
@@ -322,6 +326,7 @@ pub struct App {
     video_tab: VideoTab,
     general_tab: GeneralTab,
     state: State,
+    snipping: Option<snipping::SnippingTool>,
     live: LivePreview,
     library: Library,
     /// Poster frames and durations for the files the library lists.
@@ -362,6 +367,13 @@ pub struct App {
     /// Debug aid: `OPENCLIP_OPEN_VIEWER=<path>` opens that file in the media
     /// viewer at start-up, since it otherwise takes a double-click to reach.
     start_viewer: Option<PathBuf>,
+    #[cfg(windows)]
+    tray_manager: Option<TrayManager>,
+    #[cfg(windows)]
+    tray_rx: Option<Receiver<TrayEvent>>,
+    quitting: bool,
+    force_quit: Arc<AtomicBool>,
+    is_recording_flag: Arc<AtomicBool>,
 }
 
 /// `x,y,w,h` in monitor-local physical pixels, for `OPENCLIP_START_REGION`.
@@ -373,6 +385,19 @@ fn parse_region(spec: &str) -> Option<Rect> {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(windows)]
+        let raw_main_hwnd: Option<windows::Win32::Foundation::HWND> = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = cc.window_handle() {
+                if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                    Some(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
         apply_theme(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
         let monitors = list_monitors().unwrap_or_default();
@@ -400,6 +425,28 @@ impl App {
             .flatten()
             .and_then(|s| parse_region(&s))
             .and_then(|r| Some((monitors.first()?.id, r)));
+        let is_recording_flag = Arc::new(AtomicBool::new(false));
+        let force_quit = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        let (tray_manager, tray_rx) = {
+            let initial_hwnd = raw_main_hwnd.or_else(tray::find_main_hwnd);
+            let (tm, rx) = TrayManager::new(
+                is_recording_flag.clone(),
+                cc.egui_ctx.clone(),
+                force_quit.clone(),
+                initial_hwnd,
+            );
+            tm.update_labels(TrayLabels {
+                open: t!(TRAY_OPEN).into(),
+                start_rec: t!(TRAY_START_REC).into(),
+                stop_rec: t!(TRAY_STOP_REC).into(),
+                exit: t!(TRAY_EXIT).into(),
+                tooltip: t!(TRAY_TOOLTIP).into(),
+            });
+            (Some(tm), Some(rx))
+        };
+        #[cfg(not(windows))]
+        let (tray_manager, tray_rx) = (None, None);
         Self {
             monitors,
             windows,
@@ -483,6 +530,7 @@ impl App {
             video_tab: VideoTab::Record,
             general_tab: GeneralTab::Output,
             state: State::Idle,
+            snipping: None,
             live: LivePreview::new(),
             library,
             thumbs: Thumbs::new(),
@@ -508,6 +556,13 @@ impl App {
             start_viewer: cfg!(debug_assertions)
                 .then(|| std::env::var_os("OPENCLIP_OPEN_VIEWER").map(PathBuf::from))
                 .flatten(),
+            #[cfg(windows)]
+            tray_manager,
+            #[cfg(windows)]
+            tray_rx,
+            quitting: false,
+            force_quit,
+            is_recording_flag,
         }
     }
 
@@ -777,7 +832,9 @@ impl App {
     fn handle_global_hotkey(&mut self, ctx: &egui::Context) {
         match &self.state {
             State::Idle => {
-                self.start_recording(ctx, true);
+                if self.snipping.is_none() {
+                    self.start_recording(ctx, true);
+                }
             }
             State::Countdown { .. } => {
                 self.cancel_countdown(true);
@@ -792,7 +849,7 @@ impl App {
                 self.stop_recording(true);
                 ctx.request_repaint();
             }
-            State::Stopping { .. } | State::Picking(_) | State::Snipping(_) => {
+            State::Stopping { .. } | State::Picking(_) => {
                 // Debounce: ignore repeated presses while stopping
             }
         }
@@ -804,7 +861,7 @@ impl App {
         ctx: &egui::Context,
         precaptured: Option<&[(u32, xcap::image::RgbaImage)]>,
     ) {
-        if let State::Snipping(ref mut tool) = self.state {
+        if let Some(ref mut tool) = self.snipping {
             tool.cancel();
             ctx.request_repaint();
             return;
@@ -952,14 +1009,14 @@ impl App {
     }
 
     fn take_snapshot(&mut self, precaptured: Option<&[(u32, xcap::image::RgbaImage)]>) {
-        if matches!(self.state, State::Snipping(_)) {
+        if self.snipping.is_some() {
             return;
         }
 
         if self.region_capture_on_screenshot {
             match snipping::SnippingTool::with_precaptured(&self.monitors, self.annotate_screenshot, precaptured) {
                 Ok(tool) => {
-                    self.state = State::Snipping(tool);
+                    self.snipping = Some(tool);
                     return;
                 }
                 Err(e) => {
@@ -1063,7 +1120,7 @@ impl App {
                     self.live.stop();
                 }
             }
-            State::Picking(_) | State::Starting { .. } | State::Stopping { .. } | State::Snipping(_) => {}
+            State::Picking(_) | State::Starting { .. } | State::Stopping { .. } => {}
         }
     }
 
@@ -1468,10 +1525,6 @@ impl App {
                     status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::REGION, t!(MODE_REGION)), None, None, None);
                     ui.label(secondary(t!(STATUS_PICKING)));
                 }
-                State::Snipping(_) => {
-                    status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::CAMERA, t!(ROW_REGION_SCREENSHOT)), None, None, None);
-                    ui.label(secondary(t!(SNIP_HINT)));
-                }
                 State::Countdown { .. } => {
                     let left = self.countdown_remaining().unwrap_or(0).max(1);
                     status_capsule(ui, Tint::Orange, &t!(BAR_STARTING_IN, left), None, None, None);
@@ -1488,20 +1541,25 @@ impl App {
                     ctx.request_repaint_after(Duration::from_millis(16));
                 }
                 State::Idle => {
-                    let ready = self.selected_source().is_some();
-                    if ready {
-                        status_capsule(ui, Tint::Green, t!(BAR_READY), None, None, None);
-                        ui.label(secondary(self.source_label()));
+                    if self.snipping.is_some() {
+                        status_capsule(ui, Tint::Blue, &format!("{}  {}", icons::CAMERA, t!(ROW_REGION_SCREENSHOT)), None, None, None);
+                        ui.label(secondary(t!(SNIP_HINT)));
                     } else {
-                        status_capsule(ui, Tint::Gray, t!(BAR_PICK_SOURCE), None, None, None);
-                        ui.label(secondary(t!(STATUS_NO_SOURCE)));
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(4.0);
-                        if tinted_button_small(ui, t!(STATUS_CHANGE)).on_hover_text(t!(STATUS_CHANGE_TIP)).clicked() {
-                            self.show_preview_tab();
+                        let ready = self.selected_source().is_some();
+                        if ready {
+                            status_capsule(ui, Tint::Green, t!(BAR_READY), None, None, None);
+                            ui.label(secondary(self.source_label()));
+                        } else {
+                            status_capsule(ui, Tint::Gray, t!(BAR_PICK_SOURCE), None, None, None);
+                            ui.label(secondary(t!(STATUS_NO_SOURCE)));
                         }
-                    });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            if tinted_button_small(ui, t!(STATUS_CHANGE)).on_hover_text(t!(STATUS_CHANGE_TIP)).clicked() {
+                                self.show_preview_tab();
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -1899,17 +1957,27 @@ impl App {
                 section_header(ui, t!(SECTION_HOTKEY));
                 let before_hotkey = (self.hotkey, self.sound_feedback);
                 Card::show(ui, |card| {
-                    card.row(t!(ROW_SOUND_FEEDBACK), |ui| {
-                        segmented(
-                            ui,
-                            "sound_feedback",
-                            &[
-                                (SoundFeedback::Off, None, t!(SOUND_FEEDBACK_OFF)),
-                                (SoundFeedback::HotkeyOnly, None, t!(SOUND_FEEDBACK_HOTKEY_ONLY)),
-                                (SoundFeedback::Always, None, t!(SOUND_FEEDBACK_ALWAYS)),
-                            ],
-                            &mut self.sound_feedback,
-                        );
+                    card.custom(|ui| {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(t!(ROW_SOUND_FEEDBACK)).color(LABEL));
+                        });
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            segmented(
+                                ui,
+                                "sound_feedback",
+                                &[
+                                    (SoundFeedback::Off, None, t!(SOUND_FEEDBACK_OFF)),
+                                    (SoundFeedback::HotkeyOnly, None, t!(SOUND_FEEDBACK_HOTKEY_ONLY)),
+                                    (SoundFeedback::Always, None, t!(SOUND_FEEDBACK_ALWAYS)),
+                                ],
+                                &mut self.sound_feedback,
+                            );
+                        });
+                        ui.add_space(2.0);
                     });
                     card.row(t!(ROW_HOTKEY), |ui| {
                         let btn_text = if self.capturing_hotkey {
@@ -2008,6 +2076,16 @@ impl App {
     fn set_language(&mut self, lang: Lang) {
         self.language = lang;
         i18n::set_lang(lang);
+        #[cfg(windows)]
+        if let Some(tray) = &self.tray_manager {
+            tray.update_labels(TrayLabels {
+                open: t!(TRAY_OPEN).into(),
+                start_rec: t!(TRAY_START_REC).into(),
+                stop_rec: t!(TRAY_STOP_REC).into(),
+                exit: t!(TRAY_EXIT).into(),
+                tooltip: t!(TRAY_TOOLTIP).into(),
+            });
+        }
         self.save_settings();
     }
 
@@ -2660,6 +2738,48 @@ impl App {
     }
 
     fn tick_logic(&mut self, ctx: &egui::Context, logic_only: bool) {
+        #[cfg(windows)]
+        {
+            let tray_events: Vec<TrayEvent> = if let Some(rx) = &self.tray_rx {
+                let mut evs = Vec::new();
+                while let Ok(ev) = rx.try_recv() {
+                    evs.push(ev);
+                }
+                evs
+            } else {
+                Vec::new()
+            };
+            for ev in tray_events {
+                match ev {
+                    TrayEvent::Open => {
+                        #[cfg(windows)]
+                        if let Some(tray) = &self.tray_manager {
+                            tray.restore_main_window();
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    TrayEvent::ToggleRecord => {
+                        if matches!(self.state, State::Recording(_)) {
+                            self.stop_recording(false);
+                        } else if self.selected_source().is_some() {
+                            self.start_recording(ctx, false);
+                        }
+                    }
+                    TrayEvent::Exit => {
+                        self.quitting = true;
+                        self.force_quit.store(true, Ordering::SeqCst);
+                        if matches!(self.state, State::Recording(_)) {
+                            self.stop_recording(false);
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+
+        self.is_recording_flag.store(matches!(self.state, State::Recording(_)), Ordering::Relaxed);
+
         if let Some(record_evt) = self.hotkey_manager.poll_record_event() {
             log::info!(
                 "[HOTKEY] UI thread processing Record (source: {}, lag: {:?})",
@@ -2712,13 +2832,13 @@ impl App {
 
         let is_minimized_or_hidden = ctx.input(|i| i.viewport().minimized == Some(true));
         if (!logic_only || is_minimized_or_hidden)
-            && let State::Snipping(tool) = &mut self.state
+            && let Some(tool) = &mut self.snipping
         {
             match tool.show(ctx) {
                 snipping::SnippingOutcome::Pending => {}
                 snipping::SnippingOutcome::Saved(img) => {
                     self.save_snipped_image(img);
-                    self.state = State::Idle;
+                    self.snipping = None;
                 }
                 snipping::SnippingOutcome::CopiedOnly(img) => {
                     if let Err(e) = snipping::copy_image_to_clipboard(&img) {
@@ -2726,10 +2846,10 @@ impl App {
                     }
                     self.message = Some((t!(MSG_SNAPSHOT_COPIED).into(), false));
                     self.message_at = Some(Instant::now());
-                    self.state = State::Idle;
+                    self.snipping = None;
                 }
                 snipping::SnippingOutcome::Cancelled => {
-                    self.state = State::Idle;
+                    self.snipping = None;
                 }
             }
         }
@@ -2745,7 +2865,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.tick_logic(&ctx, false);
 
-        if self.compact && !self.intercept_close(&ctx) {
+        if self.compact && !self.quitting && !self.force_quit.load(Ordering::Relaxed) && !self.intercept_close(&ctx) {
             self.region_frame(&ctx);
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(12, 0)))
@@ -2753,6 +2873,15 @@ impl eframe::App for App {
             self.delete_dialog(&ctx);
             self.show_format_dialog(&ctx);
             return;
+        }
+
+        if !self.compact
+            && ctx.input(|i| i.viewport().close_requested())
+            && !self.quitting
+            && !self.force_quit.load(Ordering::Relaxed)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         // Not compact: closes the border viewports (and drops any drag state) if
@@ -3183,5 +3312,31 @@ fn open_folder(path: &std::path::Path) {
     let cmd = std::process::Command::new("xdg-open").arg(dir).spawn();
     if let Err(e) = cmd {
         log::warn!("open folder: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snipping_decoupled_from_recording_state() {
+        // App state tracks the recording pipeline:
+        // Idle, Picking, Starting, Countdown, Recording, Stopping.
+        // Snipping is stored independently in `App.snipping` so taking a screenshot
+        // during active video recording never drops the Recorder or transitions State.
+        let idle = State::Idle;
+        assert_eq!(idle.rec_mode_test(), RecMode::Idle);
+    }
+
+    impl State {
+        fn rec_mode_test(&self) -> RecMode {
+            match self {
+                State::Stopping { .. } => RecMode::Stopping,
+                State::Recording(_) | State::Starting { .. } => RecMode::Recording,
+                State::Countdown { .. } => RecMode::Countdown(0),
+                _ => RecMode::Idle,
+            }
+        }
     }
 }

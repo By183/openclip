@@ -60,5 +60,6 @@ pub const FONT: &str = "\u{f031}"; // font / text
 pub const EYE_SLASH: &str = "\u{f070}"; // eye-slash / blur
 pub const COPY: &str = "\u{f0c5}"; // copy
 pub const UNDO: &str = "\u{f0e2}"; // rotate-left / undo
+pub const REDO: &str = "\u{f01e}"; // rotate-right / redo
 pub const ARROWS_ALT: &str = "\u{f0b2}"; // arrows-up-down-left-right / move
 

@@ -303,7 +303,7 @@ pub enum ResizeHandle {
     Left,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Annotation {
     Rect { p1: Pos2, p2: Pos2, color: Color32, width: f32 },
     Arrow { p1: Pos2, p2: Pos2, color: Color32, width: f32 },
@@ -471,7 +471,7 @@ pub fn resize_text_handle_pure(
 }
 
 impl Annotation {
-    pub fn bounding_box(&self) -> Rect {
+    pub fn bounding_box_with_ctx(&self, ctx: Option<&egui::Context>) -> Rect {
         match self {
             Annotation::Rect { p1, p2, width, .. } => {
                 Rect::from_two_pos(*p1, *p2).expand(*width / 2.0 + 4.0)
@@ -503,16 +503,28 @@ impl Annotation {
                 Rect::from_two_pos(*p1, *p2).expand(*width * 2.0 + 4.0)
             }
             Annotation::Text { pos, text, font_size, custom_width, .. } => {
-                let (w, h) = measure_text_size(text, *font_size, *custom_width);
                 let pad_x = 8.0;
                 let pad_y = 5.0;
+                let (w, h) = if let Some(ctx) = ctx {
+                    let wrap_w = custom_width.map(|w| w.max(40.0)).unwrap_or(f32::INFINITY);
+                    let sz = ctx.fonts_mut(|fonts| {
+                        fonts.layout(text.clone(), FontId::proportional(*font_size), Color32::WHITE, wrap_w).size()
+                    });
+                    (sz.x.max(20.0), sz.y.max(*font_size))
+                } else {
+                    measure_text_size(text, *font_size, *custom_width)
+                };
                 Rect::from_min_size(*pos - egui::vec2(pad_x, pad_y), egui::vec2(w + pad_x * 2.0, h + pad_y * 2.0))
             }
             Annotation::Pixelate { rect, .. } => *rect,
         }
     }
 
-    pub fn hit_test(&self, pos: Pos2) -> bool {
+    pub fn bounding_box(&self) -> Rect {
+        self.bounding_box_with_ctx(None)
+    }
+
+    pub fn hit_test_with_ctx(&self, pos: Pos2, ctx: Option<&egui::Context>) -> bool {
         match self {
             Annotation::Rect { p1, p2, width, .. } => {
                 let r = Rect::from_two_pos(*p1, *p2);
@@ -536,12 +548,16 @@ impl Annotation {
                 dist_to_segment(pos, *p1, *p2) <= tol
             }
             Annotation::Text { .. } => {
-                self.bounding_box().expand(6.0).contains(pos)
+                self.bounding_box_with_ctx(ctx).expand(8.0).contains(pos)
             }
             Annotation::Pixelate { rect, .. } => {
                 rect.expand(6.0).contains(pos)
             }
         }
+    }
+
+    pub fn hit_test(&self, pos: Pos2) -> bool {
+        self.hit_test_with_ctx(pos, None)
     }
 
     pub fn translate(&mut self, delta: Vec2) {
@@ -584,12 +600,12 @@ impl Annotation {
 enum DragState {
     None,
     Selecting { start: Pos2, current: Pos2 },
-    Moving { start_rect: Rect, start_pos: Pos2 },
+    Moving { start_rect: Rect, start_pos: Pos2, start_annotations: Vec<Annotation> },
     Resizing { handle: ResizeHandle, start_rect: Rect, start_pos: Pos2 },
     Drawing { start: Pos2, current: Pos2, pen_points: Vec<Pos2> },
-    MovingAnnotation { index: usize, last_pos: Pos2 },
-    ResizingAnnotation { index: usize, handle: ResizeHandle, start_rect: Rect, start_pos: Pos2, start_font_size: f32 },
-    ResizingLine { index: usize, is_p2: bool },
+    MovingAnnotation { index: usize, last_pos: Pos2, start_annotations: Vec<Annotation> },
+    ResizingAnnotation { index: usize, handle: ResizeHandle, start_rect: Rect, start_pos: Pos2, start_font_size: f32, start_annotations: Vec<Annotation> },
+    ResizingLine { index: usize, is_p2: bool, start_annotations: Vec<Annotation> },
 }
 
 struct MonitorView {
@@ -617,6 +633,8 @@ pub struct SnippingTool {
     stroke_width: f32,
     font_size: f32,
     annotations: Vec<Annotation>,
+    undo_stack: Vec<Vec<Annotation>>,
+    redo_stack: Vec<Vec<Annotation>>,
     selected_index: Option<usize>,
     text_input: Option<TextInputState>,
     annotate_enabled: bool,
@@ -646,6 +664,43 @@ impl Drop for SnippingTool {
 }
 
 impl SnippingTool {
+    fn push_undo_snapshot(&mut self) {
+        self.undo_stack.push(self.annotations.clone());
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(std::mem::replace(&mut self.annotations, prev));
+            self.selected_index = None;
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(std::mem::replace(&mut self.annotations, next));
+            self.selected_index = if self.annotations.is_empty() {
+                None
+            } else {
+                Some(self.annotations.len() - 1)
+            };
+        }
+    }
+
+    fn ann_bounding_box(&self, ctx: &egui::Context, ann: &Annotation) -> Rect {
+        ann.bounding_box_with_ctx(Some(ctx))
+    }
+
+    fn ann_hit_test(&self, ctx: &egui::Context, ann: &Annotation, pos: Pos2) -> bool {
+        ann.hit_test_with_ctx(pos, Some(ctx))
+    }
+
+    fn find_hit_annotation(&self, ctx: &egui::Context, pos: Pos2) -> Option<usize> {
+        self.annotations.iter().enumerate().rev()
+            .find(|(_, ann)| self.ann_hit_test(ctx, ann, pos))
+            .map(|(idx, _)| idx)
+    }
+
     /// Captures full-resolution screenshots of all monitors up front (freeze-frame).
     pub fn new(monitors: &[MonitorInfo], annotate_enabled: bool) -> Result<Self> {
         Self::with_precaptured(monitors, annotate_enabled, None)
@@ -682,6 +737,8 @@ impl SnippingTool {
             stroke_width: 4.0,
             font_size: 22.0,
             annotations: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             selected_index: None,
             text_input: None,
             annotate_enabled,
@@ -766,21 +823,26 @@ impl SnippingTool {
             && let Some(idx) = self.selected_index.take()
             && idx < self.annotations.len()
         {
+            self.push_undo_snapshot();
             self.annotations.remove(idx);
         }
 
-        // 3. Other hotkeys (Enter via Win32 hardware key + egui, Ctrl+C, Ctrl+Z)
-        let (egui_enter, copy_hotkey, undo_hotkey) = ctx.input(|inp| {
+        // 3. Other hotkeys (Enter via Win32 hardware key + egui, Ctrl+C, Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z)
+        let (egui_enter, copy_hotkey, undo_hotkey, redo_hotkey) = ctx.input(|inp| {
             let enter = inp.key_pressed(Key::Enter);
             let copy = inp.modifiers.matches_exact(Modifiers::CTRL) && inp.key_pressed(Key::C);
             let undo = inp.modifiers.matches_exact(Modifiers::CTRL) && inp.key_pressed(Key::Z);
-            (enter, copy, undo)
+            let redo = (inp.modifiers.matches_exact(Modifiers::CTRL) && inp.key_pressed(Key::Y))
+                || ((inp.modifiers.ctrl && inp.modifiers.shift) && inp.key_pressed(Key::Z));
+            (enter, copy, undo, redo)
         });
         let enter = raw_enter || egui_enter;
 
         if undo_hotkey {
-            self.annotations.pop();
-            self.selected_index = None;
+            self.undo();
+        }
+        if redo_hotkey {
+            self.redo();
         }
 
         // Ensure selected_index is within bounds
@@ -892,7 +954,7 @@ impl SnippingTool {
                         hovered_ann_handle = self.hit_test_rect_handle(Rect::from_two_pos(*p1, *p2), pos);
                     }
                     Annotation::Text { .. } => {
-                        hovered_ann_handle = hit_test_text_handle(self.annotations[idx].bounding_box(), pos);
+                        hovered_ann_handle = hit_test_text_handle(self.ann_bounding_box(&ctx, &self.annotations[idx]), pos);
                     }
                     Annotation::Arrow { p1, p2, .. } | Annotation::Line { p1, p2, .. } => {
                         hovered_line_handle = self.hit_test_endpoint_handle(*p1, *p2, pos);
@@ -904,9 +966,7 @@ impl SnippingTool {
             if hovered_ann_handle.is_none() && hovered_line_handle.is_none()
                 && let Some(pos) = pointer_pos.filter(|p| current_sel.is_some_and(|sel| sel.contains(*p)))
             {
-                hovered_ann_idx = self.annotations.iter().enumerate().rev()
-                    .find(|(_, ann)| ann.hit_test(pos))
-                    .map(|(idx, _)| idx);
+                hovered_ann_idx = self.find_hit_annotation(&ctx, pos);
             }
         }
 
@@ -1015,7 +1075,7 @@ impl SnippingTool {
                             self.draw_rect_handles(&painter, r);
                         }
                         Annotation::Text { .. } => {
-                            let bbox = ann.bounding_box();
+                            let bbox = self.ann_bounding_box(&ctx, ann);
                             painter.rect_stroke(bbox.expand(1.5), 0.0, Stroke::new(1.5, BLUE), egui::StrokeKind::Outside);
                             self.draw_text_handles(&painter, bbox);
                         }
@@ -1023,7 +1083,7 @@ impl SnippingTool {
                             self.draw_endpoint_handles(&painter, *p1, *p2);
                         }
                         _ => {
-                            let bbox = ann.bounding_box();
+                            let bbox = self.ann_bounding_box(&ctx, ann);
                             painter.rect_stroke(
                                 bbox.expand(4.0),
                                 4.0,
@@ -1036,7 +1096,7 @@ impl SnippingTool {
 
                 // Highlight hovered annotation with light bounding box if not already selected
                 if let Some(ann) = hovered_ann_idx.filter(|idx| Some(*idx) != self.selected_index).and_then(|idx| self.annotations.get(idx)) {
-                    let bbox = ann.bounding_box();
+                    let bbox = self.ann_bounding_box(&ctx, ann);
                     painter.rect_stroke(
                         bbox.expand(3.0),
                         3.0,
@@ -1138,7 +1198,7 @@ impl SnippingTool {
         let rmb_clicked = resp.secondary_clicked() || ctx.input(|inp| inp.pointer.button_clicked(PointerButton::Secondary));
         if (rmb_clicked || resp.double_clicked()) && self.tool == Tool::Select
             && let Some(pos) = pointer_pos
-            && let Some(idx) = self.annotations.iter().enumerate().rev().find(|(_, ann)| ann.hit_test(pos)).map(|(i, _)| i)
+            && let Some(idx) = self.find_hit_annotation(&ctx, pos)
         {
             if let Annotation::Text { pos: tpos, text: ttext, color: tcolor, font_size: tfont_size, custom_width: tcustom_width } = &self.annotations[idx] {
                 let state = TextInputState {
@@ -1148,6 +1208,7 @@ impl SnippingTool {
                     color: *tcolor,
                     custom_width: *tcustom_width,
                 };
+                self.push_undo_snapshot();
                 self.annotations.remove(idx);
                 self.text_input = Some(state);
                 self.selected_index = None;
@@ -1172,7 +1233,7 @@ impl SnippingTool {
                             match &self.annotations[idx] {
                                 Annotation::Pixelate { rect, .. } => self.hit_test_rect_handle(*rect, press_origin).map(|h| (idx, h)),
                                 Annotation::Rect { p1, p2, .. } => self.hit_test_rect_handle(Rect::from_two_pos(*p1, *p2), press_origin).map(|h| (idx, h)),
-                                Annotation::Text { .. } => hit_test_text_handle(self.annotations[idx].bounding_box(), press_origin).map(|h| (idx, h)),
+                                Annotation::Text { .. } => hit_test_text_handle(self.ann_bounding_box(&ctx, &self.annotations[idx]), press_origin).map(|h| (idx, h)),
                                 _ => None,
                             }
                         } else {
@@ -1194,7 +1255,7 @@ impl SnippingTool {
                             let (r, sfs) = match &self.annotations[idx] {
                                 Annotation::Pixelate { rect, .. } => (*rect, 0.0),
                                 Annotation::Rect { p1, p2, .. } => (Rect::from_two_pos(*p1, *p2), 0.0),
-                                Annotation::Text { font_size, .. } => (self.annotations[idx].bounding_box(), *font_size),
+                                Annotation::Text { font_size, .. } => (self.ann_bounding_box(&ctx, &self.annotations[idx]), *font_size),
                                 _ => (Rect::ZERO, 0.0),
                             };
                             self.drag = DragState::ResizingAnnotation {
@@ -1203,28 +1264,47 @@ impl SnippingTool {
                                 start_rect: r,
                                 start_pos: press_origin,
                                 start_font_size: sfs,
+                                start_annotations: self.annotations.clone(),
                             };
                         } else if let Some((idx, is_p2)) = hit_line_handle {
-                            self.drag = DragState::ResizingLine { index: idx, is_p2 };
+                            self.drag = DragState::ResizingLine {
+                                index: idx,
+                                is_p2,
+                                start_annotations: self.annotations.clone(),
+                            };
                         // 2. Selected annotation body
-                        } else if let Some(idx) = self.selected_index.filter(|&i| i < self.annotations.len()).filter(|&i| self.annotations[i].hit_test(press_origin)) {
-                            self.drag = DragState::MovingAnnotation { index: idx, last_pos: press_origin };
+                        } else if let Some(idx) = self.selected_index.filter(|&i| i < self.annotations.len()).filter(|&i| self.ann_hit_test(&ctx, &self.annotations[i], press_origin)) {
+                            self.drag = DragState::MovingAnnotation {
+                                index: idx,
+                                last_pos: press_origin,
+                                start_annotations: self.annotations.clone(),
+                            };
                         // 3. Other annotations (unselected)
-                        } else if let Some(idx) = self.annotations.iter().enumerate().rev().find(|(_, ann)| ann.hit_test(press_origin)).map(|(i, _)| i) {
+                        } else if let Some(idx) = self.find_hit_annotation(&ctx, press_origin) {
                             self.selected_index = Some(idx);
-                            self.drag = DragState::MovingAnnotation { index: idx, last_pos: press_origin };
+                            self.drag = DragState::MovingAnnotation {
+                                index: idx,
+                                last_pos: press_origin,
+                                start_annotations: self.annotations.clone(),
+                            };
                         // 4. Crop handles
                         } else if let Some(handle) = self.hit_test_handle(sel, press_origin) {
                             self.drag = DragState::Resizing { handle, start_rect: sel, start_pos: press_origin };
                         // 5. Inside main crop
                         } else if sel.contains(press_origin) {
                             self.selected_index = None;
-                            self.drag = DragState::Moving { start_rect: sel, start_pos: press_origin };
+                            self.drag = DragState::Moving {
+                                start_rect: sel,
+                                start_pos: press_origin,
+                                start_annotations: self.annotations.clone(),
+                            };
                         // 6. Outside main crop
                         } else {
                             self.selected_index = None;
                             self.selection = None;
                             self.annotations.clear();
+                            self.undo_stack.clear();
+                            self.redo_stack.clear();
                             self.drag = DragState::Selecting { start: press_origin, current: press_origin };
                         }
                     } else if self.tool != Tool::Text {
@@ -1240,6 +1320,8 @@ impl SnippingTool {
                         } else {
                             self.selection = None;
                             self.annotations.clear();
+                            self.undo_stack.clear();
+                            self.redo_stack.clear();
                             self.drag = DragState::Selecting { start: press_origin, current: press_origin };
                         }
                     } else {
@@ -1247,6 +1329,8 @@ impl SnippingTool {
                         if !sel.contains(press_origin) {
                             self.selection = None;
                             self.annotations.clear();
+                            self.undo_stack.clear();
+                            self.redo_stack.clear();
                             self.drag = DragState::Selecting { start: press_origin, current: press_origin };
                         }
                     }
@@ -1265,14 +1349,14 @@ impl SnippingTool {
                         self.drag = DragState::Selecting { start: origin, current: cur };
                     }
                 }
-                DragState::MovingAnnotation { index, last_pos } => {
+                DragState::MovingAnnotation { index, last_pos, .. } => {
                     let delta = cur - *last_pos;
                     if let Some(ann) = self.annotations.get_mut(*index) {
                         ann.translate(delta);
                     }
                     *last_pos = cur;
                 }
-                DragState::ResizingAnnotation { index, handle, start_rect, start_pos, start_font_size } => {
+                DragState::ResizingAnnotation { index, handle, start_rect, start_pos, start_font_size, .. } => {
                     let delta = cur - *start_pos;
                     let mut r = *start_rect;
                     match handle {
@@ -1321,7 +1405,7 @@ impl SnippingTool {
                         self.font_size = *font_size;
                     }
                 }
-                DragState::ResizingLine { index, is_p2 } => {
+                DragState::ResizingLine { index, is_p2, .. } => {
                     if let Some(Annotation::Arrow { p1, p2, .. } | Annotation::Line { p1, p2, .. }) = self.annotations.get_mut(*index) {
                         if *is_p2 {
                             *p2 = cur;
@@ -1333,10 +1417,14 @@ impl SnippingTool {
                 DragState::Selecting { current, .. } => {
                     *current = cur;
                 }
-                DragState::Moving { start_rect, start_pos } => {
+                DragState::Moving { start_rect, start_pos, start_annotations } => {
                     let delta = cur - *start_pos;
                     let moved = start_rect.translate(delta);
                     self.selection = Some((i, moved.intersect(full)));
+                    self.annotations = start_annotations.clone();
+                    for ann in &mut self.annotations {
+                        ann.translate(delta);
+                    }
                 }
                 DragState::Resizing { handle, start_rect, start_pos } => {
                     let delta = cur - *start_pos;
@@ -1368,7 +1456,7 @@ impl SnippingTool {
 
         if resp.drag_stopped() {
             match std::mem::replace(&mut self.drag, DragState::None) {
-                DragState::MovingAnnotation { index, .. } | DragState::ResizingAnnotation { index, .. } => {
+                DragState::MovingAnnotation { index, start_annotations, .. } => {
                     let target_rect = match self.annotations.get(index) {
                         Some(Annotation::Pixelate { rect, .. }) => Some(*rect),
                         _ => None,
@@ -1378,6 +1466,38 @@ impl SnippingTool {
                         if let Some(Annotation::Pixelate { blocks: b, .. }) = self.annotations.get_mut(index) {
                             *b = blocks;
                         }
+                    }
+                    if self.annotations != start_annotations {
+                        self.undo_stack.push(start_annotations);
+                        self.redo_stack.clear();
+                    }
+                }
+                DragState::ResizingAnnotation { index, start_annotations, .. } => {
+                    let target_rect = match self.annotations.get(index) {
+                        Some(Annotation::Pixelate { rect, .. }) => Some(*rect),
+                        _ => None,
+                    };
+                    if let Some(r) = target_rect {
+                        let blocks = self.compute_pixelate_blocks(r, i, full);
+                        if let Some(Annotation::Pixelate { blocks: b, .. }) = self.annotations.get_mut(index) {
+                            *b = blocks;
+                        }
+                    }
+                    if self.annotations != start_annotations {
+                        self.undo_stack.push(start_annotations);
+                        self.redo_stack.clear();
+                    }
+                }
+                DragState::ResizingLine { start_annotations, .. } => {
+                    if self.annotations != start_annotations {
+                        self.undo_stack.push(start_annotations);
+                        self.redo_stack.clear();
+                    }
+                }
+                DragState::Moving { start_annotations, .. } => {
+                    if self.annotations != start_annotations {
+                        self.undo_stack.push(start_annotations);
+                        self.redo_stack.clear();
                     }
                 }
                 DragState::Selecting { start, current } => {
@@ -1404,7 +1524,9 @@ impl SnippingTool {
                             if let Annotation::Pixelate { rect, ref mut blocks } = ann {
                                 *blocks = self.compute_pixelate_blocks(rect, i, full);
                             }
+                            self.push_undo_snapshot();
                             self.annotations.push(ann);
+                            self.selected_index = Some(self.annotations.len() - 1);
                         }
                     }
                 }
@@ -1417,7 +1539,7 @@ impl SnippingTool {
             && let Some(pos) = resp.interact_pointer_pos()
         {
             if self.tool == Tool::Select {
-                let hit = self.annotations.iter().enumerate().rev().find(|(_, ann)| ann.hit_test(pos)).map(|(i, _)| i);
+                let hit = self.find_hit_annotation(&ctx, pos);
                 if let Some(idx) = hit {
                     self.selected_index = Some(idx);
                 } else if current_sel.is_some_and(|sel| sel.contains(pos)) {
@@ -1439,7 +1561,11 @@ impl SnippingTool {
             let mut close_text = false;
             let pad_x = 8.0;
             let pad_y = 5.0;
-            let (w, h) = measure_text_size(&state.buffer, state.font_size, state.custom_width);
+            let wrap_w = state.custom_width.map(|w| w.max(40.0)).unwrap_or(f32::INFINITY);
+            let (w, h) = ctx.fonts_mut(|fonts| {
+                let sz = fonts.layout(state.buffer.clone(), FontId::proportional(state.font_size), Color32::WHITE, wrap_w).size();
+                (sz.x.max(40.0), sz.y.max(state.font_size))
+            });
             let text_rect = Rect::from_min_size(
                 state.pos - egui::vec2(pad_x, pad_y),
                 egui::vec2(w + pad_x * 2.0, h + pad_y * 2.0),
@@ -1472,6 +1598,7 @@ impl SnippingTool {
                         state.buffer.pop();
                     }
                     if !state.buffer.trim().is_empty() {
+                        self.push_undo_snapshot();
                         self.annotations.push(Annotation::Text {
                             pos: state.pos,
                             text: state.buffer.clone(),
@@ -1479,6 +1606,7 @@ impl SnippingTool {
                             font_size: state.font_size,
                             custom_width: state.custom_width,
                         });
+                        self.selected_index = Some(self.annotations.len() - 1);
                     }
                     close_text = true;
                 }
@@ -1658,14 +1786,13 @@ impl SnippingTool {
                 painter.line_segment([*p1, *p2], Stroke::new(*width * 3.5, c));
             }
             Annotation::Text { pos, text, color, font_size, custom_width } => {
-                let (w, h) = measure_text_size(text, *font_size, *custom_width);
+                let wrap_w = custom_width.map(|w| w.max(40.0)).unwrap_or(f32::INFINITY);
+                let galley = painter.layout(text.clone(), FontId::proportional(*font_size), *color, wrap_w);
+                let text_size = galley.size();
                 let pad_x = 8.0;
                 let pad_y = 5.0;
-                let pill_rect = Rect::from_min_size(*pos - egui::vec2(pad_x, pad_y), egui::vec2(w + pad_x * 2.0, h + pad_y * 2.0));
+                let pill_rect = Rect::from_min_size(*pos - egui::vec2(pad_x, pad_y), text_size + egui::vec2(pad_x * 2.0, pad_y * 2.0));
                 painter.rect_filled(pill_rect, 4.0, Color32::from_black_alpha(180));
-
-                let wrap_w = custom_width.unwrap_or(w).max(40.0);
-                let galley = painter.layout(text.clone(), FontId::proportional(*font_size), *color, wrap_w);
                 painter.galley(*pos, galley, *color);
             }
             Annotation::Pixelate { blocks, .. } => {
@@ -1815,18 +1942,30 @@ impl SnippingTool {
                                     if resp.clicked() {
                                         self.color = c;
                                         if let Some(idx) = self.selected_index
-                                            && let Some(ann) = self.annotations.get_mut(idx)
+                                            && let Some(ann) = self.annotations.get(idx)
                                         {
-                                            match ann {
+                                            let current_c = match ann {
                                                 Annotation::Rect { color, .. }
                                                 | Annotation::Arrow { color, .. }
                                                 | Annotation::Line { color, .. }
                                                 | Annotation::Pen { color, .. }
                                                 | Annotation::Marker { color, .. }
-                                                | Annotation::Text { color, .. } => {
-                                                    *color = c;
+                                                | Annotation::Text { color, .. } => Some(*color),
+                                                Annotation::Pixelate { .. } => None,
+                                            };
+                                            if let Some(cur) = current_c && cur != c {
+                                                self.push_undo_snapshot();
+                                                match &mut self.annotations[idx] {
+                                                    Annotation::Rect { color, .. }
+                                                    | Annotation::Arrow { color, .. }
+                                                    | Annotation::Line { color, .. }
+                                                    | Annotation::Pen { color, .. }
+                                                    | Annotation::Marker { color, .. }
+                                                    | Annotation::Text { color, .. } => {
+                                                        *color = c;
+                                                    }
+                                                    Annotation::Pixelate { .. } => {}
                                                 }
-                                                Annotation::Pixelate { .. } => {}
                                             }
                                         }
                                     }
@@ -1840,12 +1979,17 @@ impl SnippingTool {
                                 if is_text_mode {
                                     let smaller_text = RichText::new("A−").size(12.0).color(Color32::WHITE);
                                     if ui.button(smaller_text).on_hover_text(crate::t!(SNIP_TOOL_TEXT_SMALLER)).clicked() {
-                                        self.font_size = (self.font_size - 4.0).clamp(12.0, 96.0);
+                                        let new_fs = (self.font_size - 4.0).clamp(12.0, 96.0);
                                         if let Some(idx) = self.selected_index
                                             && let Some(Annotation::Text { font_size, .. }) = self.annotations.get_mut(idx)
+                                            && *font_size != new_fs
                                         {
-                                            *font_size = self.font_size;
+                                            self.push_undo_snapshot();
+                                            if let Some(Annotation::Text { font_size, .. }) = self.annotations.get_mut(idx) {
+                                                *font_size = new_fs;
+                                            }
                                         }
+                                        self.font_size = new_fs;
                                     }
 
                                     let cur_fs = if let Some(idx) = self.selected_index {
@@ -1861,12 +2005,17 @@ impl SnippingTool {
 
                                     let larger_text = RichText::new("A+").size(12.0).color(Color32::WHITE);
                                     if ui.button(larger_text).on_hover_text(crate::t!(SNIP_TOOL_TEXT_LARGER)).clicked() {
-                                        self.font_size = (self.font_size + 4.0).clamp(12.0, 96.0);
+                                        let new_fs = (self.font_size + 4.0).clamp(12.0, 96.0);
                                         if let Some(idx) = self.selected_index
                                             && let Some(Annotation::Text { font_size, .. }) = self.annotations.get_mut(idx)
+                                            && *font_size != new_fs
                                         {
-                                            *font_size = self.font_size;
+                                            self.push_undo_snapshot();
+                                            if let Some(Annotation::Text { font_size, .. }) = self.annotations.get_mut(idx) {
+                                                *font_size = new_fs;
+                                            }
                                         }
+                                        self.font_size = new_fs;
                                     }
                                 } else {
                                     // Stroke width
@@ -1885,8 +2034,18 @@ impl SnippingTool {
                                                     | Annotation::Pen { width, .. }
                                                     | Annotation::Marker { width, .. }
                                                 ) = self.annotations.get_mut(idx)
+                                                && *width != w
                                             {
-                                                *width = w;
+                                                self.push_undo_snapshot();
+                                                if let Some(
+                                                    Annotation::Rect { width, .. }
+                                                    | Annotation::Arrow { width, .. }
+                                                    | Annotation::Line { width, .. }
+                                                    | Annotation::Pen { width, .. }
+                                                    | Annotation::Marker { width, .. }
+                                                ) = self.annotations.get_mut(idx) {
+                                                    *width = w;
+                                                }
                                             }
                                         }
                                     }
@@ -1895,11 +2054,17 @@ impl SnippingTool {
                                 ui.separator();
 
                                 // Undo
-                                let can_undo = !self.annotations.is_empty();
+                                let can_undo = !self.undo_stack.is_empty();
                                 let undo_text = RichText::new(icons::UNDO).size(14.0).color(if can_undo { Color32::WHITE } else { Color32::from_gray(80) });
                                 if ui.add_enabled(can_undo, egui::Button::new(undo_text)).on_hover_text(crate::t!(SNIP_TOOL_UNDO)).clicked() {
-                                    self.annotations.pop();
-                                    self.selected_index = None;
+                                    self.undo();
+                                }
+
+                                // Redo
+                                let can_redo = !self.redo_stack.is_empty();
+                                let redo_text = RichText::new(icons::REDO).size(14.0).color(if can_redo { Color32::WHITE } else { Color32::from_gray(80) });
+                                if ui.add_enabled(can_redo, egui::Button::new(redo_text)).on_hover_text(crate::t!(SNIP_TOOL_REDO)).clicked() {
+                                    self.redo();
                                 }
 
                                 // Trash (Delete selected annotation)
@@ -1909,6 +2074,7 @@ impl SnippingTool {
                                     && let Some(idx) = self.selected_index.take()
                                     && idx < self.annotations.len()
                                 {
+                                    self.push_undo_snapshot();
                                     self.annotations.remove(idx);
                                 }
 
@@ -2601,5 +2767,92 @@ mod tests {
             None,
         );
         assert_eq!(fs_huge, 96.0);
+    }
+
+    #[test]
+    fn test_text_annotation_hit_test_and_translate_large_font() {
+        let mut text_ann = Annotation::Text {
+            pos: Pos2::new(100.0, 200.0),
+            text: "LARGE 96PT ANNOTATION TEXT".into(),
+            color: Color32::WHITE,
+            font_size: 96.0,
+            custom_width: None,
+        };
+
+        // 1. Hit testing at various points with font size 96
+        // Near text origin / anchor
+        assert!(text_ann.hit_test(Pos2::new(100.0, 200.0)));
+        // Inside top-left padding
+        assert!(text_ann.hit_test(Pos2::new(96.0, 196.0)));
+        // In the middle of the text line
+        assert!(text_ann.hit_test(Pos2::new(300.0, 240.0)));
+        // Point far outside should not hit
+        assert!(!text_ann.hit_test(Pos2::new(50.0, 50.0)));
+        assert!(!text_ann.hit_test(Pos2::new(100.0, 400.0)));
+
+        // 2. Also verify with egui Context fonts
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(text_ann.hit_test_with_ctx(Pos2::new(100.0, 200.0), Some(&ctx)));
+        assert!(text_ann.hit_test_with_ctx(Pos2::new(300.0, 240.0), Some(&ctx)));
+        assert!(!text_ann.hit_test_with_ctx(Pos2::new(50.0, 50.0), Some(&ctx)));
+
+        // 3. Translation (moving the annotation)
+        let delta = Vec2::new(150.0, -80.0);
+        let orig_bbox = text_ann.bounding_box();
+        text_ann.translate(delta);
+
+        if let Annotation::Text { pos, .. } = text_ann {
+            assert_eq!(pos, Pos2::new(250.0, 120.0));
+        } else {
+            panic!("expected text annotation");
+        }
+
+        let new_bbox = text_ann.bounding_box();
+        assert_eq!(new_bbox.min, orig_bbox.min + delta);
+        assert_eq!(new_bbox.max, orig_bbox.max + delta);
+
+        // Old position no longer hits
+        assert!(!text_ann.hit_test(Pos2::new(100.0, 200.0)));
+        // New position hits
+        assert!(text_ann.hit_test(Pos2::new(250.0, 120.0)));
+        assert!(text_ann.hit_test(Pos2::new(450.0, 160.0)));
+
+        // 4. Undo/Redo simulation of text annotation translation
+        let initial = vec![Annotation::Text {
+            pos: Pos2::new(100.0, 200.0),
+            text: "LARGE 96PT ANNOTATION TEXT".into(),
+            color: Color32::WHITE,
+            font_size: 96.0,
+            custom_width: None,
+        }];
+        let mut annotations = initial.clone();
+        let mut undo_stack: Vec<Vec<Annotation>> = Vec::new();
+        let mut redo_stack: Vec<Vec<Annotation>> = Vec::new();
+
+        // Drag move starts & finishes:
+        let start_annotations = annotations.clone();
+        annotations[0].translate(delta);
+        if annotations != start_annotations {
+            undo_stack.push(start_annotations);
+            redo_stack.clear();
+        }
+        assert_ne!(annotations, initial);
+
+        // User hits Ctrl+Z (Undo)
+        if let Some(prev) = undo_stack.pop() {
+            redo_stack.push(std::mem::replace(&mut annotations, prev));
+        }
+        assert_eq!(annotations, initial);
+
+        // User hits Ctrl+Y (Redo)
+        if let Some(next) = redo_stack.pop() {
+            undo_stack.push(std::mem::replace(&mut annotations, next));
+        }
+        assert_ne!(annotations, initial);
+        if let Annotation::Text { pos, .. } = annotations[0] {
+            assert_eq!(pos, Pos2::new(250.0, 120.0));
+        }
     }
 }

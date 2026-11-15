@@ -3235,6 +3235,7 @@ dependencies = [
  "mp4-atom",
  "openclip-overlay",
  "openh264",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
