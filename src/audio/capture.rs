@@ -326,7 +326,7 @@ fn promote_audio_thread() {
     use windows::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
     };
-        // SAFETY: `GetCurrentThread()` returns a pseudo-handle for the calling thread.
+    // SAFETY: `GetCurrentThread()` returns a pseudo-handle for the calling thread.
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
@@ -381,6 +381,7 @@ mod watcher {
     impl DeviceNotificationListener {
         pub fn new() -> Self {
             let changed = Arc::new(AtomicBool::new(false));
+            // SAFETY: Initializes COM on the current thread and registers the endpoint notification callback.
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
                 let enumerator: windows::core::Result<IMMDeviceEnumerator> =
@@ -414,6 +415,7 @@ mod watcher {
     impl Drop for DeviceNotificationListener {
         fn drop(&mut self) {
             if let (Some(enumerator), Some(client)) = (&self.enumerator, &self.client) {
+                // SAFETY: Unregisters the client callback before releasing COM interfaces.
                 unsafe {
                     let _ = enumerator.UnregisterEndpointNotificationCallback(client);
                 }

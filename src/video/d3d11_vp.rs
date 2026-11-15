@@ -317,6 +317,7 @@ impl GpuOverlayCompositor {
         Ok(())
     }
 
+    // SAFETY: Maps dynamic 64-byte CB0 with WRITE_DISCARD and copies shader parameters.
     unsafe fn update_cb(
         &self,
         rect: [f32; 4],
@@ -325,6 +326,7 @@ impl GpuOverlayCompositor {
         target_size: [f32; 4],
     ) -> Result<()> {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: Caller guarantees valid context and constant buffer.
         unsafe {
             self.context
                 .Map(&self.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
@@ -348,11 +350,12 @@ impl GpuOverlayCompositor {
         overlay: Option<&GpuOverlayInput>,
     ) -> Result<&ID3D11Texture2D> {
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: Queries source texture description.
         unsafe { src.GetDesc(&mut src_desc) };
         self.ensure_scratch(crop_w, crop_h, src_desc.Format)?;
         let (_, _, _, scratch_tex, scratch_rtv) = self.scratch.as_ref().unwrap();
 
-        // 1. Copy cropped source region into scratch texture at (0, 0)
+        // Copy cropped source region into scratch texture at (0, 0)
         let src_box = D3D11_BOX {
             left: src_rect.left as u32,
             top: src_rect.top as u32,
@@ -361,6 +364,7 @@ impl GpuOverlayCompositor {
             bottom: src_rect.bottom as u32,
             back: 1,
         };
+        // SAFETY: Copies subresource within valid texture bounds.
         unsafe {
             self.context.CopySubresourceRegion(
                 scratch_tex,
@@ -374,7 +378,8 @@ impl GpuOverlayCompositor {
             );
         }
 
-        // 2. Set up pipeline state
+        // Configure pipeline state
+        // SAFETY: Sets viewport, render target, blend state, and shaders for overlay pass.
         unsafe {
             let viewport = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
@@ -398,7 +403,7 @@ impl GpuOverlayCompositor {
             self.context.GSSetShader(None, None);
         }
 
-        // 3. Draw Watermark if enabled
+        // Watermark overlay
         if self.watermark.any_overlay() {
             let badge_h = self.watermark.badge_height(crop_h);
             if let Err(e) = self.ensure_watermark_tex(badge_h) {
@@ -413,6 +418,7 @@ impl GpuOverlayCompositor {
                 let ndc_h = -(*bh as f32 / crop_h as f32) * 2.0;
                 let opacity = (self.watermark.opacity.min(100) as f32) / 100.0;
 
+                // SAFETY: Updates CB0 and issues 4-vertex draw call for sprite.
                 unsafe {
                     self.update_cb(
                         [ndc_x, ndc_y, ndc_w, ndc_h],
@@ -427,12 +433,12 @@ impl GpuOverlayCompositor {
             }
         }
 
-        // 4. Draw Mouse effects if active and input available
+        // Mouse effects
         if let Some(input) = overlay {
             let cursor = input.cursor;
             let scale = input.scale;
 
-            // 4a. Highlight halo
+            // Highlight halo
             if self.mouse_fx.highlight && self.mouse_fx.highlight_opacity > 0 {
                 let r = HIGHLIGHT_RADIUS * self.mouse_fx.highlight_size as f32 / 100.0 * scale;
                 let (cx, cy) = (cursor.0 as f32, cursor.1 as f32);
@@ -448,6 +454,7 @@ impl GpuOverlayCompositor {
                     let ndc_h = -((y1 - y0) / crop_h as f32) * 2.0;
                     let col = self.mouse_fx.highlight_color;
                     let alpha = (self.mouse_fx.highlight_opacity.min(100) as f32) / 100.0;
+                    // SAFETY: Updates CB0 and issues 4-vertex draw call for shape shader.
                     unsafe {
                         self.update_cb(
                             [ndc_x, ndc_y, ndc_w, ndc_h],
@@ -461,7 +468,7 @@ impl GpuOverlayCompositor {
                 }
             }
 
-            // 4b. Click ripples
+            // Click ripples
             if self.mouse_fx.click_effect {
                 for &(x, y, age, right) in &input.clicks {
                     let t = age.clamp(0.0, 1.0);
@@ -482,6 +489,7 @@ impl GpuOverlayCompositor {
                         let ndc_h = -((y1 - y0) / crop_h as f32) * 2.0;
                         let col = if right { self.mouse_fx.right_color } else { self.mouse_fx.left_color };
                         let alpha = 0.9 * (1.0 - t);
+                        // SAFETY: Updates CB0 and issues 4-vertex draw call for shape shader.
                         unsafe {
                             self.update_cb(
                                 [ndc_x, ndc_y, ndc_w, ndc_h],
@@ -496,7 +504,7 @@ impl GpuOverlayCompositor {
                 }
             }
 
-            // 4c. Custom cursor sprite if draws_cursor()
+            // Custom cursor arrow
             if self.mouse_fx.draws_cursor() {
                 if let Err(e) = self.ensure_cursor_tex() {
                     log::warn!("failed to ensure cursor arrow texture: {e}");
@@ -510,6 +518,7 @@ impl GpuOverlayCompositor {
                     let ndc_y = 1.0 - (y0 / crop_h as f32) * 2.0;
                     let ndc_w = (w / crop_w as f32) * 2.0;
                     let ndc_h = -(h / crop_h as f32) * 2.0;
+                    // SAFETY: Updates CB0 and issues 4-vertex draw call for cursor sprite.
                     unsafe {
                         self.update_cb(
                             [ndc_x, ndc_y, ndc_w, ndc_h],
@@ -525,7 +534,8 @@ impl GpuOverlayCompositor {
             }
         }
 
-        // 5. Unbind render target and SRV so texture can be read by VideoProcessor
+        // Unbind render target and SRV so texture can be read by VideoProcessor
+        // SAFETY: Clears OM and PS bindings.
         unsafe {
             self.context.OMSetRenderTargets(None, None);
             self.context.PSSetShaderResources(0, Some(&[None]));
@@ -1729,7 +1739,6 @@ mod tests {
                 SysMemSlicePitch: 0,
             };
             if unsafe { pb.device.CreateTexture2D(&nv12_desc, Some(&nv12_init), Some(&mut pb_nv12)) }.is_ok() {
-                eprintln!("pb_nv12 created with bind={bind:#x}");
                 break;
             }
         }
