@@ -8,8 +8,7 @@
 [![Сборка](https://img.shields.io/github/actions/workflow/status/By183/openclip/release.yml?style=flat-square&label=build)](https://github.com/By183/openclip/actions/workflows/release.yml)
 [![Лицензия](https://img.shields.io/badge/license-Apache--2.0-8e8e93?style=flat-square)](LICENSE)
 
-[![СКАЧАТЬ](https://img.shields.io/badge/DOWNLOAD-latest%20release-0a84ff?style=for-the-badge&logo=github&logoColor=white)](https://github.com/By183/openclip/releases)
-[![ПОСЛЕДНИЙ РЕЛИЗ](https://img.shields.io/badge/LATEST%20RELEASE-v0.2.0-0a84ff?style=for-the-badge&logo=github&logoColor=white)](https://github.com/By183/openclip/releases/latest)
+[![Скачать](https://img.shields.io/badge/Скачать-последний%20релиз-0a84ff?style=for-the-badge&logo=github&logoColor=white)](https://github.com/By183/openclip/releases/latest)
 
 <br>
 
