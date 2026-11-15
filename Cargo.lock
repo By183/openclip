@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "openclip-hook"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "openclip-overlay",
  "windows 0.62.2",
@@ -3256,7 +3256,7 @@ dependencies = [
 
 [[package]]
 name = "openclip-overlay"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ab_glyph",
  "serde",
