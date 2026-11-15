@@ -194,12 +194,3 @@ Third-party bundled libraries and assets:
 
 Based on the original [openclip](https://github.com/catalingrigoriev285/openclip) created by [Catalin Grigoriev](https://github.com/catalingrigoriev285).
 
----
-
-## Roadmap
-
-* [x] **Fragmented MP4 (`fMP4`)**: Real-time progressive fragment muxing protecting recordings from power loss.
-* [x] **GPU Cursor Overlays**: Direct3D 11 HLSL shader rendering of cursor highlights, click ripples, and watermarks without CPU fallback.
-* [x] **Dynamic Custom Text Watermark**: Inter font Cyrillic and Latin badge with live preview.
-* [x] **Dynamic Audio Device Recovery**: Hot-reconnection of audio endpoints if a USB microphone or headset is unplugged during a session.
-* [ ] **Multi-Monitor Annotation Offsets**: Multi-monitor coordinate normalization for screenshot crop frame selections.
