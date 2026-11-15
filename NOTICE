@@ -26,11 +26,11 @@ You may obtain a copy of the License at:
      and/or other materials provided with the distribution.
 
 ### LAME MP3 Encoder
-* **Component:** LAME MP3 audio encoder library (via `mp3lame-encoder` crate)
-* **License:** GNU Lesser General Public License (LGPL), Version 2.0 or later
+* **Component:** LAME MP3 audio encoder library (via `mp3lame-encoder` / `mp3lame-sys` crates)
+* **License:** GNU Lesser General Public License (LGPL), Version 3.0
 * **Notice:**
   Copyright (c) 1999-2020 The LAME Project.
-  Distributed under the terms of the GNU LGPL v2.0+.
+  Distributed under the terms of the GNU LGPL v3.0.
 
 ---
 
