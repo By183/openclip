@@ -26,10 +26,15 @@ pub use openclip_overlay::INTER_SEMIBOLD;
 /// App icon artwork, also used for the window icon and the About page.
 pub const LOGO_PNG: &[u8] = include_bytes!("../../assets/android-chrome-192x192.png");
 
-/// The wordmark, drawn as one run so kerning is applied across the split.
-const WORDMARK: &str = "openclip";
+/// Default text for the brand badge.
+pub const WORDMARK: &str = "openclip";
 /// Characters from here on take the accent colour ("open" | "clip").
 const ACCENT_FROM: usize = 4;
+
+/// Default watermark text for serialization and defaults.
+pub fn default_watermark_text() -> String {
+    WORDMARK.to_string()
+}
 
 /// systemOrange — the same accent as the icon's corner brackets and the region frame.
 const ACCENT: [u8; 3] = [0xff, 0x9f, 0x0a];
@@ -52,9 +57,8 @@ const LAYOUT: Layout = Layout {
     max_height_fraction: 0.25,
 };
 
-/// User-facing watermark settings. Percentages are integers so the struct can
-/// derive `Eq` and the settings pages can diff it with `!=`, like [`super::mouse_fx::MouseFx`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// User-facing watermark settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Watermark {
     pub enabled: bool,
@@ -63,18 +67,27 @@ pub struct Watermark {
     pub size: u32,
     /// Badge opacity in percent.
     pub opacity: u32,
+    /// Custom watermark text.
+    #[serde(default = "default_watermark_text")]
+    pub text: String,
 }
 
 impl Default for Watermark {
     fn default() -> Self {
-        Self { enabled: true, position: Corner::default(), size: 100, opacity: 100 }
+        Self {
+            enabled: true,
+            position: Corner::default(),
+            size: 100,
+            opacity: 100,
+            text: default_watermark_text(),
+        }
     }
 }
 
 impl Watermark {
     /// Whether anything would be painted at all.
     pub fn any_overlay(&self) -> bool {
-        self.enabled && self.opacity > 0
+        self.enabled && self.opacity > 0 && !self.text.trim().is_empty()
     }
 
     /// Pill height in pixels for a frame `frame_h` pixels tall.
@@ -106,13 +119,22 @@ fn blit(sprite: &Sprite, frame: &mut RawFrame, x0: i32, y0: i32, opacity: f32) {
     }
 }
 
+/// Cache key for dynamic watermark composition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatermarkCacheKey {
+    pub text: String,
+    pub scale_pct: u32,
+    pub opacity_pct: u32,
+    pub height: u32,
+}
+
 /// Composes and caches the badge. Not part of [`Watermark`] so the settings stay
 /// a plain value type; one renderer lives on the encode thread, one in the GUI.
 pub struct WatermarkRenderer {
     text: TextRenderer,
     logo: RgbaImage,
-    /// The badge composed for one pixel height; recomposed when it changes.
-    cache: Option<(u32, Sprite)>,
+    /// The badge composed for a given (text, scale, opacity, height) key.
+    cache: Option<(WatermarkCacheKey, Sprite)>,
 }
 
 impl WatermarkRenderer {
@@ -130,14 +152,30 @@ impl WatermarkRenderer {
         Some(Self { text, logo, cache: None })
     }
 
-    /// The badge at `height` pixels tall, composing it if it is not cached.
-    pub fn sprite(&mut self, height: u32) -> &Sprite {
+    /// The badge for `wm` at `height` pixels tall, composing it if not cached.
+    pub fn sprite_for(&mut self, wm: &Watermark, height: u32) -> &Sprite {
+        self.sprite_themed(&wm.text, wm.size, wm.opacity, height)
+    }
+
+    /// Dynamic rasterization with cache key `(text, scale_pct, opacity_pct)`.
+    pub fn sprite_themed(&mut self, text: &str, scale_pct: u32, opacity_pct: u32, height: u32) -> &Sprite {
         let height = height.max(1);
-        if self.cache.as_ref().map(|(h, _)| *h) != Some(height) {
-            let sprite = self.compose(height);
-            self.cache = Some((height, sprite));
+        let key = WatermarkCacheKey {
+            text: text.to_string(),
+            scale_pct,
+            opacity_pct,
+            height,
+        };
+        if self.cache.as_ref().map(|(k, _)| k) != Some(&key) {
+            let sprite = self.compose(text, height);
+            self.cache = Some((key, sprite));
         }
         &self.cache.as_ref().expect("just composed").1
+    }
+
+    /// Backward-compatible method: "openclip" badge at `height` pixels tall.
+    pub fn sprite(&mut self, height: u32) -> &Sprite {
+        self.sprite_themed(WORDMARK, 100, 100, height)
     }
 
     /// Paints the badge, recording the pixels under it so
@@ -146,7 +184,10 @@ impl WatermarkRenderer {
         if !wm.any_overlay() {
             return;
         }
-        let sprite = self.sprite(wm.badge_height(frame.height));
+        let sprite = self.sprite_for(wm, wm.badge_height(frame.height));
+        if sprite.width == 0 || sprite.height == 0 {
+            return;
+        }
         let Some((x, y)) = wm.place((sprite.width, sprite.height), (frame.width, frame.height)) else {
             return;
         };
@@ -162,36 +203,57 @@ impl WatermarkRenderer {
         self.paint(wm, frame, &mut patches);
     }
 
-    fn compose(&self, height: u32) -> Sprite {
-        let h = height as f32;
-        let pad = h * 0.34;
-        let gap = h * 0.30;
-        let logo_px = (h * 0.62).round().clamp(1.0, h) as u32;
-        let font_px = h * 0.44;
-        let text_w = self.text.width(WORDMARK, font_px);
-        let width = (pad + logo_px as f32 + gap + text_w + pad).ceil().max(1.0) as u32;
-        let mut sprite = Sprite::new(width, height);
-
-        // The pill, plus a hairline just inside its edge.
-        sprite.fill_pill(h / 2.0, (SCRIM, SCRIM_ALPHA), (TEXT, HAIRLINE_ALPHA));
-
-        // The icon.
-        let logo = self.logo_at(logo_px);
-        let lx = pad.round() as i32;
-        let ly = ((h - logo_px as f32) / 2.0).round() as i32;
-        for (px, py, p) in logo.enumerate_pixels() {
-            let [r, g, b, a] = p.0;
-            sprite.put(lx + px as i32, ly + py as i32, [r, g, b], a as f32 / 255.0);
+    fn compose(&self, text: &str, height: u32) -> Sprite {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Sprite::new(0, 0);
         }
 
-        // The wordmark, "open" in white and "clip" in the accent colour, drawn
-        // as one run so kerning is applied across the split.
-        let pen = pad + logo_px as f32 + gap;
-        let baseline = self.text.baseline(font_px, h);
-        self.text.draw_run(&mut sprite, WORDMARK, font_px, (pen, baseline), TEXT_ALPHA, |i| {
-            if i < ACCENT_FROM { TEXT } else { ACCENT }
-        });
-        sprite
+        let h = height as f32;
+        if trimmed.eq_ignore_ascii_case(WORDMARK) {
+            let pad = h * 0.34;
+            let gap = h * 0.30;
+            let logo_px = (h * 0.62).round().clamp(1.0, h) as u32;
+            let font_px = h * 0.44;
+            let text_w = self.text.width(WORDMARK, font_px);
+            let width = (pad + logo_px as f32 + gap + text_w + pad).ceil().max(1.0) as u32;
+            let mut sprite = Sprite::new(width, height);
+
+            // The pill, plus a hairline just inside its edge.
+            sprite.fill_pill(h / 2.0, (SCRIM, SCRIM_ALPHA), (TEXT, HAIRLINE_ALPHA));
+
+            // The icon.
+            let logo = self.logo_at(logo_px);
+            let lx = pad.round() as i32;
+            let ly = ((h - logo_px as f32) / 2.0).round() as i32;
+            for (px, py, p) in logo.enumerate_pixels() {
+                let [r, g, b, a] = p.0;
+                sprite.put(lx + px as i32, ly + py as i32, [r, g, b], a as f32 / 255.0);
+            }
+
+            // The wordmark, "open" in white and "clip" in the accent colour, drawn
+            // as one run so kerning is applied across the split.
+            let pen = pad + logo_px as f32 + gap;
+            let baseline = self.text.baseline(font_px, h);
+            self.text.draw_run(&mut sprite, WORDMARK, font_px, (pen, baseline), TEXT_ALPHA, |i| {
+                if i < ACCENT_FROM { TEXT } else { ACCENT }
+            });
+            sprite
+        } else {
+            // Clean dark semi-transparent pill adapted dynamically to custom text length.
+            let pad = h * 0.40;
+            let font_px = h * 0.46;
+            let text_w = self.text.width(trimmed, font_px);
+            let width = (pad + text_w + pad).ceil().max(1.0) as u32;
+            let mut sprite = Sprite::new(width, height);
+
+            sprite.fill_pill(h / 2.0, (SCRIM, SCRIM_ALPHA), (TEXT, HAIRLINE_ALPHA));
+
+            let pen = pad;
+            let baseline = self.text.baseline(font_px, h);
+            self.text.draw(&mut sprite, trimmed, font_px, (pen, baseline), TEXT, TEXT_ALPHA);
+            sprite
+        }
     }
 
     /// The icon resized to `px` square. Alpha is premultiplied around the
@@ -336,11 +398,56 @@ mod tests {
 
     #[test]
     fn settings_round_trip_json() {
-        let wm = Watermark { enabled: false, position: Corner::TopLeft, size: 150, opacity: 60 };
+        let wm = Watermark { enabled: false, position: Corner::TopLeft, size: 150, opacity: 60, text: "@channel".into() };
         let text = serde_json::to_string(&wm).unwrap();
         assert_eq!(serde_json::from_str::<Watermark>(&text).unwrap(), wm);
         // Missing fields fall back to the defaults.
         let partial: Watermark = serde_json::from_str(r#"{"opacity":50}"#).unwrap();
         assert_eq!(partial, Watermark { opacity: 50, ..Default::default() });
+    }
+
+    #[test]
+    fn badge_width_adapts_to_text_length() {
+        let mut r = renderer();
+        let wm_short = Watermark { text: "ab".into(), ..Default::default() };
+        let wm_long = Watermark { text: "abcdefghijklmnopqrstuvwxyz123456".into(), ..Default::default() };
+        let s_short = r.sprite_for(&wm_short, 40);
+        let w_short = s_short.width;
+        let s_long = r.sprite_for(&wm_long, 40);
+        let w_long = s_long.width;
+        assert!(w_long > w_short * 2, "long text ({w_long}px) must be significantly wider than short ({w_short}px)");
+    }
+
+    #[test]
+    fn renders_cyrillic_and_latin_glyphs_cleanly() {
+        let mut r = renderer();
+        let cases = [
+            ("Latin @Channel", "latin text"),
+            ("Тест @Канал", "cyrillic russian"),
+            ("Запис екрана", "cyrillic ukrainian"),
+        ];
+        for (text, desc) in cases {
+            let wm = Watermark { text: text.into(), ..Default::default() };
+            let s = r.sprite_for(&wm, 40);
+            assert!(s.width > 40, "{desc}: pill should be wider than height");
+            let has_text_coverage = s.rgba.chunks_exact(4).any(|p| p[3] > 180 && p[0] > 180 && p[0] == p[1] && p[1] == p[2]);
+            assert!(has_text_coverage, "{desc}: text must be drawn in white with solid coverage");
+        }
+    }
+
+    #[test]
+    fn safe_handling_of_empty_and_whitespace_string() {
+        let mut r = renderer();
+        let empty_cases = ["", "   ", "\t\n  \r\n"];
+        for text in empty_cases {
+            let wm = Watermark { text: text.into(), ..Default::default() };
+            assert!(!wm.any_overlay(), "empty watermark must not be active");
+            let s = r.sprite_for(&wm, 40);
+            assert_eq!(s.width, 0, "empty text produces 0-width sprite");
+            assert_eq!(s.height, 0, "empty text produces 0-height sprite");
+            let mut f = frame(640, 360, PixelFormat::Bgra);
+            r.apply(&wm, &mut f);
+            assert!(f.data.iter().all(|&b| b == 0), "empty watermark must leave frame untouched");
+        }
     }
 }

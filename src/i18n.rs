@@ -413,14 +413,17 @@ strings! {
     POS_BOTTOM_LEFT => "Bottom left", "Stânga jos", "Снизу слева", "Знизу ліворуч";
     POS_BOTTOM_RIGHT => "Bottom right", "Dreapta jos", "Снизу справа", "Знизу праворуч";
     ROW_WATERMARK => "Watermark", "Filigran", "Водяной знак", "Водяний знак";
+    ROW_WATERMARK_TEXT => "Watermark text", "Text filigran", "Текст водяного знака", "Текст водяного знака";
+    WATERMARK_TEXT_PLACEHOLDER => "openclip, @channel, etc.", "openclip, @canal etc.", "openclip, @канал и т.д.", "openclip, @канал тощо";
+    RESET_TO_DEFAULT => "Reset to default", "Restabilește valoarea implicită", "Сбросить по умолчанию", "Скинути за замовчуванням";
     WATERMARK_PREVIEW_HINT => "Shown larger than it will appear in the recording.",
         "Afișat mai mare decât va apărea în înregistrare.",
         "Показан крупнее, чем будет в записи.",
         "Показаний більшим, ніж буде у записі.";
-    WATERMARK_FOOTNOTE => "Added to recordings and snapshots. openclip is free and open source — you can turn it off.",
-        "Adăugat la înregistrări și capturi. openclip este gratuit și open source — îl poți dezactiva.",
-        "Добавляется к записям и снимкам. openclip бесплатен и с открытым кодом — его можно отключить.",
-        "Додається до записів і знімків. openclip безкоштовний і з відкритим кодом — його можна вимкнути.";
+    WATERMARK_FOOTNOTE => "Custom text overlay is applied to recordings and screenshots. You can turn it off anytime.",
+        "Textul personalizat se aplică pe înregistrări și capturi de ecran. Îl poți dezactiva oricând.",
+        "Пользовательский текст накладывается на записи и снимки экрана. Его можно отключить в любой момент.",
+        "Користувацький текст накладається на записи та знімки екрана. Його можна вимкнути у будь-який момент.";
 
     // ----- Image page ------------------------------------------------------
     SECTION_SNAPSHOT => "Snapshot", "Captură de ecran", "Снимок экрана", "Знімок екрана";

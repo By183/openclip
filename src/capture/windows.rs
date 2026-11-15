@@ -180,7 +180,7 @@ impl Handler {
                 crop_size,
                 out_size,
                 gpu.mouse_fx.clone(),
-                gpu.watermark,
+                gpu.watermark.clone(),
             )?;
             self.gpu_expected_crop = Some(crop_size);
             self.gpu_vp = Some(vp);

@@ -216,7 +216,7 @@ impl LivePreview {
                 let (cursor, clicks) = s.mapped(origin, (1.0, 1.0));
                 fx.apply(&mut frame, cursor, &clicks, 1.0);
             }
-            let wm = *wm.read().unwrap();
+            let wm = wm.read().unwrap().clone();
             if wm.any_overlay() {
                 if badge.is_none() && !badge_failed {
                     badge = WatermarkRenderer::new();
@@ -276,8 +276,8 @@ pub struct App {
     /// use; stays `None` when the bundled artwork cannot be loaded.
     watermark_renderer: Option<WatermarkRenderer>,
     watermark_unavailable: bool,
-    /// The badge texture on the Watermark tab, and the pixel height it is for.
-    watermark_tex: Option<(u32, TextureHandle)>,
+    /// The badge texture on the Watermark tab, and its cache key (text, size, opacity, px).
+    watermark_tex: Option<((String, u32, u32, u32), TextureHandle)>,
     /// The in-game frame-rate counter's appearance.
     fps_overlay: FpsOverlay,
     /// Composes the counter for the Game tab's preview.
@@ -416,7 +416,13 @@ impl App {
             encoder_rx: Some(encoder_rx),
             mouse_fx: Arc::new(RwLock::new(settings.mouse_fx)),
             fx_demo_clicks: Vec::new(),
-            watermark: Arc::new(RwLock::new(settings.watermark)),
+            watermark: {
+                let mut wm = settings.watermark;
+                if !settings.watermark_text.is_empty() && wm.text == crate::video::watermark::default_watermark_text() {
+                    wm.text = settings.watermark_text;
+                }
+                Arc::new(RwLock::new(wm))
+            },
             watermark_renderer: None,
             watermark_unavailable: false,
             watermark_tex: None,
@@ -555,7 +561,8 @@ impl App {
             audio_track_mode: self.audio_track_mode,
             bitrate_presets: self.bitrate_presets.clone(),
             mouse_fx: self.mouse_fx.read().unwrap().clone(),
-            watermark: *self.watermark.read().unwrap(),
+            watermark: self.watermark.read().unwrap().clone(),
+            watermark_text: self.watermark.read().unwrap().text.clone(),
             fps_overlay: self.fps_overlay,
             game_consented: self.game_consented,
             game_ignored: self.game_ignored.clone(),
@@ -867,7 +874,7 @@ impl App {
             // buffer, so cursor and click effects would land in an unrelated
             // corner of the picture. The watermark is frame-relative and fine.
             mouse_fx: if game { MouseFx::default_off() } else { self.mouse_fx.read().unwrap().clone() },
-            watermark: *self.watermark.read().unwrap(),
+            watermark: self.watermark.read().unwrap().clone(),
             system_audio: self.system_audio,
             system_audio_device: self.system_audio_device.clone(),
             system_audio_gain: self.system_audio_volume as f32 / 100.0,
@@ -966,7 +973,7 @@ impl App {
             return;
         };
         let path = self.timestamped("png");
-        let wm = *self.watermark.read().unwrap();
+        let wm = self.watermark.read().unwrap().clone();
         let result = (|| {
             let mut frame = screenshot_source(&source)?;
             if let Some(r) = self.watermark_renderer() {
@@ -985,7 +992,7 @@ impl App {
 
     fn save_snipped_image(&mut self, mut img: xcap::image::RgbaImage) {
         let path = self.timestamped("png");
-        let wm = *self.watermark.read().unwrap();
+        let wm = self.watermark.read().unwrap().clone();
         if wm.any_overlay() {
             let (w, h) = (img.width(), img.height());
             let mut frame = crate::video::RawFrame {
@@ -2271,8 +2278,8 @@ impl App {
     }
 
     fn video_watermark_tab(&mut self, ui: &mut egui::Ui) {
-        let current = *self.watermark.read().unwrap();
-        let mut wm = current;
+        let current = self.watermark.read().unwrap().clone();
+        let mut wm = current.clone();
         if ui.available_width() >= FX_SETTINGS_W + FX_GAP + FX_PREVIEW_W {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -2332,8 +2339,11 @@ impl App {
         let rel = wm.badge_height(1080) as f32 / 1080.0;
         let h = (rect.height() * rel * EXAGGERATION).max(12.0);
         let px = (h * ui.ctx().pixels_per_point()).round() as u32;
-        let Some(tex) = self.watermark_texture(ui.ctx(), px) else { return };
+        let Some(tex) = self.watermark_texture(ui.ctx(), wm, px) else { return };
         let size = tex.size_vec2();
+        if size.x == 0.0 || size.y == 0.0 {
+            return;
+        }
         let (w, m) = (h * size.x / size.y.max(1.0), h * 0.55);
         let (left, top) = (rect.left() + m, rect.top() + m);
         let (right, bottom) = (rect.right() - w - m, rect.bottom() - h - m);
@@ -2348,13 +2358,17 @@ impl App {
         p.image(tex.id(), egui::Rect::from_min_size(min, Vec2::new(w, h)), uv, tint);
     }
 
-    /// The badge as a texture, recomposed only when its size changes.
-    fn watermark_texture(&mut self, ctx: &egui::Context, px: u32) -> Option<TextureHandle> {
-        if self.watermark_tex.as_ref().map(|(h, _)| *h) != Some(px) {
-            let sprite = self.watermark_renderer()?.sprite(px);
+    /// The badge as a texture, recomposed when text, size, opacity or px change.
+    fn watermark_texture(&mut self, ctx: &egui::Context, wm: &Watermark, px: u32) -> Option<TextureHandle> {
+        let key = (wm.text.clone(), wm.size, wm.opacity, px);
+        if self.watermark_tex.as_ref().map(|(k, _)| k) != Some(&key) {
+            let sprite = self.watermark_renderer()?.sprite_for(wm, px);
+            if sprite.width == 0 || sprite.height == 0 {
+                return None;
+            }
             let image =
                 ColorImage::from_rgba_unmultiplied([sprite.width as usize, sprite.height as usize], &sprite.rgba);
-            self.watermark_tex = Some((px, ctx.load_texture("watermark", image, TextureOptions::LINEAR)));
+            self.watermark_tex = Some((key, ctx.load_texture("watermark", image, TextureOptions::LINEAR)));
         }
         self.watermark_tex.as_ref().map(|(_, tex)| tex.clone())
     }
@@ -2915,6 +2929,29 @@ fn watermark_cards(ui: &mut egui::Ui, wm: &mut Watermark) {
             ui.add_enabled_ui(wm.enabled, |ui| {
                 ui.add(egui::DragValue::new(&mut wm.opacity).range(0..=100).suffix(" %"));
                 ui.add(egui::Slider::new(&mut wm.opacity, 0..=100).show_value(false));
+            });
+        });
+        card.row(t!(ROW_WATERMARK_TEXT).trim(), |ui| {
+            ui.add_enabled_ui(wm.enabled, |ui| {
+                ui.horizontal(|ui| {
+                    let mut text = wm.text.clone();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .hint_text(t!(WATERMARK_TEXT_PLACEHOLDER))
+                            .desired_width(170.0),
+                    );
+                    if response.changed() {
+                        if text.chars().count() > 48 {
+                            text = text.chars().take(48).collect();
+                        }
+                        wm.text = text;
+                    }
+                    if !wm.text.eq_ignore_ascii_case("openclip")
+                        && ui.small_button("↺").on_hover_text(t!(RESET_TO_DEFAULT)).clicked()
+                    {
+                        wm.text = "openclip".to_string();
+                    }
+                });
             });
         });
     });

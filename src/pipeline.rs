@@ -732,7 +732,7 @@ fn start_capture(
                         }
                     }),
                     mouse_fx: config.mouse_fx.clone(),
-                    watermark: config.watermark,
+                    watermark: config.watermark.clone(),
                     sampler: sampler.clone(),
                     origin_tracker: Some(origin_tracker),
                 }

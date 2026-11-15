@@ -129,7 +129,7 @@ pub struct GpuOverlayCompositor {
     sampler: ID3D11SamplerState,
     cb: ID3D11Buffer,
     scratch: Option<(u32, u32, DXGI_FORMAT, ID3D11Texture2D, ID3D11RenderTargetView)>,
-    watermark_tex: Option<(u32, u32, ID3D11Texture2D, ID3D11ShaderResourceView)>,
+    watermark_tex: Option<(String, u32, u32, ID3D11Texture2D, ID3D11ShaderResourceView)>,
     cursor_tex: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
     watermark_renderer: Option<WatermarkRenderer>,
     pub mouse_fx: MouseFx,
@@ -260,7 +260,8 @@ impl GpuOverlayCompositor {
 
     fn ensure_watermark_tex(&mut self, height: u32) -> Result<()> {
         let height = height.max(1);
-        if let Some((_, h, ..)) = &self.watermark_tex
+        if let Some((text, _, h, ..)) = &self.watermark_tex
+            && text == &self.watermark.text
             && *h == height
         {
             return Ok(());
@@ -271,8 +272,12 @@ impl GpuOverlayCompositor {
         let Some(renderer) = &mut self.watermark_renderer else {
             bail!("WatermarkRenderer unavailable");
         };
-        let sprite = renderer.sprite(height);
+        let sprite = renderer.sprite_for(&self.watermark, height);
         let (w, h) = (sprite.width, sprite.height);
+        if w == 0 || h == 0 {
+            self.watermark_tex = None;
+            return Ok(());
+        }
 
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
@@ -299,7 +304,7 @@ impl GpuOverlayCompositor {
         unsafe { self.device.CreateShaderResourceView(&tex, None, Some(&mut srv)) }
             .context("CreateShaderResourceView(watermark)")?;
         let srv = srv.ok_or_else(|| anyhow!("CreateShaderResourceView returned None"))?;
-        self.watermark_tex = Some((w, h, tex, srv));
+        self.watermark_tex = Some((self.watermark.text.clone(), w, h, tex, srv));
         Ok(())
     }
 
@@ -398,7 +403,8 @@ impl GpuOverlayCompositor {
             let badge_h = self.watermark.badge_height(crop_h);
             if let Err(e) = self.ensure_watermark_tex(badge_h) {
                 log::warn!("failed to ensure watermark texture: {e}");
-            } else if let Some((bw, bh, _, srv)) = &self.watermark_tex
+            } else if let Some((_, bw, bh, _, srv)) = &self.watermark_tex
+                && *bw > 0 && *bh > 0
                 && let Some((x, y)) = self.watermark.place((*bw, *bh), (crop_w, crop_h))
             {
                 let ndc_x = (x as f32 / crop_w as f32) * 2.0 - 1.0;
@@ -1791,6 +1797,7 @@ mod tests {
             position: crate::video::watermark::Corner::TopRight,
             size: 100,
             opacity: 80,
+            ..Default::default()
         };
 
         let mut compositor = match GpuOverlayCompositor::new(&device, &context, mouse_fx, watermark) {
@@ -1865,7 +1872,7 @@ mod tests {
             (w, h),
             (w, h),
             compositor.mouse_fx.clone(),
-            compositor.watermark,
+            compositor.watermark.clone(),
         ) {
             let (slot, _) = vp
                 .convert_timed(

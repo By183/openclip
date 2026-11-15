@@ -10,7 +10,7 @@ use crate::i18n::Lang;
 use crate::t;
 use crate::video::encoder::EncoderInfo;
 use crate::video::mouse_fx::MouseFx;
-use crate::video::watermark::Watermark;
+use crate::video::watermark::{default_watermark_text, Watermark};
 use openclip_overlay::FpsOverlay;
 
 /// Output container.
@@ -690,6 +690,9 @@ pub struct Settings {
     pub mouse_fx: MouseFx,
     /// The openclip badge burned into recordings and snapshots.
     pub watermark: Watermark,
+    /// Custom watermark text displayed on recordings and snapshots.
+    #[serde(default = "default_watermark_text")]
+    pub watermark_text: String,
     /// The frame-rate counter openclip's hook draws inside a game.
     pub fps_overlay: FpsOverlay,
     /// Whether the one-time explanation of what game mode loads into a game has
@@ -740,6 +743,7 @@ impl Default for Settings {
             bitrate_presets: Vec::new(),
             mouse_fx: MouseFx::default(),
             watermark: Watermark::default(),
+            watermark_text: default_watermark_text(),
             fps_overlay: FpsOverlay::default(),
             game_consented: false,
             game_ignored: Vec::new(),
@@ -763,6 +767,11 @@ impl Settings {
         self.system_audio_volume = self.system_audio_volume.clamp(0, 200);
         self.mic_volume = self.mic_volume.clamp(0, 200);
         normalize_bitrate_presets(&mut self.bitrate_presets);
+        if !self.watermark_text.is_empty() && self.watermark.text == default_watermark_text() {
+            self.watermark.text = self.watermark_text.clone();
+        } else if !self.watermark.text.is_empty() && self.watermark_text == default_watermark_text() {
+            self.watermark_text = self.watermark.text.clone();
+        }
     }
 }
 
@@ -873,6 +882,7 @@ impl Settings {
         }
         let mut to_save = self.clone();
         to_save.hotkey.sound = to_save.sound_feedback.is_enabled_for_hotkey();
+        to_save.watermark_text = to_save.watermark.text.clone();
         let json = serde_json::to_string_pretty(&to_save)?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
@@ -1136,5 +1146,23 @@ mod tests {
 
         let s_off = Settings::parse_from_str(r#"{"hotkey":{"sound":true},"sound_feedback":"Off"}"#).unwrap();
         assert_eq!(s_off.sound_feedback, SoundFeedback::Off);
+    }
+
+    #[test]
+    fn watermark_text_default_and_backward_compatibility() {
+        // Missing watermark_text defaults to "openclip"
+        let s_default = Settings::parse_from_str(r#"{"watermark":{"enabled":true}}"#).unwrap();
+        assert_eq!(s_default.watermark_text, "openclip");
+        assert_eq!(s_default.watermark.text, "openclip");
+
+        // Custom watermark_text is loaded properly
+        let s_custom = Settings::parse_from_str(r#"{"watermark_text":"@By183"}"#).unwrap();
+        assert_eq!(s_custom.watermark_text, "@By183");
+        assert_eq!(s_custom.watermark.text, "@By183");
+
+        // Custom text inside watermark object
+        let s_nested = Settings::parse_from_str(r#"{"watermark":{"text":"Streamer"}}"#).unwrap();
+        assert_eq!(s_nested.watermark_text, "Streamer");
+        assert_eq!(s_nested.watermark.text, "Streamer");
     }
 }
