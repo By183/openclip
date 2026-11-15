@@ -204,6 +204,7 @@ impl Drop for CaptureHandle {
 
 #[cfg(windows)]
 pub use windows::{CapturedFrame, GpuCaptureOptions, GpuFrame};
+pub use monitors::OriginTracker;
 
 #[cfg(not(windows))]
 #[derive(Debug)]

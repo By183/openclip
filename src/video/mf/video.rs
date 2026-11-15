@@ -597,7 +597,7 @@ mod tests {
         assert!(gpu_enc.supports_d3d11());
         let mut gpu_out = 0usize;
         for i in 0..10u64 {
-            let (slot, _vp_us) = vp.convert_timed(&src_tex, (w, h), RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }).unwrap();
+            let (slot, _vp_us) = vp.convert_timed(&src_tex, (w, h), RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }, None).unwrap();
             let _gw_us = slot.wait_complete(&ctx);
             let pts = Duration::from_nanos(i * 1_000_000_000 / 120);
             gpu_out += gpu_enc.encode_d3d11(&slot.texture, pts).unwrap().len();

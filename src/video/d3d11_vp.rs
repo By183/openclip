@@ -9,22 +9,33 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, RECT};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Query, ID3D11Resource,
-    ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
+    D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
+    ID3D11Multithread, ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView, ID3D11Resource,
+    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
     ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
-    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_DECODER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BIND_VIDEO_ENCODER, D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_MAP_WRITE,
-    D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_RGBA,
-    D3D11_VIDEO_COLOR_YCbCrA, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_DECODER,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VIDEO_ENCODER,
+    D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD,
+    D3D11_BLEND_SRC_ALPHA, D3D11_BOX, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL,
+    D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAP_READ,
+    D3D11_MAP_WRITE, D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE, D3D11_QUERY_DESC,
+    D3D11_QUERY_EVENT, D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_USAGE_IMMUTABLE,
+    D3D11_USAGE_STAGING, D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_RGBA, D3D11_VIDEO_COLOR_YCbCrA,
+    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE,
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VIEWPORT, D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -34,8 +45,489 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
 
+use super::mouse_fx::{
+    FrameClick, MouseFx, ARROW, HIGHLIGHT_RADIUS, RIPPLE_END, RIPPLE_START, RIPPLE_THICKNESS,
+};
 use super::preview::PreviewImage;
 use super::scale::fit_inside;
+use super::watermark::{Watermark, WatermarkRenderer};
+
+const OVERLAY_VS_DXBC: &[u8] = include_bytes!("shaders/overlay_vs.dxbc");
+const OVERLAY_SPRITE_PS_DXBC: &[u8] = include_bytes!("shaders/overlay_sprite_ps.dxbc");
+const OVERLAY_SHAPE_PS_DXBC: &[u8] = include_bytes!("shaders/overlay_shape_ps.dxbc");
+
+/// Frame-level overlay dynamic input (cursor position, click ripples, scale).
+#[derive(Debug, Clone, Default)]
+pub struct GpuOverlayInput {
+    pub cursor: (i32, i32),
+    pub clicks: Vec<FrameClick>,
+    pub scale: f32,
+}
+
+fn create_cursor_arrow_texture(
+    device: &ID3D11Device,
+) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
+    let mut pixels = [0u8; 12 * 19 * 4];
+    for (y, row_str) in ARROW.iter().enumerate() {
+        let row = row_str.as_bytes();
+        for (x, &b) in row.iter().enumerate().take(12) {
+            let idx = (y * 12 + x) * 4;
+            match b {
+                b'X' => {
+                    pixels[idx] = 0;
+                    pixels[idx + 1] = 0;
+                    pixels[idx + 2] = 0;
+                    pixels[idx + 3] = 255;
+                }
+                b'W' => {
+                    pixels[idx] = 255;
+                    pixels[idx + 1] = 255;
+                    pixels[idx + 2] = 255;
+                    pixels[idx + 3] = 255;
+                }
+                _ => {}
+            }
+        }
+    }
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: 12,
+        Height: 19,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let subresource = D3D11_SUBRESOURCE_DATA {
+        pSysMem: pixels.as_ptr().cast(),
+        SysMemPitch: 12 * 4,
+        SysMemSlicePitch: 0,
+    };
+    let mut tex = None;
+    unsafe { device.CreateTexture2D(&desc, Some(&subresource), Some(&mut tex)) }
+        .context("CreateTexture2D(cursor arrow)")?;
+    let tex = tex.ok_or_else(|| anyhow!("CreateTexture2D returned None"))?;
+    let mut srv = None;
+    unsafe { device.CreateShaderResourceView(&tex, None, Some(&mut srv)) }
+        .context("CreateShaderResourceView(cursor arrow)")?;
+    let srv = srv.ok_or_else(|| anyhow!("CreateShaderResourceView returned None"))?;
+    Ok((tex, srv))
+}
+
+/// GPU-side compositor for cursor highlight, click ripple rings, custom cursor,
+/// and watermark badge directly in VRAM via Direct3D 11 shaders.
+pub struct GpuOverlayCompositor {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    vs: ID3D11VertexShader,
+    ps_sprite: ID3D11PixelShader,
+    ps_shape: ID3D11PixelShader,
+    blend: ID3D11BlendState,
+    sampler: ID3D11SamplerState,
+    cb: ID3D11Buffer,
+    scratch: Option<(u32, u32, DXGI_FORMAT, ID3D11Texture2D, ID3D11RenderTargetView)>,
+    watermark_tex: Option<(u32, u32, ID3D11Texture2D, ID3D11ShaderResourceView)>,
+    cursor_tex: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
+    watermark_renderer: Option<WatermarkRenderer>,
+    pub mouse_fx: MouseFx,
+    pub watermark: Watermark,
+}
+
+impl GpuOverlayCompositor {
+    pub fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        mouse_fx: MouseFx,
+        watermark: Watermark,
+    ) -> Result<Self> {
+        let mut vs = None;
+        unsafe { device.CreateVertexShader(OVERLAY_VS_DXBC, None, Some(&mut vs)) }
+            .context("CreateVertexShader(overlay_vs)")?;
+        let vs = vs.ok_or_else(|| anyhow!("CreateVertexShader returned None"))?;
+
+        let mut ps_sprite = None;
+        unsafe { device.CreatePixelShader(OVERLAY_SPRITE_PS_DXBC, None, Some(&mut ps_sprite)) }
+            .context("CreatePixelShader(overlay_sprite_ps)")?;
+        let ps_sprite = ps_sprite.ok_or_else(|| anyhow!("CreatePixelShader returned None"))?;
+
+        let mut ps_shape = None;
+        unsafe { device.CreatePixelShader(OVERLAY_SHAPE_PS_DXBC, None, Some(&mut ps_shape)) }
+            .context("CreatePixelShader(overlay_shape_ps)")?;
+        let ps_shape = ps_shape.ok_or_else(|| anyhow!("CreatePixelShader returned None"))?;
+
+        let mut blend_desc = D3D11_BLEND_DESC::default();
+        blend_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D11_BLEND_SRC_ALPHA,
+            DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D11_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D11_BLEND_ONE,
+            DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+            BlendOpAlpha: D3D11_BLEND_OP_ADD,
+            RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+        };
+        let mut blend = None;
+        unsafe { device.CreateBlendState(&blend_desc, Some(&mut blend)) }
+            .context("CreateBlendState(overlay)")?;
+        let blend = blend.ok_or_else(|| anyhow!("CreateBlendState returned None"))?;
+
+        let sampler_desc = D3D11_SAMPLER_DESC {
+            Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        let mut sampler = None;
+        unsafe { device.CreateSamplerState(&sampler_desc, Some(&mut sampler)) }
+            .context("CreateSamplerState(overlay)")?;
+        let sampler = sampler.ok_or_else(|| anyhow!("CreateSamplerState returned None"))?;
+
+        let cb_desc = D3D11_BUFFER_DESC {
+            ByteWidth: 64, // 4 * float4
+            Usage: D3D11_USAGE_DYNAMIC,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let mut cb = None;
+        unsafe { device.CreateBuffer(&cb_desc, None, Some(&mut cb)) }
+            .context("CreateBuffer(overlay constants)")?;
+        let cb = cb.ok_or_else(|| anyhow!("CreateBuffer returned None"))?;
+
+        let watermark_renderer = watermark.any_overlay().then(WatermarkRenderer::new).flatten();
+
+        Ok(Self {
+            device: device.clone(),
+            context: context.clone(),
+            vs,
+            ps_sprite,
+            ps_shape,
+            blend,
+            sampler,
+            cb,
+            scratch: None,
+            watermark_tex: None,
+            cursor_tex: None,
+            watermark_renderer,
+            mouse_fx,
+            watermark,
+        })
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.mouse_fx.any_overlay() || self.watermark.any_overlay()
+    }
+
+    pub fn scratch_texture(&self) -> Option<&ID3D11Texture2D> {
+        self.scratch.as_ref().map(|(_, _, _, tex, _)| tex)
+    }
+
+    fn ensure_scratch(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<()> {
+        if let Some((sw, sh, sfmt, ..)) = &self.scratch
+            && *sw == w && *sh == h && *sfmt == format
+        {
+            return Ok(());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex = None;
+        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+            .context("CreateTexture2D(scratch)")?;
+        let tex = tex.ok_or_else(|| anyhow!("CreateTexture2D returned None"))?;
+        let mut rtv = None;
+        unsafe { self.device.CreateRenderTargetView(&tex, None, Some(&mut rtv)) }
+            .context("CreateRenderTargetView(scratch)")?;
+        let rtv = rtv.ok_or_else(|| anyhow!("CreateRenderTargetView returned None"))?;
+        self.scratch = Some((w, h, format, tex, rtv));
+        Ok(())
+    }
+
+    fn ensure_watermark_tex(&mut self, height: u32) -> Result<()> {
+        let height = height.max(1);
+        if let Some((_, h, ..)) = &self.watermark_tex
+            && *h == height
+        {
+            return Ok(());
+        }
+        if self.watermark_renderer.is_none() {
+            self.watermark_renderer = WatermarkRenderer::new();
+        }
+        let Some(renderer) = &mut self.watermark_renderer else {
+            bail!("WatermarkRenderer unavailable");
+        };
+        let sprite = renderer.sprite(height);
+        let (w, h) = (sprite.width, sprite.height);
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let subresource = D3D11_SUBRESOURCE_DATA {
+            pSysMem: sprite.rgba.as_ptr().cast(),
+            SysMemPitch: w * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut tex = None;
+        unsafe { self.device.CreateTexture2D(&desc, Some(&subresource), Some(&mut tex)) }
+            .context("CreateTexture2D(watermark)")?;
+        let tex = tex.ok_or_else(|| anyhow!("CreateTexture2D returned None"))?;
+        let mut srv = None;
+        unsafe { self.device.CreateShaderResourceView(&tex, None, Some(&mut srv)) }
+            .context("CreateShaderResourceView(watermark)")?;
+        let srv = srv.ok_or_else(|| anyhow!("CreateShaderResourceView returned None"))?;
+        self.watermark_tex = Some((w, h, tex, srv));
+        Ok(())
+    }
+
+    fn ensure_cursor_tex(&mut self) -> Result<()> {
+        if self.cursor_tex.is_some() {
+            return Ok(());
+        }
+        let (tex, srv) = create_cursor_arrow_texture(&self.device)?;
+        self.cursor_tex = Some((tex, srv));
+        Ok(())
+    }
+
+    unsafe fn update_cb(
+        &self,
+        rect: [f32; 4],
+        center_rad: [f32; 4],
+        color: [f32; 4],
+        target_size: [f32; 4],
+    ) -> Result<()> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.context
+                .Map(&self.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .context("Map(overlay cb)")?;
+            let ptr = mapped.pData as *mut f32;
+            std::ptr::copy_nonoverlapping(rect.as_ptr(), ptr, 4);
+            std::ptr::copy_nonoverlapping(center_rad.as_ptr(), ptr.add(4), 4);
+            std::ptr::copy_nonoverlapping(color.as_ptr(), ptr.add(8), 4);
+            std::ptr::copy_nonoverlapping(target_size.as_ptr(), ptr.add(12), 4);
+            self.context.Unmap(&self.cb, 0);
+        }
+        Ok(())
+    }
+
+    pub fn draw(
+        &mut self,
+        src: &ID3D11Texture2D,
+        src_rect: RECT,
+        crop_w: u32,
+        crop_h: u32,
+        overlay: Option<&GpuOverlayInput>,
+    ) -> Result<&ID3D11Texture2D> {
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { src.GetDesc(&mut src_desc) };
+        self.ensure_scratch(crop_w, crop_h, src_desc.Format)?;
+        let (_, _, _, scratch_tex, scratch_rtv) = self.scratch.as_ref().unwrap();
+
+        // 1. Copy cropped source region into scratch texture at (0, 0)
+        let src_box = D3D11_BOX {
+            left: src_rect.left as u32,
+            top: src_rect.top as u32,
+            front: 0,
+            right: src_rect.right as u32,
+            bottom: src_rect.bottom as u32,
+            back: 1,
+        };
+        unsafe {
+            self.context.CopySubresourceRegion(
+                scratch_tex,
+                0,
+                0,
+                0,
+                0,
+                src,
+                0,
+                Some(&src_box),
+            );
+        }
+
+        // 2. Set up pipeline state
+        unsafe {
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: crop_w as f32,
+                Height: crop_h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            self.context.RSSetViewports(Some(&[viewport]));
+            self.context.RSSetState(None);
+            self.context.OMSetRenderTargets(Some(&[Some(scratch_rtv.clone())]), None);
+            self.context.OMSetBlendState(&self.blend, Some(&[0.0; 4]), 0xffff_ffff);
+            self.context.OMSetDepthStencilState(None, 0);
+            self.context.IASetInputLayout(None);
+            self.context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            self.context.VSSetShader(&self.vs, None);
+            self.context.VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            self.context.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            self.context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            self.context.GSSetShader(None, None);
+        }
+
+        // 3. Draw Watermark if enabled
+        if self.watermark.any_overlay() {
+            let badge_h = self.watermark.badge_height(crop_h);
+            if let Err(e) = self.ensure_watermark_tex(badge_h) {
+                log::warn!("failed to ensure watermark texture: {e}");
+            } else if let Some((bw, bh, _, srv)) = &self.watermark_tex
+                && let Some((x, y)) = self.watermark.place((*bw, *bh), (crop_w, crop_h))
+            {
+                let ndc_x = (x as f32 / crop_w as f32) * 2.0 - 1.0;
+                let ndc_y = 1.0 - (y as f32 / crop_h as f32) * 2.0;
+                let ndc_w = (*bw as f32 / crop_w as f32) * 2.0;
+                let ndc_h = -(*bh as f32 / crop_h as f32) * 2.0;
+                let opacity = (self.watermark.opacity.min(100) as f32) / 100.0;
+
+                unsafe {
+                    self.update_cb(
+                        [ndc_x, ndc_y, ndc_w, ndc_h],
+                        [0.0, 0.0, 0.0, 0.0],
+                        [1.0, 1.0, 1.0, opacity],
+                        [crop_w as f32, crop_h as f32, 0.0, 0.0],
+                    )?;
+                    self.context.PSSetShader(&self.ps_sprite, None);
+                    self.context.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+                    self.context.Draw(4, 0);
+                }
+            }
+        }
+
+        // 4. Draw Mouse effects if active and input available
+        if let Some(input) = overlay {
+            let cursor = input.cursor;
+            let scale = input.scale;
+
+            // 4a. Highlight halo
+            if self.mouse_fx.highlight && self.mouse_fx.highlight_opacity > 0 {
+                let r = HIGHLIGHT_RADIUS * self.mouse_fx.highlight_size as f32 / 100.0 * scale;
+                let (cx, cy) = (cursor.0 as f32, cursor.1 as f32);
+                let ext = r + 2.0;
+                let x0 = (cx - ext).clamp(0.0, crop_w as f32);
+                let y0 = (cy - ext).clamp(0.0, crop_h as f32);
+                let x1 = (cx + ext).clamp(0.0, crop_w as f32);
+                let y1 = (cy + ext).clamp(0.0, crop_h as f32);
+                if x1 > x0 && y1 > y0 {
+                    let ndc_x = (x0 / crop_w as f32) * 2.0 - 1.0;
+                    let ndc_y = 1.0 - (y0 / crop_h as f32) * 2.0;
+                    let ndc_w = ((x1 - x0) / crop_w as f32) * 2.0;
+                    let ndc_h = -((y1 - y0) / crop_h as f32) * 2.0;
+                    let col = self.mouse_fx.highlight_color;
+                    let alpha = (self.mouse_fx.highlight_opacity.min(100) as f32) / 100.0;
+                    unsafe {
+                        self.update_cb(
+                            [ndc_x, ndc_y, ndc_w, ndc_h],
+                            [cx, cy, r, 0.0],
+                            [col[0] as f32 / 255.0, col[1] as f32 / 255.0, col[2] as f32 / 255.0, alpha],
+                            [crop_w as f32, crop_h as f32, 0.0, 0.0],
+                        )?;
+                        self.context.PSSetShader(&self.ps_shape, None);
+                        self.context.Draw(4, 0);
+                    }
+                }
+            }
+
+            // 4b. Click ripples
+            if self.mouse_fx.click_effect {
+                for &(x, y, age, right) in &input.clicks {
+                    let t = age.clamp(0.0, 1.0);
+                    let k = self.mouse_fx.click_size as f32 / 100.0 * scale;
+                    let r = (RIPPLE_START + (RIPPLE_END - RIPPLE_START) * t) * k;
+                    let thickness = RIPPLE_THICKNESS * k.max(0.5);
+                    let outer_r = r + thickness * 0.5;
+                    let inner_r = (r - thickness * 0.5).max(0.0);
+                    let ext = outer_r + 2.0;
+                    let x0 = (x as f32 - ext).clamp(0.0, crop_w as f32);
+                    let y0 = (y as f32 - ext).clamp(0.0, crop_h as f32);
+                    let x1 = (x as f32 + ext).clamp(0.0, crop_w as f32);
+                    let y1 = (y as f32 + ext).clamp(0.0, crop_h as f32);
+                    if x1 > x0 && y1 > y0 {
+                        let ndc_x = (x0 / crop_w as f32) * 2.0 - 1.0;
+                        let ndc_y = 1.0 - (y0 / crop_h as f32) * 2.0;
+                        let ndc_w = ((x1 - x0) / crop_w as f32) * 2.0;
+                        let ndc_h = -((y1 - y0) / crop_h as f32) * 2.0;
+                        let col = if right { self.mouse_fx.right_color } else { self.mouse_fx.left_color };
+                        let alpha = 0.9 * (1.0 - t);
+                        unsafe {
+                            self.update_cb(
+                                [ndc_x, ndc_y, ndc_w, ndc_h],
+                                [x as f32, y as f32, outer_r, inner_r],
+                                [col[0] as f32 / 255.0, col[1] as f32 / 255.0, col[2] as f32 / 255.0, alpha],
+                                [crop_w as f32, crop_h as f32, 0.0, 0.0],
+                            )?;
+                            self.context.PSSetShader(&self.ps_shape, None);
+                            self.context.Draw(4, 0);
+                        }
+                    }
+                }
+            }
+
+            // 4c. Custom cursor sprite if draws_cursor()
+            if self.mouse_fx.draws_cursor() {
+                if let Err(e) = self.ensure_cursor_tex() {
+                    log::warn!("failed to ensure cursor arrow texture: {e}");
+                } else if let Some((_, srv)) = &self.cursor_tex {
+                    let s = (self.mouse_fx.cursor_size as f32 / 100.0 * scale).max(0.25);
+                    let w = (12.0 * s).round();
+                    let h = (19.0 * s).round();
+                    let x0 = cursor.0 as f32;
+                    let y0 = cursor.1 as f32;
+                    let ndc_x = (x0 / crop_w as f32) * 2.0 - 1.0;
+                    let ndc_y = 1.0 - (y0 / crop_h as f32) * 2.0;
+                    let ndc_w = (w / crop_w as f32) * 2.0;
+                    let ndc_h = -(h / crop_h as f32) * 2.0;
+                    unsafe {
+                        self.update_cb(
+                            [ndc_x, ndc_y, ndc_w, ndc_h],
+                            [0.0, 0.0, 0.0, 0.0],
+                            [1.0, 1.0, 1.0, 1.0],
+                            [crop_w as f32, crop_h as f32, 0.0, 0.0],
+                        )?;
+                        self.context.PSSetShader(&self.ps_sprite, None);
+                        self.context.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+                        self.context.Draw(4, 0);
+                    }
+                }
+            }
+        }
+
+        // 5. Unbind render target and SRV so texture can be read by VideoProcessor
+        unsafe {
+            self.context.OMSetRenderTargets(None, None);
+            self.context.PSSetShaderResources(0, Some(&[None]));
+        }
+
+        Ok(&self.scratch.as_ref().unwrap().3)
+    }
+}
 
 /// Number of NV12 textures kept in the GPU ring pool so async hardware
 /// encoders never read a texture while the capture thread overwrites it.
@@ -300,6 +792,7 @@ pub struct GpuCaptureProcessor {
     // Small RGBA preview resources (allocated lazily only while preview is visible).
     preview_vp: Option<(ID3D11VideoProcessorEnumerator, ID3D11VideoProcessor, (u32, u32))>,
     preview_tex: Option<(ID3D11Texture2D, ID3D11VideoProcessorOutputView, ID3D11Texture2D, (u32, u32))>,
+    pub compositor: Option<GpuOverlayCompositor>,
 }
 
 impl GpuCaptureProcessor {
@@ -312,12 +805,14 @@ impl GpuCaptureProcessor {
         Ok((vd, vc))
     }
 
-    pub fn new(
+    pub fn with_overlays(
         device: ID3D11Device,
         context: ID3D11DeviceContext,
         in_size: (u32, u32),
         expected_crop: (u32, u32),
         out_size: (u32, u32),
+        mouse_fx: MouseFx,
+        watermark: Watermark,
     ) -> Result<Self> {
         let (video_device, video_context) = Self::probe(&device, &context)?;
         let (enumerator, processor) = create_vp(&video_device, in_size, out_size, D3D11_VIDEO_USAGE_OPTIMAL_SPEED)?;
@@ -333,6 +828,17 @@ impl GpuCaptureProcessor {
         for _ in 0..6 {
             pool.push(create_nv12_slot(&device, &video_device, &enumerator, out_size.0, out_size.1)?);
         }
+        let compositor = if mouse_fx.any_overlay() || watermark.any_overlay() {
+            match GpuOverlayCompositor::new(&device, &context, mouse_fx, watermark) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::warn!("failed to initialize GPU overlay compositor: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             device,
             context,
@@ -347,7 +853,26 @@ impl GpuCaptureProcessor {
             cursor: 0,
             preview_vp: None,
             preview_tex: None,
+            compositor,
         })
+    }
+
+    pub fn new(
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        in_size: (u32, u32),
+        expected_crop: (u32, u32),
+        out_size: (u32, u32),
+    ) -> Result<Self> {
+        Self::with_overlays(
+            device,
+            context,
+            in_size,
+            expected_crop,
+            out_size,
+            MouseFx::default_off(),
+            Watermark { enabled: false, ..Default::default() },
+        )
     }
 
     pub fn device(&self) -> &ID3D11Device {
@@ -411,25 +936,41 @@ impl GpuCaptureProcessor {
         src_size: (u32, u32),
         src_rect: RECT,
     ) -> Result<Arc<GpuNv12Slot>> {
-        let (slot, _) = self.convert_timed(src, src_size, src_rect)?;
+        let (slot, _) = self.convert_timed(src, src_size, src_rect, None)?;
         Ok(slot)
     }
 
     /// Converts `src` (cropped to `src_rect`) into a pooled `NV12` GPU surface
     /// of size `self.out_size`, marks an `ID3D11Query` event fence on the surface,
     /// and flushes the context. Returns `(slot, vp_submit_us)`.
+    ///
+    /// If overlays (watermark, cursor highlight, click ripples) are active in
+    /// `self.compositor`, they are rendered directly onto a scratch texture in VRAM
+    /// before `VideoProcessorBlt` performs zero-readback conversion to NV12.
     pub fn convert_timed(
         &mut self,
         src: &ID3D11Texture2D,
         src_size: (u32, u32),
         src_rect: RECT,
+        overlay: Option<&GpuOverlayInput>,
     ) -> Result<(Arc<GpuNv12Slot>, u64)> {
         let t0 = Instant::now();
-        self.ensure_input_size(src_size)?;
-        let slot = self.acquire_slot()?;
-
         let crop_w = (src_rect.right - src_rect.left).max(1) as u32;
         let crop_h = (src_rect.bottom - src_rect.top).max(1) as u32;
+
+        let (input_tex, effective_src_size, effective_src_rect) =
+            if self.compositor.as_ref().is_some_and(|c| c.is_active()) {
+                let comp = self.compositor.as_mut().unwrap();
+                let comp_tex = comp.draw(src, src_rect, crop_w, crop_h, overlay)?;
+                let r = RECT { left: 0, top: 0, right: crop_w as i32, bottom: crop_h as i32 };
+                (comp_tex.clone(), (crop_w, crop_h), r)
+            } else {
+                (src.clone(), src_size, src_rect)
+            };
+
+        self.ensure_input_size(effective_src_size)?;
+        let slot = self.acquire_slot()?;
+
         let dst_rect = if (crop_w, crop_h) == self.expected_crop {
             RECT { left: 0, top: 0, right: self.out_size.0 as i32, bottom: self.out_size.1 as i32 }
         } else {
@@ -440,7 +981,7 @@ impl GpuCaptureProcessor {
         };
         let target_rect = RECT { left: 0, top: 0, right: self.out_size.0 as i32, bottom: self.out_size.1 as i32 };
 
-        let src_res: ID3D11Resource = src.cast()?;
+        let src_res: ID3D11Resource = input_tex.cast()?;
         let iv_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -457,7 +998,7 @@ impl GpuCaptureProcessor {
         let iv = iv_opt.ok_or_else(|| anyhow!("CreateVideoProcessorInputView returned None"))?;
 
         unsafe {
-            self.video_context.VideoProcessorSetStreamSourceRect(&self.processor, 0, true, Some(&src_rect));
+            self.video_context.VideoProcessorSetStreamSourceRect(&self.processor, 0, true, Some(&effective_src_rect));
             self.video_context.VideoProcessorSetStreamDestRect(&self.processor, 0, true, Some(&dst_rect));
             self.video_context.VideoProcessorSetOutputTargetRect(&self.processor, true, Some(&target_rect));
 
@@ -492,13 +1033,28 @@ impl GpuCaptureProcessor {
     ) -> Result<PreviewImage> {
         let crop_w = (src_rect.right - src_rect.left).max(1) as u32;
         let crop_h = (src_rect.bottom - src_rect.top).max(1) as u32;
+
+        let (input_tex, p_size, p_rect) = if let Some(comp) = &self.compositor {
+            if comp.is_active() && comp.scratch_texture().is_some() {
+                (
+                    comp.scratch_texture().unwrap().clone(),
+                    (crop_w, crop_h),
+                    RECT { left: 0, top: 0, right: crop_w as i32, bottom: crop_h as i32 },
+                )
+            } else {
+                (src.clone(), src_size, src_rect)
+            }
+        } else {
+            (src.clone(), src_size, src_rect)
+        };
+
         let scale = (crop_w.max(crop_h) as f32 / max_side.max(2) as f32).max(1.0);
         let pw = (((crop_w as f32 / scale) as u32).max(2)) & !1;
         let ph = (((crop_h as f32 / scale) as u32).max(2)) & !1;
 
         if self.preview_tex.as_ref().is_none_or(|(_, _, _, d)| *d != (pw, ph)) {
             let (vp_enum, vp) =
-                create_vp(&self.video_device, src_size, (pw, ph), D3D11_VIDEO_USAGE_OPTIMAL_SPEED)?;
+                create_vp(&self.video_device, p_size, (pw, ph), D3D11_VIDEO_USAGE_OPTIMAL_SPEED)?;
             configure_vp_colorspaces(&self.video_context, &vp, None, false, true);
             let out_desc = D3D11_TEXTURE2D_DESC {
                 Width: pw,
@@ -535,11 +1091,11 @@ impl GpuCaptureProcessor {
             let mut stg = None;
             unsafe { self.device.CreateTexture2D(&stg_desc, None, Some(&mut stg)) }?;
             let stg = stg.ok_or_else(|| anyhow!("preview staging CreateTexture2D returned None"))?;
-            self.preview_vp = Some((vp_enum, vp, src_size));
+            self.preview_vp = Some((vp_enum, vp, p_size));
             self.preview_tex = Some((out_tex, vpov, stg, (pw, ph)));
-        } else if self.preview_vp.as_ref().is_none_or(|(_, _, s)| *s != src_size) {
+        } else if self.preview_vp.as_ref().is_none_or(|(_, _, s)| *s != p_size) {
             let (vp_enum, vp) =
-                create_vp(&self.video_device, src_size, (pw, ph), D3D11_VIDEO_USAGE_OPTIMAL_SPEED)?;
+                create_vp(&self.video_device, p_size, (pw, ph), D3D11_VIDEO_USAGE_OPTIMAL_SPEED)?;
             configure_vp_colorspaces(&self.video_context, &vp, None, false, true);
             // Recreate output view against new enumerator on input resize.
             let out_tex = self.preview_tex.as_ref().unwrap().0.clone();
@@ -554,13 +1110,13 @@ impl GpuCaptureProcessor {
             let mut vpov = None;
             unsafe { self.video_device.CreateVideoProcessorOutputView(&out_res, &vp_enum, &vpov_desc, Some(&mut vpov)) }?;
             let vpov = vpov.ok_or_else(|| anyhow!("preview CreateVideoProcessorOutputView returned None"))?;
-            self.preview_vp = Some((vp_enum, vp, src_size));
+            self.preview_vp = Some((vp_enum, vp, p_size));
             self.preview_tex = Some((out_tex, vpov, stg, (pw, ph)));
         }
 
         let (vp_enum, vp, _) = self.preview_vp.as_ref().unwrap();
         let (out_tex, vpov, stg, _) = self.preview_tex.as_ref().unwrap();
-        let src_res: ID3D11Resource = src.cast()?;
+        let src_res: ID3D11Resource = input_tex.cast()?;
         let iv_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -574,7 +1130,7 @@ impl GpuCaptureProcessor {
         let dst_rect = RECT { left: 0, top: 0, right: pw as i32, bottom: ph as i32 };
         let mut rgba = Vec::with_capacity((pw * ph * 4) as usize);
         unsafe {
-            self.video_context.VideoProcessorSetStreamSourceRect(vp, 0, true, Some(&src_rect));
+            self.video_context.VideoProcessorSetStreamSourceRect(vp, 0, true, Some(&p_rect));
             self.video_context.VideoProcessorSetStreamDestRect(vp, 0, true, Some(&dst_rect));
             self.video_context.VideoProcessorSetOutputTargetRect(vp, true, Some(&dst_rect));
             let mut streams = [D3D11_VIDEO_PROCESSOR_STREAM {
@@ -657,6 +1213,51 @@ pub fn readback_nv12_texture(
         context.Unmap(&stg, 0);
     }
     Ok((y_plane, uv_plane, w, w))
+}
+
+/// Reads back an 8-bit RGBA/BGRA texture from GPU to CPU memory for testing/verification.
+pub fn readback_bgra_texture(
+    device: &ID3D11Device,
+    tex: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let context = unsafe { device.GetImmediateContext() }?;
+    let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { tex.GetDesc(&mut src_desc) };
+    let stg_desc = D3D11_TEXTURE2D_DESC {
+        Width: src_desc.Width,
+        Height: src_desc.Height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: src_desc.Format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut stg = None;
+    unsafe { device.CreateTexture2D(&stg_desc, None, Some(&mut stg)) }?;
+    let stg = stg.ok_or_else(|| anyhow!("staging CreateTexture2D returned None"))?;
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe {
+        context.CopyResource(&stg, tex);
+        context.Map(&stg, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let pitch = mapped.RowPitch as usize;
+    let mut out = Vec::with_capacity(w * h * 4);
+    unsafe {
+        let src_ptr = mapped.pData as *const u8;
+        for row in 0..h {
+            let row_bytes = std::slice::from_raw_parts(src_ptr.add(row * pitch), w * 4);
+            out.extend_from_slice(row_bytes);
+        }
+        context.Unmap(&stg, 0);
+    }
+    Ok(out)
 }
 
 /// Hardware-accelerated `NV12` -> `R8G8B8A8_UNORM` converter + downscaler for
@@ -1142,5 +1743,141 @@ mod tests {
         // Red stripe (cols 16..23 scaled to 32px width -> col ~20): R high, G low, B low.
         let r_px = &pb_rgba.rgba[(4 * 32 + 20) * 4..][..4];
         assert!(r_px[0] > 235 && r_px[1] < 20 && r_px[2] < 20, "unexpected decoded red {r_px:?}");
+    }
+
+    #[test]
+    fn gpu_overlay_compositor_renders_overlays_cleanly() {
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        let mut device_opt = None;
+        let mut context_opt = None;
+        let res = unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                flags,
+                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device_opt),
+                None,
+                Some(&mut context_opt),
+            )
+        };
+        let (device, context) = match res {
+            Ok(()) => (device_opt.unwrap(), context_opt.unwrap()),
+            Err(_) => {
+                // Headless CI or machine without D3D11 hardware support
+                return;
+            }
+        };
+
+        let w = 256u32;
+        let h = 256u32;
+
+        let mouse_fx = MouseFx {
+            highlight: true,
+            highlight_color: [255, 255, 0], // Yellow
+            highlight_opacity: 50,
+            highlight_size: 100,
+            click_effect: true,
+            left_color: [255, 0, 0], // Red
+            right_color: [0, 0, 255],
+            click_size: 100,
+            show_cursor: true,
+            cursor_size: 150, // draws_cursor() = true
+        };
+        let watermark = Watermark {
+            enabled: true,
+            position: crate::video::watermark::Corner::TopRight,
+            size: 100,
+            opacity: 80,
+        };
+
+        let mut compositor = match GpuOverlayCompositor::new(&device, &context, mouse_fx, watermark) {
+            Ok(c) => c,
+            Err(_) => return, // Headless environment where shader creation or features fail
+        };
+        assert!(compositor.is_active());
+
+        // Create a solid blue BGRA input texture (B=255, G=0, R=0, A=255)
+        let bgra: Vec<u8> = (0..w * h).flat_map(|_| [255u8, 0, 0, 255]).collect();
+        let src_desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bgra.as_ptr().cast(),
+            SysMemPitch: w * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut src_tex = None;
+        unsafe { device.CreateTexture2D(&src_desc, Some(&init), Some(&mut src_tex)) }.unwrap();
+        let src_tex = src_tex.unwrap();
+
+        let overlay_input = GpuOverlayInput {
+            cursor: (128, 128),
+            clicks: vec![(64, 64, 0.5, false)], // half-aged left click
+            scale: 1.0,
+        };
+
+        let comp_tex = compositor
+            .draw(
+                &src_tex,
+                RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+                w,
+                h,
+                Some(&overlay_input),
+            )
+            .unwrap();
+
+        let pixels = readback_bgra_texture(&device, comp_tex, w, h).unwrap();
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+
+        // Highlight halo check at (148, 128) - 20px offset from center (inside radius 32, outside arrow):
+        // Background was Blue (B=255, G=0, R=0).
+        // Yellow is (R=255, G=255, B=0) blended at 50% opacity.
+        // So R should be > 80, G should be > 80!
+        let idx = (128 * w as usize + 148) * 4;
+        let b = pixels[idx];
+        let g = pixels[idx + 1];
+        let r = pixels[idx + 2];
+        assert!(r > 80 && g > 80, "cursor highlight not blended at (148, 128): R={r}, G={g}, B={b}");
+
+        // Untouched corner at (10, 240) should be untouched blue:
+        let corner_idx = (240 * w as usize + 10) * 4;
+        assert_eq!(pixels[corner_idx], 255, "untouched corner B mismatch");
+        assert_eq!(pixels[corner_idx + 1], 0, "untouched corner G mismatch");
+        assert_eq!(pixels[corner_idx + 2], 0, "untouched corner R mismatch");
+
+        // Also test GpuCaptureProcessor::with_overlays with full conversion to NV12:
+        if let Ok(mut vp) = GpuCaptureProcessor::with_overlays(
+            device.clone(),
+            context.clone(),
+            (w, h),
+            (w, h),
+            (w, h),
+            compositor.mouse_fx.clone(),
+            compositor.watermark,
+        ) {
+            let (slot, _) = vp
+                .convert_timed(
+                    &src_tex,
+                    (w, h),
+                    RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+                    Some(&overlay_input),
+                )
+                .unwrap();
+            let (gpu_y, gpu_uv, _, _) = readback_nv12_texture(&device, &slot.texture, w, h).unwrap();
+            assert_eq!(gpu_y.len(), (w * h) as usize);
+            assert_eq!(gpu_uv.len(), (w * (h / 2)) as usize);
+        }
     }
 }

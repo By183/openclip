@@ -3,6 +3,7 @@
 //! Used on every platform for the source list, the region picker background
 //! and idle thumbnails. Coordinates and sizes are physical pixels.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -219,5 +220,49 @@ pub fn screenshot_source(source: &super::Source) -> Result<RawFrame> {
         // There is no way to sample a game's back buffer from outside; a preview
         // or snapshot has to come from the hook's own frames instead.
         super::Source::Game { .. } => Err(anyhow!("{}", crate::t!(ERR_GAME_STILL))),
+    }
+}
+
+/// Tracks the virtual desktop physical origin of a capture source, handling
+/// moving windows or dynamic region drags.
+#[derive(Clone)]
+pub struct OriginTracker {
+    source: super::Source,
+    base: Option<(i32, i32)>,
+    region: Option<super::LiveRect>,
+    cached_origin: Arc<Mutex<((i32, i32), u32)>>,
+}
+
+impl OriginTracker {
+    pub fn new(source: super::Source, region: Option<super::LiveRect>) -> Self {
+        let base = match (&source, &region) {
+            (super::Source::Region { monitor_id, .. }, Some(_)) => {
+                source_origin(&super::Source::Monitor { id: *monitor_id }).ok()
+            }
+            _ => None,
+        };
+        let init_origin = source_origin(&source).unwrap_or((0, 0));
+        Self {
+            source,
+            base,
+            region,
+            cached_origin: Arc::new(Mutex::new((init_origin, 0))),
+        }
+    }
+
+    pub fn get_origin(&self) -> (i32, i32) {
+        if let (Some(base), Some(live)) = (self.base, &self.region) {
+            let r = live.get();
+            return (base.0 + r.x as i32, base.1 + r.y as i32);
+        }
+        let mut guard = self.cached_origin.lock().unwrap();
+        guard.1 += 1;
+        if guard.1 >= 30 {
+            guard.1 = 0;
+            if let Ok(o) = source_origin(&self.source) {
+                guard.0 = o;
+            }
+        }
+        guard.0
     }
 }

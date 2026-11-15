@@ -11,11 +11,11 @@ use super::{PixelFormat, RawFrame};
 /// How long a click ripple stays visible.
 pub const CLICK_DURATION: Duration = Duration::from_millis(600);
 /// Base radius of the highlight halo at 100 %.
-const HIGHLIGHT_RADIUS: f32 = 32.0;
+pub(crate) const HIGHLIGHT_RADIUS: f32 = 32.0;
 /// Ripple radius range at 100 %.
-const RIPPLE_START: f32 = 10.0;
-const RIPPLE_END: f32 = 42.0;
-const RIPPLE_THICKNESS: f32 = 3.0;
+pub(crate) const RIPPLE_START: f32 = 10.0;
+pub(crate) const RIPPLE_END: f32 = 42.0;
+pub(crate) const RIPPLE_THICKNESS: f32 = 3.0;
 
 /// User-facing mouse effect settings (mirrors classic recorder options).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

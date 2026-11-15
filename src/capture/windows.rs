@@ -32,11 +32,14 @@ use windows_capture::settings::{
 };
 use windows_capture::window::Window;
 
+use super::monitors::OriginTracker;
 use super::{CaptureConfig, CaptureHandle, FramePool, FrameSink, LiveRect, PhaseLimiter, Source};
 use crate::settings::SizeMode;
 use crate::video::convert::even_dims;
-use crate::video::d3d11_vp::{is_supported_capture_format, GpuCaptureProcessor, GpuNv12Slot};
+use crate::video::d3d11_vp::{is_supported_capture_format, GpuCaptureProcessor, GpuNv12Slot, GpuOverlayInput};
+use crate::video::mouse_fx::{MouseFx, MouseSampler};
 use crate::video::preview::PreviewImage;
+use crate::video::watermark::Watermark;
 use crate::video::{PixelFormat, RawFrame};
 
 /// One GPU-converted `DXGI_FORMAT_NV12` surface kept in GPU memory for
@@ -91,6 +94,10 @@ pub struct GpuCaptureOptions {
     pub gpu_active: Arc<AtomicBool>,
     pub preview_visible: Arc<AtomicBool>,
     pub on_preview: Box<dyn FnMut(PreviewImage) + Send>,
+    pub mouse_fx: MouseFx,
+    pub watermark: Watermark,
+    pub sampler: Option<Arc<Mutex<MouseSampler>>>,
+    pub origin_tracker: Option<Arc<OriginTracker>>,
 }
 
 /// Everything the capture callback needs, passed through `Settings::flags`.
@@ -166,12 +173,14 @@ impl Handler {
             if out_size.0 == 0 || out_size.1 == 0 {
                 return Err(anyhow!("frame too small to encode: {}x{}", crop_size.0, crop_size.1));
             }
-            let vp = GpuCaptureProcessor::new(
+            let vp = GpuCaptureProcessor::with_overlays(
                 self.readback.device.clone(),
                 self.readback.context.clone(),
                 (fw, fh),
                 crop_size,
                 out_size,
+                gpu.mouse_fx.clone(),
+                gpu.watermark,
             )?;
             self.gpu_expected_crop = Some(crop_size);
             self.gpu_vp = Some(vp);
@@ -179,7 +188,19 @@ impl Handler {
         let vp = self.gpu_vp.as_mut().unwrap();
         let rect = RECT { left: x0 as i32, top: y0 as i32, right: x1 as i32, bottom: y1 as i32 };
         let tex = frame.as_raw_texture();
-        let (slot, vp_submit_us) = vp.convert_timed(tex, (fw, fh), rect)?;
+        let overlay_input = if gpu.mouse_fx.any_overlay() || gpu.watermark.any_overlay() {
+            let origin = gpu.origin_tracker.as_ref().map(|t| t.get_origin()).unwrap_or((0, 0));
+            let snap = gpu.sampler.as_ref().map(|s| s.lock().unwrap().snapshot());
+            let (cursor, clicks) = snap.map(|s| s.mapped(origin, (1.0, 1.0))).unwrap_or_default();
+            Some(GpuOverlayInput {
+                cursor,
+                clicks,
+                scale: 1.0,
+            })
+        } else {
+            None
+        };
+        let (slot, vp_submit_us) = vp.convert_timed(tex, (fw, fh), rect, overlay_input.as_ref())?;
         if gpu.preview_visible.load(Ordering::Relaxed)
             && now.duration_since(self.last_preview) >= Duration::from_millis(200)
         {

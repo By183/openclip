@@ -459,7 +459,6 @@ impl Recorder {
             log::info!("auto fps: monitor refresh {monitor_hz:?} Hz -> nominal encoder fps {nominal_fps}");
         }
 
-        let has_overlays = config.mouse_fx.any_overlay() || config.watermark.any_overlay();
         let is_openh264 = config.format.video_codec == VideoCodec::OpenH264
             || (config.format.video_codec == VideoCodec::Auto
                 && VideoCodec::resolve_auto(&available_encoders()) == VideoCodec::OpenH264);
@@ -469,8 +468,6 @@ impl Recorder {
             Some("color conversion set to CPU")
         } else if matches!(config.source, Source::Game { .. }) {
             Some("in-game hook capture")
-        } else if has_overlays {
-            Some("cursor/click/watermark overlay active")
         } else if is_openh264 {
             Some("OpenH264 CPU encoder selected")
         } else {
@@ -715,11 +712,12 @@ fn start_capture(
         fps: capture_fps,
         show_cursor: config.mouse_fx.native_cursor(),
         pool: Some(pool),
-        live_region: region,
+        live_region: region.clone(),
     };
     let mut handle = {
         #[cfg(windows)]
         {
+            let origin_tracker = Arc::new(crate::capture::monitors::OriginTracker::new(config.source.clone(), region.clone()));
             let gpu_opts = gpu_active.load(Ordering::Relaxed).then(|| {
                 let prev_slot = preview;
                 let prev_cb = on_preview;
@@ -733,6 +731,10 @@ fn start_capture(
                             cb();
                         }
                     }),
+                    mouse_fx: config.mouse_fx.clone(),
+                    watermark: config.watermark,
+                    sampler: sampler.clone(),
+                    origin_tracker: Some(origin_tracker),
                 }
             });
             let sink: capture::windows::CapturedSink = Box::new(move |mut frame| {
