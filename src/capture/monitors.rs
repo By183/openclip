@@ -142,6 +142,21 @@ pub fn screenshot_monitor_image(id: u32) -> Result<xcap::image::RgbaImage> {
     m.capture_image().context("monitor screenshot")
 }
 
+/// Takes screenshots of all available monitors, returning pairs of (monitor_id, RgbaImage).
+/// Used for instant freeze-frame capture directly at hotkey press time.
+pub fn screenshot_all_monitors_images() -> Vec<(u32, xcap::image::RgbaImage)> {
+    let Ok(monitors) = Monitor::all() else { return Vec::new() };
+    let mut results = Vec::with_capacity(monitors.len());
+    for m in monitors {
+        if let Ok(id) = m.id()
+            && let Ok(img) = m.capture_image()
+        {
+            results.push((id, img));
+        }
+    }
+    results
+}
+
 /// Takes a screenshot of a window (RGBA).
 pub fn screenshot_window(id: u32) -> Result<RawFrame> {
     let w = find_window(id)?;

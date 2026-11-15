@@ -792,13 +792,17 @@ impl App {
     }
 
     /// Global screenshot hotkey trigger: takes screenshot or starts interactive snipping.
-    fn handle_global_screenshot_hotkey(&mut self, ctx: &egui::Context) {
+    fn handle_global_screenshot_hotkey(
+        &mut self,
+        ctx: &egui::Context,
+        precaptured: Option<&[(u32, xcap::image::RgbaImage)]>,
+    ) {
         if let State::Snipping(ref mut tool) = self.state {
             tool.cancel();
             ctx.request_repaint();
             return;
         }
-        self.take_snapshot();
+        self.take_snapshot(precaptured);
         ctx.request_repaint();
     }
 
@@ -940,13 +944,13 @@ impl App {
         }
     }
 
-    fn take_snapshot(&mut self) {
+    fn take_snapshot(&mut self, precaptured: Option<&[(u32, xcap::image::RgbaImage)]>) {
         if matches!(self.state, State::Snipping(_)) {
             return;
         }
 
         if self.region_capture_on_screenshot {
-            match snipping::SnippingTool::new(&self.monitors, self.annotate_screenshot) {
+            match snipping::SnippingTool::with_precaptured(&self.monitors, self.annotate_screenshot, precaptured) {
                 Ok(tool) => {
                     self.state = State::Snipping(tool);
                     return;
@@ -1102,7 +1106,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(4.0);
                 if icon_button(ui, icons::CAMERA, t!(TIP_SNAPSHOT)).clicked() {
-                    self.take_snapshot();
+                    self.take_snapshot(None);
                 }
                 if icon_button(ui, icons::MINIMIZE, t!(TIP_MINIBAR)).clicked() {
                     self.enter_compact(ctx);
@@ -2444,7 +2448,7 @@ impl App {
             card.text_row(t!(BOX_IMAGE), &format!("PNG · {}", t!(SNAPSHOT_DETAIL)));
             card.row(t!(ROW_CAPTURE), |ui| {
                 if tinted_button_small(ui, &format!("{}  {}", icons::CAMERA, t!(TAKE_SNAPSHOT_NOW))).clicked() {
-                    self.take_snapshot();
+                    self.take_snapshot(None);
                 }
             });
             card.text_row(t!(ROW_SOURCE), &self.source_label());
@@ -2640,35 +2644,42 @@ impl App {
             self.library.confirm_delete = None;
         }
     }
-}
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        if self.hotkey_manager.poll_triggered() {
-            self.handle_global_hotkey(&ctx);
+    fn tick_logic(&mut self, ctx: &egui::Context, logic_only: bool) {
+        if let Some(record_evt) = self.hotkey_manager.poll_record_event() {
+            log::info!(
+                "[HOTKEY] UI thread processing Record (source: {}, lag: {:?})",
+                record_evt.source,
+                record_evt.triggered_at.elapsed()
+            );
+            self.handle_global_hotkey(ctx);
         }
-        if self.hotkey_manager.poll_screenshot_triggered() {
-            self.handle_global_screenshot_hotkey(&ctx);
+        if let Some(sc_evt) = self.hotkey_manager.poll_screenshot_event() {
+            log::info!(
+                "[HOTKEY] UI thread processing Screenshot (source: {}, lag: {:?})",
+                sc_evt.source,
+                sc_evt.triggered_at.elapsed()
+            );
+            self.handle_global_screenshot_hotkey(ctx, Some(&sc_evt.images));
         }
         self.poll_encoders();
-        if self.thumbs.poll(&ctx) {
+        if self.thumbs.poll(ctx) {
             ctx.request_repaint();
         }
-        self.tick_countdown(&ctx);
-        self.poll_state_transition(&ctx);
-        self.poll_game(&ctx);
-        self.poll_preview(&ctx);
+        self.tick_countdown(ctx);
+        self.poll_state_transition(ctx);
+        self.poll_game(ctx);
+        self.poll_preview(ctx);
         self.track_message();
         if let Some(path) = self.start_viewer.take() {
-            self.open_viewer(&ctx, path);
+            self.open_viewer(ctx, path);
         }
         if std::mem::take(&mut self.start_compact) {
-            self.enter_compact(&ctx);
+            self.enter_compact(ctx);
         }
 
         if let State::Picking(picker) = &mut self.state {
-            match picker.show(&ctx) {
+            match picker.show(ctx) {
                 PickerOutcome::Pending => {}
                 PickerOutcome::Selected(monitor_id, rect) => {
                     self.region = Some((monitor_id, rect));
@@ -2677,16 +2688,19 @@ impl eframe::App for App {
                     // Like other recorders: collapse to the mini bar next to the
                     // area and show the border around it.
                     if !self.compact {
-                        self.enter_compact(&ctx);
+                        self.enter_compact(ctx);
                     }
-                    self.place_bar_near_region(&ctx);
+                    self.place_bar_near_region(ctx);
                 }
                 PickerOutcome::Cancelled => self.state = State::Idle,
             }
         }
 
-        if let State::Snipping(tool) = &mut self.state {
-            match tool.show(&ctx) {
+        let is_minimized_or_hidden = ctx.input(|i| i.viewport().minimized == Some(true));
+        if (!logic_only || is_minimized_or_hidden)
+            && let State::Snipping(tool) = &mut self.state
+        {
+            match tool.show(ctx) {
                 snipping::SnippingOutcome::Pending => {}
                 snipping::SnippingOutcome::Saved(img) => {
                     self.save_snipped_image(img);
@@ -2705,6 +2719,17 @@ impl eframe::App for App {
                 }
             }
         }
+    }
+}
+
+impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick_logic(ctx, true);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.tick_logic(&ctx, false);
 
         if self.compact && !self.intercept_close(&ctx) {
             self.region_frame(&ctx);

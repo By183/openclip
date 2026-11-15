@@ -648,13 +648,29 @@ impl Drop for SnippingTool {
 impl SnippingTool {
     /// Captures full-resolution screenshots of all monitors up front (freeze-frame).
     pub fn new(monitors: &[MonitorInfo], annotate_enabled: bool) -> Result<Self> {
+        Self::with_precaptured(monitors, annotate_enabled, None)
+    }
+
+    /// Creates a snipping session, optionally using pre-captured monitor images
+    /// taken at the exact instant the global hotkey was pressed.
+    pub fn with_precaptured(
+        monitors: &[MonitorInfo],
+        annotate_enabled: bool,
+        precaptured: Option<&[(u32, xcap::image::RgbaImage)]>,
+    ) -> Result<Self> {
         if monitors.is_empty() {
             anyhow::bail!("no monitors available for snapshot");
         }
         win32_overlay::reset_signals();
         let mut views = Vec::new();
         for m in monitors {
-            let raw = screenshot_monitor_image(m.id)?;
+            let raw = if let Some(items) = precaptured
+                && let Some((_, img)) = items.iter().find(|(id, _)| *id == m.id)
+            {
+                img.clone()
+            } else {
+                screenshot_monitor_image(m.id)?
+            };
             views.push(MonitorView { info: m.clone(), raw, tex: None });
         }
         Ok(Self {

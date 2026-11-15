@@ -1,10 +1,10 @@
 [package]
 name = "openclip"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Cross-platform screen recorder with an egui GUI and no external runtime dependencies"
-repository = "https://github.com/catalingrigoriev285/openclip"
+description = "Screen recorder and screenshot tool for Windows with an egui GUI and no external runtime dependencies"
+repository = "https://github.com/By183/openclip"
 
 # The root package is also the workspace root, so `[profile.*]` below keeps
 # applying to everything and `target/` stays where it is.
@@ -41,6 +41,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 windows-capture = "2.0"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",

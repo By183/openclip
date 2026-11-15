@@ -271,10 +271,22 @@ pub enum HotkeyStatus {
     Disabled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
+pub struct PrecapturedScreenshot {
+    pub triggered_at: std::time::Instant,
+    pub source: &'static str,
+    pub images: Arc<Vec<(u32, xcap::image::RgbaImage)>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RecordTrigger {
+    pub triggered_at: std::time::Instant,
+    pub source: &'static str,
+}
+
 pub enum HotkeyEvent {
-    Record,
-    Screenshot,
+    Record(RecordTrigger),
+    Screenshot(PrecapturedScreenshot),
 }
 
 #[cfg(windows)]
@@ -290,8 +302,8 @@ pub struct HotkeyManager {
     #[cfg(windows)]
     worker: Option<JoinHandle<()>>,
     event_rx: Receiver<HotkeyEvent>,
-    pending_record: AtomicBool,
-    pending_screenshot: AtomicBool,
+    pending_record: Arc<std::sync::Mutex<Option<RecordTrigger>>>,
+    pending_screenshot: Arc<std::sync::Mutex<Option<PrecapturedScreenshot>>>,
     record_status: Arc<std::sync::Mutex<HotkeyStatus>>,
     screenshot_status: Arc<std::sync::Mutex<HotkeyStatus>>,
 }
@@ -309,6 +321,8 @@ impl HotkeyManager {
         let (event_tx, event_rx) = channel();
         let record_status = Arc::new(std::sync::Mutex::new(HotkeyStatus::Disabled));
         let screenshot_status = Arc::new(std::sync::Mutex::new(HotkeyStatus::Disabled));
+        let pending_record = Arc::new(std::sync::Mutex::new(None));
+        let pending_screenshot = Arc::new(std::sync::Mutex::new(None));
 
         #[cfg(windows)]
         {
@@ -334,8 +348,8 @@ impl HotkeyManager {
                 cmd_tx,
                 worker,
                 event_rx,
-                pending_record: AtomicBool::new(false),
-                pending_screenshot: AtomicBool::new(false),
+                pending_record,
+                pending_screenshot,
                 record_status,
                 screenshot_status,
             }
@@ -346,8 +360,8 @@ impl HotkeyManager {
             let _ = (record_cfg, screenshot_cfg, event_tx, repaint_cb);
             Self {
                 event_rx,
-                pending_record: AtomicBool::new(false),
-                pending_screenshot: AtomicBool::new(false),
+                pending_record,
+                pending_screenshot,
                 record_status,
                 screenshot_status,
             }
@@ -388,22 +402,36 @@ impl HotkeyManager {
     fn drain_events(&self) {
         while let Ok(evt) = self.event_rx.try_recv() {
             match evt {
-                HotkeyEvent::Record => self.pending_record.store(true, Ordering::Relaxed),
-                HotkeyEvent::Screenshot => self.pending_screenshot.store(true, Ordering::Relaxed),
+                HotkeyEvent::Record(rec) => {
+                    *self.pending_record.lock().unwrap() = Some(rec);
+                }
+                HotkeyEvent::Screenshot(sc) => {
+                    *self.pending_screenshot.lock().unwrap() = Some(sc);
+                }
             }
         }
     }
 
     /// Non-blocking check whether the recording hotkey was triggered.
     pub fn poll_triggered(&self) -> bool {
+        self.poll_record_event().is_some()
+    }
+
+    /// Drains and returns details of the pending record hotkey event.
+    pub fn poll_record_event(&self) -> Option<RecordTrigger> {
         self.drain_events();
-        self.pending_record.swap(false, Ordering::Relaxed)
+        self.pending_record.lock().unwrap().take()
     }
 
     /// Non-blocking check whether the screenshot hotkey was triggered.
     pub fn poll_screenshot_triggered(&self) -> bool {
+        self.poll_screenshot_event().is_some()
+    }
+
+    /// Drains and returns details of the pending screenshot hotkey event.
+    pub fn poll_screenshot_event(&self) -> Option<PrecapturedScreenshot> {
         self.drain_events();
-        self.pending_screenshot.swap(false, Ordering::Relaxed)
+        self.pending_screenshot.lock().unwrap().take()
     }
 }
 
@@ -480,6 +508,62 @@ impl HotkeyAtomicState {
 }
 
 #[cfg(windows)]
+pub fn wake_main_window() {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        RedrawWindow, RDW_ALLCHILDREN, RDW_INTERNALPAINT, RDW_INVALIDATE, RDW_UPDATENOW,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, PostMessageW, WM_NULL,
+    };
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let (pid, window_pid) = unsafe {
+            let pid = GetCurrentProcessId();
+            let mut window_pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+            (pid, window_pid)
+        };
+        if window_pid == pid {
+            let mut title = [0u16; 256];
+            let len = unsafe { GetWindowTextW(hwnd, &mut title) };
+            let text = String::from_utf16_lossy(&title[..len as usize]);
+            if text == "openclip" {
+                unsafe {
+                    let ptr = lparam.0 as *mut Option<HWND>;
+                    *ptr = Some(hwnd);
+                }
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut found: Option<HWND> = None;
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut found as *mut _ as isize));
+    }
+    if let Some(hwnd) = found {
+        unsafe {
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_INTERNALPAINT | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_NULL,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
 struct HookState {
     record: HotkeyAtomicState,
     screenshot: HotkeyAtomicState,
@@ -511,29 +595,48 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: windows::Win32::Fo
         if state.record.matches(kbd.vkCode, ctrl_down, alt_down, shift_down, win_down)
             && state.record.debounce_and_trigger()
         {
+            let t0 = std::time::Instant::now();
+            log::info!("[HOTKEY] WH_KEYBOARD_LL hook received Record hotkey at {:?}", t0);
             if let Ok(guard) = state.event_tx.lock()
                 && let Some(tx) = guard.as_ref()
             {
-                let _ = tx.send(HotkeyEvent::Record);
+                let _ = tx.send(HotkeyEvent::Record(RecordTrigger {
+                    triggered_at: t0,
+                    source: "WH_KEYBOARD_LL",
+                }));
             }
             if let Ok(guard) = state.repaint_cb.lock()
                 && let Some(cb) = guard.as_ref()
             {
                 cb();
             }
+            wake_main_window();
         } else if state.screenshot.matches(kbd.vkCode, ctrl_down, alt_down, shift_down, win_down)
             && state.screenshot.debounce_and_trigger()
         {
+            let t0 = std::time::Instant::now();
+            let images = Arc::new(crate::capture::monitors::screenshot_all_monitors_images());
+            let capture_dur = t0.elapsed();
+            log::info!(
+                "[HOTKEY] WH_KEYBOARD_LL hook received Screenshot hotkey (captured {} monitors in {:?})",
+                images.len(),
+                capture_dur
+            );
             if let Ok(guard) = state.event_tx.lock()
                 && let Some(tx) = guard.as_ref()
             {
-                let _ = tx.send(HotkeyEvent::Screenshot);
+                let _ = tx.send(HotkeyEvent::Screenshot(PrecapturedScreenshot {
+                    triggered_at: t0,
+                    source: "WH_KEYBOARD_LL",
+                    images,
+                }));
             }
             if let Ok(guard) = state.repaint_cb.lock()
                 && let Some(cb) = guard.as_ref()
             {
                 cb();
             }
+            wake_main_window();
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -707,18 +810,37 @@ fn run_hotkey_worker(
                     let id = msg.wParam.0 as i32;
                     if id == HOTKEY_RECORD_ID {
                         if hook_state.record.debounce_and_trigger() {
-                            let _ = event_tx.send(HotkeyEvent::Record);
+                            let t0 = std::time::Instant::now();
+                            log::info!("[HOTKEY] RegisterHotKey received Record hotkey at {:?}", t0);
+                            let _ = event_tx.send(HotkeyEvent::Record(RecordTrigger {
+                                triggered_at: t0,
+                                source: "RegisterHotKey",
+                            }));
                             if let Some(cb) = &repaint_cb {
                                 cb();
                             }
+                            wake_main_window();
                         }
                     } else if id == HOTKEY_SCREENSHOT_ID
                         && hook_state.screenshot.debounce_and_trigger()
                     {
-                        let _ = event_tx.send(HotkeyEvent::Screenshot);
+                        let t0 = std::time::Instant::now();
+                        let images = Arc::new(crate::capture::monitors::screenshot_all_monitors_images());
+                        let capture_dur = t0.elapsed();
+                        log::info!(
+                            "[HOTKEY] RegisterHotKey received Screenshot hotkey (captured {} monitors in {:?})",
+                            images.len(),
+                            capture_dur
+                        );
+                        let _ = event_tx.send(HotkeyEvent::Screenshot(PrecapturedScreenshot {
+                            triggered_at: t0,
+                            source: "RegisterHotKey",
+                            images,
+                        }));
                         if let Some(cb) = &repaint_cb {
                             cb();
                         }
+                        wake_main_window();
                     }
                 }
                 let _ = TranslateMessage(&msg);

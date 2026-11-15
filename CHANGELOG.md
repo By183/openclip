@@ -4,6 +4,28 @@ All notable changes to OpenClip in this fork compared to the original project ([
 
 ---
 
+## [0.2.1] — 2026-11-15
+
+### English
+
+#### Fixed
+- **Global Hotkeys Responsiveness**:
+  - Fixed: global hotkeys did not respond while the main window was covered or minimized.
+  - Implemented `eframe::App::logic` event processing and proactive Win32 message queue wake-up (`RedrawWindow` + `PostMessage`) bypassing Windows DWM occlusion and minimization throttling.
+  - Desktop freeze-frame capture is now taken synchronously at the exact moment of pressing `Ctrl+Alt+Q`.
+
+---
+
+### Русский
+
+#### Исправлено
+- **Отзывчивость глобальных горячих клавиш**:
+  - Исправлено: глобальные горячие клавиши не срабатывали, пока главное окно было перекрыто другим окном или свёрнуто.
+  - Реализована фоновая обработка в `eframe::App::logic` и принудительное пробуждение Win32 (`RedrawWindow` + `PostMessage`) для обхода троттлинга DWM Windows при перекрытии или минимизации окна.
+  - Замороженный снимок экрана теперь фиксируется синхронно непосредственно в момент нажатия `Ctrl+Alt+Q`.
+
+---
+
 ## [0.2.0] — 2026-11-15
 
 ### English
