@@ -116,7 +116,7 @@ jobs:
           fi
           name="openclip-${version}-${{ matrix.name }}"
           mkdir -p "dist/$name"
-          cp "target/release/${{ matrix.bin }}" LICENSE README.md "dist/$name/"
+          cp "target/release/${{ matrix.bin }}" LICENSE NOTICE README.md "dist/$name/"
           cp assets/fonts/FONT-AWESOME-LICENSE.txt "dist/$name/"
           hook="${{ matrix.hook }}"
           if [ -n "$hook" ]; then
