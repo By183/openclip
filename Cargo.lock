@@ -3240,6 +3240,7 @@ dependencies = [
  "serde_json",
  "windows 0.62.2",
  "windows-capture",
+ "windows-core",
  "winresource",
  "xcap",
  "yuv",

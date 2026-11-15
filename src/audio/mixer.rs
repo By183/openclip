@@ -61,7 +61,8 @@ impl Mixer {
         Self { rate, epoch, origin, sources: Vec::new(), out_pos: 0, silence_inserted: 0 }
     }
 
-    pub fn add_source(&mut self, queue: SharedQueue, sample_rate: u32, channels: u16, gain: f32) {
+    pub fn add_source(&mut self, queue: SharedQueue, sample_rate: u32, channels: u16, gain: f32) -> usize {
+        let id = self.sources.len();
         self.sources.push(SourceState {
             queue,
             channels: channels.max(1) as usize,
@@ -75,6 +76,33 @@ impl Mixer {
             stereo: Vec::new(),
             gain,
         });
+        id
+    }
+
+    /// Replaces the source queue and updates format parameters (sample rate,
+    /// channels, gain) after a device reconnect or hot-swap, preserving
+    /// timeline continuity and buffered audio.
+    pub fn update_source(
+        &mut self,
+        id: usize,
+        queue: SharedQueue,
+        sample_rate: u32,
+        channels: u16,
+        gain: Option<f32>,
+    ) {
+        if let Some(src) = self.sources.get_mut(id) {
+            src.queue = queue;
+            src.channels = channels.max(1) as usize;
+            src.resampler = KaiserSincResampler::new(sample_rate, self.rate, 2);
+            if let Some(g) = gain {
+                src.gain = g;
+            }
+            if src.buffer.is_empty() {
+                src.buffer_start = src.buffer_start.max(self.out_pos);
+            }
+            src.trim_frames = 0;
+            src.crossfade = false;
+        }
     }
 
     pub fn rate(&self) -> u32 {
@@ -507,5 +535,60 @@ mod tests {
             let rms = (all[w * 2..(w + 96) * 2].iter().map(|x| x * x).sum::<f32>() / (96 * 2) as f32).sqrt();
             assert!(rms > 0.20, "audible dip around frame {w}: rms={rms}");
         }
+    }
+
+    #[test]
+    fn reconnect_replaces_resampler_and_preserves_timeline() {
+        let master_rate = 48_000u32;
+        let epoch = Instant::now();
+        let q1 = make_queue();
+        let mut mixer = Mixer::new(master_rate, epoch, Duration::ZERO);
+
+        // Initial device: 48 kHz stereo (2 ch)
+        let src_id = mixer.add_source(q1.clone(), 48_000, 2, 1.0);
+
+        // Deliver 200 ms of audio (20 chunks of 10 ms = 480 frames * 2 ch = 960 floats)
+        let chunk_frames_48k = 480usize;
+        for k in 0..20usize {
+            let data = vec![0.5f32; chunk_frames_48k * 2];
+            q1.lock().unwrap().chunks.push_back(Chunk {
+                at: epoch + Duration::from_millis(((k + 1) * 10) as u64),
+                data,
+            });
+        }
+
+        let mut out = Vec::new();
+        mixer.mix_until(epoch + Duration::from_millis(200), &mut out);
+        assert_eq!(out.len(), 480 * 20 * 2); // 9600 frames * 2 ch = 19200 floats
+        assert!((out[1000 * 2] - 0.5).abs() < 1e-4);
+
+        // Disconnect: 500 ms of silence (mix until 700 ms without new chunks).
+        mixer.mix_until(epoch + Duration::from_millis(700), &mut out);
+        assert_eq!(out.len(), (48_000 * 700 / 1000) * 2); // 33600 frames * 2 ch = 67200 floats
+        // Check that the silence gap contains 0.0
+        let gap_sample = out[15000 * 2];
+        assert_eq!(gap_sample, 0.0);
+
+        // Reconnect with a different device: 44.1 kHz mono (1 ch)
+        let q2 = make_queue();
+        mixer.update_source(src_id, q2.clone(), 44_100, 1, None);
+
+        // Deliver 300 ms of audio at 44.1 kHz (30 chunks of 10 ms = 441 floats each)
+        // from 700 ms to 1000 ms.
+        let chunk_frames_44k = 441usize;
+        for k in 0..30usize {
+            let data = vec![0.8f32; chunk_frames_44k];
+            q2.lock().unwrap().chunks.push_back(Chunk {
+                at: epoch + Duration::from_millis(700 + ((k + 1) * 10) as u64),
+                data,
+            });
+        }
+
+        mixer.mix_until(epoch + Duration::from_millis(1000), &mut out);
+        assert_eq!(out.len(), 48_000 * 2); // Exactly 1.0 second of audio!
+
+        // Verify audio after reconnect is present and resampled cleanly to ~0.8
+        let reconnected_sample = out[43200 * 2]; // Around 900 ms
+        assert!((reconnected_sample - 0.8).abs() < 0.05, "got {}", reconnected_sample);
     }
 }

@@ -5,6 +5,7 @@
 //! the mixer uses to place them on the recording timeline.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,8 +41,19 @@ pub struct AudioSource {
     pub sample_rate: u32,
     pub channels: u16,
     pub queue: SharedQueue,
+    pub reconnect: Arc<AtomicBool>,
     _stream: Stream,
     _keepalive: Option<Stream>,
+}
+
+impl AudioSource {
+    pub fn needs_reconnect(&self) -> bool {
+        self.reconnect.load(Ordering::SeqCst)
+    }
+
+    pub fn flag_reconnect(&self) {
+        self.reconnect.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Names of available microphone / input devices.
@@ -76,15 +88,34 @@ fn device_name(d: &Device) -> Option<String> {
     d.description().ok().map(|desc| desc.name().to_string())
 }
 
+fn is_default_device(name: Option<&str>) -> bool {
+    match name {
+        None => true,
+        Some(s) => s.trim().is_empty() || s.eq_ignore_ascii_case("default"),
+    }
+}
+
+/// Names of current default output and input devices.
+pub fn default_output_device_name() -> Option<String> {
+    let host = cpal::default_host();
+    host.default_output_device().and_then(|d| device_name(&d))
+}
+
+pub fn default_input_device_name() -> Option<String> {
+    let host = cpal::default_host();
+    host.default_input_device().and_then(|d| device_name(&d))
+}
+
 /// Opens the microphone (`name`, or the default input device).
 pub fn open_microphone(name: Option<&str>) -> Result<AudioSource> {
     let host = cpal::default_host();
-    let device = match name {
-        Some(n) => host
-            .input_devices()?
+    let device = if is_default_device(name) {
+        host.default_input_device().context("no default input device")?
+    } else {
+        let n = name.unwrap();
+        host.input_devices()?
             .find(|d| device_name(d).as_deref() == Some(n))
-            .ok_or_else(|| anyhow!("input device '{n}' not found"))?,
-        None => host.default_input_device().context("no default input device")?,
+            .ok_or_else(|| anyhow!("input device '{n}' not found"))?
     };
     let config = device.default_input_config().context("microphone default config")?;
     build(device, config, "microphone", None)
@@ -100,12 +131,13 @@ pub fn open_system_loopback() -> Result<AudioSource> {
 /// Opens a loopback capture of `name`, or the default output device when `None`.
 pub fn open_system_loopback_device(name: Option<&str>) -> Result<AudioSource> {
     let host = cpal::default_host();
-    let device = match name.filter(|s| !s.is_empty()) {
-        Some(n) => host
-            .output_devices()?
+    let device = if is_default_device(name) {
+        host.default_output_device().context("no default output device")?
+    } else {
+        let n = name.unwrap();
+        host.output_devices()?
             .find(|d| device_name(d).as_deref() == Some(n))
-            .ok_or_else(|| anyhow!("output device '{n}' not found"))?,
-        None => host.default_output_device().context("no default output device")?,
+            .ok_or_else(|| anyhow!("output device '{n}' not found"))?
     };
     let keepalive = start_loopback_keepalive(&device);
     let config = device.default_output_config().context("output device default config")?;
@@ -204,9 +236,14 @@ fn build(
     let sample_format = supported.sample_format();
     let config: StreamConfig = supported.into();
     let queue: SharedQueue = Arc::new(Mutex::new(Queue::default()));
+    let reconnect = Arc::new(AtomicBool::new(false));
     let err_fn = {
         let what = what.to_string();
-        move |e| log::warn!("{what} stream: {e}")
+        let rec = reconnect.clone();
+        move |e| {
+            log::warn!("{what} stream: {e}");
+            rec.store(true, Ordering::SeqCst);
+        }
     };
     let q = queue.clone();
     let mut boosted = false;
@@ -276,6 +313,7 @@ fn build(
         sample_rate: config.sample_rate,
         channels: config.channels,
         queue,
+        reconnect,
         _stream: stream,
         _keepalive: keepalive,
     })
@@ -288,9 +326,120 @@ fn promote_audio_thread() {
     use windows::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
     };
-    // SAFETY: `GetCurrentThread()` returns a pseudo-handle for the calling thread.
+        // SAFETY: `GetCurrentThread()` returns a pseudo-handle for the calling thread.
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
 }
+
+#[cfg(windows)]
+mod watcher {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use windows::core::{implement, PCWSTR};
+    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::Media::Audio::*;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+
+    #[implement(IMMNotificationClient)]
+    struct AudioWatcher {
+        changed: Arc<AtomicBool>,
+    }
+
+    impl IMMNotificationClient_Impl for AudioWatcher_Impl {
+        fn OnDeviceStateChanged(&self, _pwstrdeviceid: &PCWSTR, _dwnewstate: DEVICE_STATE) -> windows::core::Result<()> {
+            log::debug!("audio device state changed");
+            self.changed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn OnDeviceAdded(&self, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+            log::debug!("audio device added");
+            self.changed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn OnDeviceRemoved(&self, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+            log::debug!("audio device removed");
+            self.changed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn OnDefaultDeviceChanged(&self, _flow: EDataFlow, _role: ERole, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+            log::debug!("audio default device changed");
+            self.changed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub struct DeviceNotificationListener {
+        pub changed: Arc<AtomicBool>,
+        enumerator: Option<IMMDeviceEnumerator>,
+        client: Option<IMMNotificationClient>,
+    }
+
+    impl DeviceNotificationListener {
+        pub fn new() -> Self {
+            let changed = Arc::new(AtomicBool::new(false));
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                let enumerator: windows::core::Result<IMMDeviceEnumerator> =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL);
+                match enumerator {
+                    Ok(enumerator) => {
+                        let watcher: IMMNotificationClient = AudioWatcher { changed: changed.clone() }.into();
+                        if let Err(e) = enumerator.RegisterEndpointNotificationCallback(&watcher) {
+                            log::warn!("failed to register audio endpoint notification callback: {e}");
+                            Self { changed, enumerator: None, client: None }
+                        } else {
+                            log::debug!("audio endpoint notification callback registered");
+                            Self { changed, enumerator: Some(enumerator), client: Some(watcher) }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("failed to create MMDeviceEnumerator: {e}");
+                        Self { changed, enumerator: None, client: None }
+                    }
+                }
+            }
+        }
+    }
+
+    impl Default for DeviceNotificationListener {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Drop for DeviceNotificationListener {
+        fn drop(&mut self) {
+            if let (Some(enumerator), Some(client)) = (&self.enumerator, &self.client) {
+                unsafe {
+                    let _ = enumerator.UnregisterEndpointNotificationCallback(client);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use watcher::DeviceNotificationListener;
+
+#[cfg(not(windows))]
+#[derive(Default)]
+pub struct DeviceNotificationListener {
+    pub changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(not(windows))]
+impl DeviceNotificationListener {
+    pub fn new() -> Self {
+        Self {
+            changed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+
+
 

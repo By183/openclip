@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::audio::capture::{
-    open_microphone, open_system_loopback_device, AudioSource, Chunk, Queue, SharedQueue,
+    default_input_device_name, default_output_device_name, open_microphone,
+    open_system_loopback_device, AudioSource, Chunk, DeviceNotificationListener, Queue, SharedQueue,
 };
 use crate::audio::mixer::Mixer;
 use crate::audio::{create_audio_encoder, AudioEncoder, AudioFrame};
@@ -2307,6 +2308,12 @@ struct FanOut {
     targets: [SharedQueue; 2],
 }
 
+struct SourceSlot {
+    track_idx: usize,
+    source_id: usize,
+    target_queue: Option<SharedQueue>,
+}
+
 fn push_capped(q: &mut Queue, chunk: Chunk) {
     if q.chunks.len() >= 512 {
         q.chunks.pop_front();
@@ -2328,18 +2335,20 @@ fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, Vec<Au
     let (ready_tx, ready_rx) = mpsc::channel::<Result<Vec<AudioTrackConfig>>>();
     let handle = std::thread::Builder::new().name("openclip-audio".into()).spawn(move || {
         let clamp_gain = |g: f32| if g.is_finite() { g.clamp(0.0, 2.0) } else { 1.0 };
-        let mut sys_src: Option<(AudioSource, f32)> = None;
-        let mut mic_src: Option<(AudioSource, f32)> = None;
+        let sys_gain = clamp_gain(config.system_audio_gain);
+        let mic_gain = clamp_gain(config.mic_gain);
+        let mut sys_src: Option<AudioSource> = None;
+        let mut mic_src: Option<AudioSource> = None;
         let mut notes = Vec::new();
         if config.system_audio {
             match open_system_loopback_device(config.system_audio_device.as_deref()) {
-                Ok(s) => sys_src = Some((s, clamp_gain(config.system_audio_gain))),
+                Ok(s) => sys_src = Some(s),
                 Err(e) => notes.push(crate::t!(NOTE_SYSTEM_AUDIO_UNAVAILABLE, format!("{e:#}"))),
             }
         }
         if let Some(mic) = &config.microphone {
             match open_microphone(mic.as_deref()) {
-                Ok(s) => mic_src = Some((s, clamp_gain(config.mic_gain))),
+                Ok(s) => mic_src = Some(s),
                 Err(e) => notes.push(crate::t!(NOTE_MIC_UNAVAILABLE, format!("{e:#}"))),
             }
         }
@@ -2401,10 +2410,13 @@ fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, Vec<Au
         let fan_out_sys = roles.contains(&TrackRole::Mixed) && roles.contains(&TrackRole::System);
         let fan_out_mic = roles.contains(&TrackRole::Mixed) && roles.contains(&TrackRole::Mic);
         let mut fanouts: Vec<FanOut> = Vec::new();
-        let (sys_mix_q, sys_sep_q) = if let Some((s, _)) = &sys_src {
+        let mut sys_fanout_idx: Option<usize> = None;
+        let mut mic_fanout_idx: Option<usize> = None;
+        let (sys_mix_q, sys_sep_q) = if let Some(s) = &sys_src {
             if fan_out_sys {
                 let q1: SharedQueue = Arc::new(Mutex::new(Queue::default()));
                 let q2: SharedQueue = Arc::new(Mutex::new(Queue::default()));
+                sys_fanout_idx = Some(fanouts.len());
                 fanouts.push(FanOut { raw: s.queue.clone(), targets: [q1.clone(), q2.clone()] });
                 (Some(q1), Some(q2))
             } else {
@@ -2413,10 +2425,11 @@ fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, Vec<Au
         } else {
             (None, None)
         };
-        let (mic_mix_q, mic_sep_q) = if let Some((s, _)) = &mic_src {
+        let (mic_mix_q, mic_sep_q) = if let Some(s) = &mic_src {
             if fan_out_mic {
                 let q1: SharedQueue = Arc::new(Mutex::new(Queue::default()));
                 let q2: SharedQueue = Arc::new(Mutex::new(Queue::default()));
+                mic_fanout_idx = Some(fanouts.len());
                 fanouts.push(FanOut { raw: s.queue.clone(), targets: [q1.clone(), q2.clone()] });
                 (Some(q1), Some(q2))
             } else {
@@ -2426,37 +2439,48 @@ fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, Vec<Au
             (None, None)
         };
 
-        let mut tracks: Vec<TrackPipeline> = roles
-            .into_iter()
-            .zip(encoders)
-            .map(|(role, encoder)| {
-                let rate = encoder.sample_rate();
-                let channels = encoder.channels().clamp(1, 2) as usize;
-                let mut mixer = Mixer::new(rate, epoch, origin);
-                match role {
-                    TrackRole::Mixed => {
-                        if let (Some((s, gain)), Some(q)) = (&sys_src, &sys_mix_q) {
-                            mixer.add_source(q.clone(), s.sample_rate, s.channels, *gain);
-                        }
-                        if let (Some((s, gain)), Some(q)) = (&mic_src, &mic_mix_q) {
-                            mixer.add_source(q.clone(), s.sample_rate, s.channels, *gain);
-                        }
+        let mut sys_slots: Vec<SourceSlot> = Vec::new();
+        let mut mic_slots: Vec<SourceSlot> = Vec::new();
+        let mut tracks: Vec<TrackPipeline> = Vec::with_capacity(roles.len());
+
+        for (track_idx, (role, encoder)) in roles.into_iter().zip(encoders).enumerate() {
+            let rate = encoder.sample_rate();
+            let channels = encoder.channels().clamp(1, 2) as usize;
+            let mut mixer = Mixer::new(rate, epoch, origin);
+            match role {
+                TrackRole::Mixed => {
+                    if let (Some(s), Some(q)) = (&sys_src, &sys_mix_q) {
+                        let target_queue = if fan_out_sys { Some(q.clone()) } else { None };
+                        let source_id = mixer.add_source(q.clone(), s.sample_rate, s.channels, sys_gain);
+                        sys_slots.push(SourceSlot { track_idx, source_id, target_queue });
                     }
-                    TrackRole::System => {
-                        if let (Some((s, gain)), Some(q)) = (&sys_src, &sys_sep_q) {
-                            mixer.add_source(q.clone(), s.sample_rate, s.channels, *gain);
-                        }
-                    }
-                    TrackRole::Mic => {
-                        if let (Some((s, gain)), Some(q)) = (&mic_src, &mic_sep_q) {
-                            mixer.add_source(q.clone(), s.sample_rate, s.channels, *gain);
-                        }
+                    if let (Some(s), Some(q)) = (&mic_src, &mic_mix_q) {
+                        let target_queue = if fan_out_mic { Some(q.clone()) } else { None };
+                        let source_id = mixer.add_source(q.clone(), s.sample_rate, s.channels, mic_gain);
+                        mic_slots.push(SourceSlot { track_idx, source_id, target_queue });
                     }
                 }
-                TrackPipeline { mixer, encoder, channels }
-            })
-            .collect();
+                TrackRole::System => {
+                    if let (Some(s), Some(q)) = (&sys_src, &sys_sep_q) {
+                        let target_queue = if fan_out_sys { Some(q.clone()) } else { None };
+                        let source_id = mixer.add_source(q.clone(), s.sample_rate, s.channels, sys_gain);
+                        sys_slots.push(SourceSlot { track_idx, source_id, target_queue });
+                    }
+                }
+                TrackRole::Mic => {
+                    if let (Some(s), Some(q)) = (&mic_src, &mic_sep_q) {
+                        let target_queue = if fan_out_mic { Some(q.clone()) } else { None };
+                        let source_id = mixer.add_source(q.clone(), s.sample_rate, s.channels, mic_gain);
+                        mic_slots.push(SourceSlot { track_idx, source_id, target_queue });
+                    }
+                }
+            }
+            tracks.push(TrackPipeline { mixer, encoder, channels });
+        }
 
+        let device_listener = DeviceNotificationListener::new();
+        let mut sys_reconnect_due: Option<Instant> = None;
+        let mut mic_reconnect_due: Option<Instant> = None;
         let mut pcm = Vec::new();
         let mut mono = Vec::new();
         let send = |track_idx: usize, frames: Vec<AudioFrame>| -> Result<()> {
@@ -2485,6 +2509,141 @@ fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, Vec<Au
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
+
+            let now = Instant::now();
+
+            // Core Audio device notifications (plug/unplug or default device changed):
+            if device_listener.changed.swap(false, Ordering::SeqCst) {
+                // If system audio captures the default device, check whether the default device changed:
+                if config.system_audio
+                    && config.system_audio_device.is_none()
+                    && let Some(src) = &sys_src
+                {
+                    let current_default = default_output_device_name();
+                    if current_default.as_ref().is_some_and(|name| name != &src.name) {
+                        log::info!(
+                            "audio: default output changed from '{}' to '{}', switching...",
+                            src.name,
+                            current_default.as_deref().unwrap_or("")
+                        );
+                        sys_src = None;
+                        sys_reconnect_due = Some(now + Duration::from_millis(300));
+                    }
+                }
+                // If microphone captures the default device, check whether the default mic changed:
+                if config.microphone.as_ref().is_some_and(|m| m.is_none())
+                    && let Some(src) = &mic_src
+                {
+                    let current_default = default_input_device_name();
+                    if current_default.as_ref().is_some_and(|name| name != &src.name) {
+                        log::info!(
+                            "audio: default microphone changed from '{}' to '{}', switching...",
+                            src.name,
+                            current_default.as_deref().unwrap_or("")
+                        );
+                        mic_src = None;
+                        mic_reconnect_due = Some(now + Duration::from_millis(300));
+                    }
+                }
+                // Hasten reconnect attempts if devices reappeared:
+                if sys_src.is_none() && !sys_slots.is_empty() {
+                    let debounce = now + Duration::from_millis(300);
+                    if sys_reconnect_due.is_none_or(|due| due > debounce) {
+                        sys_reconnect_due = Some(debounce);
+                    }
+                }
+                if mic_src.is_none() && !mic_slots.is_empty() {
+                    let debounce = now + Duration::from_millis(300);
+                    if mic_reconnect_due.is_none_or(|due| due > debounce) {
+                        mic_reconnect_due = Some(debounce);
+                    }
+                }
+            }
+
+            // Detect broken CPAL streams:
+            if let Some(src) = &sys_src
+                && src.needs_reconnect()
+            {
+                log::warn!("audio: system loopback stream failed ('{}'), scheduling reconnect...", src.name);
+                sys_src = None;
+                sys_reconnect_due = Some(now + Duration::from_millis(300));
+            }
+            if let Some(src) = &mic_src
+                && src.needs_reconnect()
+            {
+                log::warn!("audio: microphone stream failed ('{}'), scheduling reconnect...", src.name);
+                mic_src = None;
+                mic_reconnect_due = Some(now + Duration::from_millis(300));
+            }
+
+            // Reconnection attempts:
+            if let Some(due) = sys_reconnect_due
+                && now >= due
+            {
+                match open_system_loopback_device(config.system_audio_device.as_deref()) {
+                    Ok(new_s) => {
+                        log::info!(
+                            "audio: system loopback recovered: '{}' {} Hz, {} ch",
+                            new_s.name,
+                            new_s.sample_rate,
+                            new_s.channels
+                        );
+                        if let Some(idx) = sys_fanout_idx {
+                            fanouts[idx].raw = new_s.queue.clone();
+                        }
+                        for slot in &sys_slots {
+                            let q = slot.target_queue.as_ref().cloned().unwrap_or_else(|| new_s.queue.clone());
+                            tracks[slot.track_idx].mixer.update_source(
+                                slot.source_id,
+                                q,
+                                new_s.sample_rate,
+                                new_s.channels,
+                                Some(sys_gain),
+                            );
+                        }
+                        sys_src = Some(new_s);
+                        sys_reconnect_due = None;
+                    }
+                    Err(e) => {
+                        log::debug!("audio: system loopback reconnect attempt failed: {e:#}, retrying in 1s");
+                        sys_reconnect_due = Some(now + Duration::from_secs(1));
+                    }
+                }
+            }
+            if let Some(due) = mic_reconnect_due
+                && now >= due
+            {
+                match open_microphone(config.microphone.as_ref().and_then(|m| m.as_deref())) {
+                    Ok(new_s) => {
+                        log::info!(
+                            "audio: microphone recovered: '{}' {} Hz, {} ch",
+                            new_s.name,
+                            new_s.sample_rate,
+                            new_s.channels
+                        );
+                        if let Some(idx) = mic_fanout_idx {
+                            fanouts[idx].raw = new_s.queue.clone();
+                        }
+                        for slot in &mic_slots {
+                            let q = slot.target_queue.as_ref().cloned().unwrap_or_else(|| new_s.queue.clone());
+                            tracks[slot.track_idx].mixer.update_source(
+                                slot.source_id,
+                                q,
+                                new_s.sample_rate,
+                                new_s.channels,
+                                Some(mic_gain),
+                            );
+                        }
+                        mic_src = Some(new_s);
+                        mic_reconnect_due = None;
+                    }
+                    Err(e) => {
+                        log::debug!("audio: microphone reconnect attempt failed: {e:#}, retrying in 1s");
+                        mic_reconnect_due = Some(now + Duration::from_secs(1));
+                    }
+                }
+            }
+
             for fan in &fanouts {
                 let drained: Vec<_> = fan.raw.lock().unwrap().chunks.drain(..).collect();
                 if drained.is_empty() {
@@ -2501,7 +2660,6 @@ fn spawn_audio_thread(args: AudioArgs) -> Result<(JoinHandle<Result<()>>, Vec<Au
                     push_capped(&mut q1, c);
                 }
             }
-            let now = Instant::now();
             let until = if stopping { now } else { now - AUDIO_LAG };
             for (track_idx, tp) in tracks.iter_mut().enumerate() {
                 pcm.clear();
