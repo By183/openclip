@@ -1,12 +1,25 @@
-//! Streaming MP4 writer.
+//! Streaming progressive ISO BMFF fragmented MP4 (`fMP4`) writer.
 //!
-//! Layout: `ftyp` | `mdat` (64-bit largesize, samples interleaved in ~0.5 s
-//! chunks) | `moov`. The `moov` box is assembled from in-memory sample tables
-//! at [`Mp4Writer::finalize`]. Video is `avc1` (H.264) or `hvc1` (HEVC) with
-//! length-prefixed samples; audio is `mp4a` with an MPEG-1 Layer III
-//! (`objectTypeIndication` 0x6B) or AAC (0x40) `esds`, one codec frame per sample.
+//! Layout:
+//!   `ftyp` | `moov` (with `mvex` and empty `stbl` sample tables) |
+//!   [ `moof` + `mdat` ]* | (optional `mfra` at finalize).
+//!
+//! Video is `avc1` (H.264) or `hvc1` (HEVC) with length-prefixed samples;
+//! audio is `mp4a` with MPEG-1 Layer III (`objectTypeIndication` 0x6B) or
+//! AAC (0x40) `esds`.
+//!
+//! Because `avcC` / `hvcC` requires parameter sets (SPS/PPS, VPS), samples
+//! are buffered in memory until the first keyframe (or `set_codec_params`),
+//! at which point the initialization segment (`ftyp` + `moov`) is flushed
+//! immediately to disk.
+//!
+//! Subsequent samples are grouped into self-contained fragments (`moof` + `mdat`)
+//! and flushed to disk on keyframes (>= 1.5 s) or emergency timeouts (>= 3.0 s).
+//! Each fragment uses `default-base-is-moof` (flag `0x020000`) and 64-bit `tfdt`
+//! decode timestamps, allowing valid playback even if the process crashes or loses
+//! power without calling [`Mp4Writer::finalize`].
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Seek, Write};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -21,8 +34,10 @@ use crate::video::encoder::CodecParams;
 pub const VIDEO_TIMESCALE: u32 = 90_000;
 /// Timescale of the movie header.
 const MOVIE_TIMESCALE: u32 = 1_000;
-/// Samples are grouped into chunks covering about this much time.
-const CHUNK_DURATION: Duration = Duration::from_millis(250);
+/// Target minimum duration of a fragment before splitting on a keyframe.
+const FRAGMENT_TARGET_DURATION: Duration = Duration::from_millis(1500);
+/// Maximum duration of a fragment before forcing an emergency flush.
+const FRAGMENT_MAX_DURATION: Duration = Duration::from_millis(3000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodecConfig {
@@ -34,7 +49,7 @@ pub enum VideoCodecConfig {
 pub struct VideoTrackConfig {
     pub width: u32,
     pub height: u32,
-    /// Used only for the duration of the final sample.
+    /// Used for default fallback sample duration when calculating frame pacing.
     pub fps: f64,
     pub codec: VideoCodecConfig,
 }
@@ -49,74 +64,43 @@ pub struct AudioTrackConfig {
     pub codec: AudioCodecConfig,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Sample {
-    size: u32,
-    /// Presentation time in track timescale units, relative to the first sample.
-    pts: u64,
+#[derive(Debug, Clone)]
+struct VideoSample {
+    data: Vec<u8>,
+    pts_ticks: u64,
     keyframe: bool,
 }
 
+#[derive(Debug, Clone)]
+struct AudioSample {
+    data: Vec<u8>,
+    pts_ticks: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
-struct Chunk {
-    offset: u64,
-    sample_count: u32,
-}
-
-#[derive(Debug, Default)]
-struct Track {
-    timescale: u32,
-    samples: Vec<Sample>,
-    chunks: Vec<Chunk>,
-    /// Samples buffered for the chunk currently being assembled.
-    pending: Vec<u8>,
-    pending_count: u32,
-    pending_start_pts: u64,
-    first_pts: Option<Duration>,
-}
-
-impl Track {
-    fn new(timescale: u32) -> Self {
-        Self { timescale, ..Default::default() }
-    }
-
-    fn chunk_ticks(&self) -> u64 {
-        CHUNK_DURATION.as_millis() as u64 * self.timescale as u64 / 1000
-    }
-
-    fn duration_ticks(&self, last_delta: u32) -> u64 {
-        match self.samples.last() {
-            None => 0,
-            Some(s) => s.pts + last_delta as u64,
-        }
-    }
-
-    /// Per-sample deltas; the final sample borrows the previous delta (or `fallback`).
-    fn deltas(&self, fallback: u32) -> Vec<u32> {
-        let n = self.samples.len();
-        let mut out: Vec<u32> = Vec::with_capacity(n);
-        for i in 0..n {
-            let d = if i + 1 < n {
-                (self.samples[i + 1].pts - self.samples[i].pts) as u32
-            } else if i > 0 {
-                out[i - 1]
-            } else {
-                fallback
-            };
-            out.push(d.max(1));
-        }
-        out
-    }
+struct SeekEntry {
+    time: u64,
+    moof_offset: u64,
 }
 
 pub struct Mp4Writer<W: Write + Seek> {
     out: W,
     pos: u64,
-    mdat_start: u64,
-    video: Option<(Track, VideoTrackConfig)>,
+    video: Option<VideoTrackConfig>,
     video_end_pts: Option<Duration>,
-    audio: Vec<(Track, AudioTrackConfig)>,
+    audio: Vec<AudioTrackConfig>,
     params: Option<CodecParams>,
+    header_written: bool,
+    sequence_number: u32,
+    first_video_pts: Option<Duration>,
+    last_video_pts_ticks: Option<u64>,
+    fragment_start_video_pts: Option<Duration>,
+    fragment_start_audio_pts: Option<u64>,
+    buffered_video: Vec<VideoSample>,
+    buffered_audio: Vec<Vec<AudioSample>>,
+    video_samples_total: usize,
+    audio_samples_total: Vec<usize>,
+    seek_entries: Vec<SeekEntry>,
     scratch: Vec<u8>,
     finalized: bool,
 }
@@ -133,7 +117,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
 
     /// Starts a new file with an optional video track and zero or more audio tracks.
     pub fn with_audio_tracks(
-        mut out: W,
+        out: W,
         video: Option<VideoTrackConfig>,
         audio_tracks: Vec<AudioTrackConfig>,
     ) -> Result<Self> {
@@ -145,31 +129,35 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 bail!("PCM audio is not supported in MP4; use AVI");
             }
         }
-        let hevc = video.as_ref().map(|v| v.codec == VideoCodecConfig::Hevc).unwrap_or(false);
-        let mut ftyp = Buf::new();
-        ftyp.atom(b"ftyp", |b| {
-            b.fourcc(b"isom").u32(0x200);
-            for brand in [b"isom", b"iso2", if hevc { b"hvc1" } else { b"avc1" }, b"mp41"] {
-                b.fourcc(brand);
-            }
-        });
-        out.write_all(&ftyp.0)?;
-        let mdat_start = ftyp.0.len() as u64;
-        // 64-bit mdat header: size=1 + largesize (patched at finalize).
-        let mut hdr = Buf::new();
-        hdr.u32(1).fourcc(b"mdat").u64(0);
-        out.write_all(&hdr.0)?;
-        Ok(Self {
+        let audio_count = audio_tracks.len();
+        let mut writer = Self {
             out,
-            pos: mdat_start + 16,
-            mdat_start,
-            video: video.map(|c| (Track::new(VIDEO_TIMESCALE), c)),
+            pos: 0,
+            video,
             video_end_pts: None,
-            audio: audio_tracks.into_iter().map(|c| (Track::new(c.sample_rate), c)).collect(),
+            audio: audio_tracks,
             params: None,
+            header_written: false,
+            sequence_number: 1,
+            first_video_pts: None,
+            last_video_pts_ticks: None,
+            fragment_start_video_pts: None,
+            fragment_start_audio_pts: None,
+            buffered_video: Vec::new(),
+            buffered_audio: vec![Vec::new(); audio_count],
+            video_samples_total: 0,
+            audio_samples_total: vec![0; audio_count],
+            seek_entries: Vec::new(),
             scratch: Vec::new(),
             finalized: false,
-        })
+        };
+
+        // If audio-only, we already have everything needed to write the initialization header.
+        if writer.video.is_none() {
+            writer.write_header()?;
+        }
+
+        Ok(writer)
     }
 
     /// Extends the final video sample's presentation duration up to `end_pts`
@@ -191,23 +179,29 @@ impl<W: Write + Seek> Mp4Writer<W> {
         self.audio.len()
     }
 
-    /// Registers the codec parameter sets (start-code-free NALs). Only the
-    /// first set is kept; when none is registered, `push_video` harvests them
-    /// from the first keyframe.
+    /// Registers the codec parameter sets (start-code-free NALs). When none is
+    /// registered, `push_video` harvests them from the first keyframe.
     pub fn set_codec_params(&mut self, params: &CodecParams) {
         if self.params.is_none() {
             self.params = Some(params.clone());
+            if !self.header_written {
+                let _ = self.write_header();
+            }
         }
     }
 
     /// Appends one video access unit in Annex-B form. Parameter sets and
     /// access-unit delimiters are stripped; the rest is length-prefixed.
     pub fn push_video(&mut self, annexb: &[u8], pts: Duration, keyframe: bool) -> Result<()> {
-        let (track, cfg) = self.video.as_mut().context("no video track")?;
+        let cfg = self.video.as_ref().context("no video track")?;
         let is_hevc = cfg.codec == VideoCodecConfig::Hevc;
         if self.params.is_none() && keyframe {
             self.params = CodecParams::from_annexb(annexb, is_hevc);
+            if self.params.is_some() && !self.header_written {
+                self.write_header()?;
+            }
         }
+
         self.scratch.clear();
         for nal in avc::split_annexb(annexb) {
             let skip = if is_hevc {
@@ -224,16 +218,45 @@ impl<W: Write + Seek> Mp4Writer<W> {
         if self.scratch.is_empty() {
             return Ok(());
         }
-        let first = *track.first_pts.get_or_insert(pts);
+
+        let first = *self.first_video_pts.get_or_insert(pts);
         let rel = pts.saturating_sub(first);
-        let mut ticks = duration_to_ticks(rel, track.timescale);
-        if let Some(last) = track.samples.last()
-            && ticks <= last.pts
+        let mut ticks = duration_to_ticks(rel, VIDEO_TIMESCALE);
+        if let Some(last) = self.last_video_pts_ticks
+            && ticks <= last
         {
-            ticks = last.pts + 1;
+            ticks = last + 1;
         }
-        let sample = Sample { size: self.scratch.len() as u32, pts: ticks, keyframe };
-        Self::push_sample(&mut self.out, &mut self.pos, track, sample, &self.scratch)
+        self.last_video_pts_ticks = Some(ticks);
+
+        // Check if current fragment duration threshold reached
+        let fragment_dur = if let Some(start) = self.fragment_start_video_pts {
+            pts.saturating_sub(start)
+        } else {
+            Duration::ZERO
+        };
+
+        let should_flush = (!self.buffered_video.is_empty()
+            && keyframe
+            && fragment_dur >= FRAGMENT_TARGET_DURATION)
+            || (!self.buffered_video.is_empty() && fragment_dur >= FRAGMENT_MAX_DURATION);
+
+        if should_flush {
+            self.flush_fragment(Some(ticks))?;
+        }
+
+        if self.fragment_start_video_pts.is_none() {
+            self.fragment_start_video_pts = Some(pts);
+        }
+
+        self.buffered_video.push(VideoSample {
+            data: self.scratch.clone(),
+            pts_ticks: ticks,
+            keyframe,
+        });
+        self.video_samples_total += 1;
+
+        Ok(())
     }
 
     /// Appends one audio frame (MP3 frame / AAC access unit) to track 0. Audio samples are assumed contiguous.
@@ -243,40 +266,296 @@ impl<W: Write + Seek> Mp4Writer<W> {
 
     /// Appends one audio frame (MP3 frame / AAC access unit) to audio track `index`.
     pub fn push_audio_track(&mut self, index: usize, frame: &[u8]) -> Result<()> {
-        let (track, cfg) = self.audio.get_mut(index).with_context(|| format!("no audio track {index}"))?;
-        let ticks = track.samples.len() as u64 * cfg.samples_per_frame as u64;
-        let sample = Sample { size: frame.len() as u32, pts: ticks, keyframe: true };
-        Self::push_sample(&mut self.out, &mut self.pos, track, sample, frame)
-    }
+        let cfg = self.audio.get(index).with_context(|| format!("no audio track {index}"))?;
+        let current_sample_count = self.audio_samples_total[index];
+        let ticks = current_sample_count as u64 * cfg.samples_per_frame as u64;
 
-    fn push_sample(
-        out: &mut W,
-        pos: &mut u64,
-        track: &mut Track,
-        sample: Sample,
-        data: &[u8],
-    ) -> Result<()> {
-        if track.pending_count == 0 {
-            track.pending_start_pts = sample.pts;
+        if self.buffered_audio[index].is_empty() && self.fragment_start_audio_pts.is_none() {
+            self.fragment_start_audio_pts = Some(ticks);
         }
-        track.pending.extend_from_slice(data);
-        track.pending_count += 1;
-        track.samples.push(sample);
-        if sample.pts - track.pending_start_pts >= track.chunk_ticks() {
-            Self::flush_chunk(out, pos, track)?;
+
+        self.buffered_audio[index].push(AudioSample {
+            data: frame.to_vec(),
+            pts_ticks: ticks,
+        });
+        self.audio_samples_total[index] += 1;
+
+        // For audio-only streams, flush on fragment target duration
+        if self.video.is_none() && index == 0 {
+            let samples = self.buffered_audio[0].len() as u64;
+            let dur_ticks = samples * cfg.samples_per_frame as u64;
+            let dur = Duration::from_secs_f64(dur_ticks as f64 / cfg.sample_rate as f64);
+            if dur >= FRAGMENT_TARGET_DURATION {
+                self.flush_fragment(None)?;
+            }
         }
+
         Ok(())
     }
 
-    fn flush_chunk(out: &mut W, pos: &mut u64, track: &mut Track) -> Result<()> {
-        if track.pending_count == 0 {
+    fn write_header(&mut self) -> Result<()> {
+        if self.header_written {
             return Ok(());
         }
-        out.write_all(&track.pending)?;
-        track.chunks.push(Chunk { offset: *pos, sample_count: track.pending_count });
-        *pos += track.pending.len() as u64;
-        track.pending.clear();
-        track.pending_count = 0;
+        let is_hevc = self.video.as_ref().map(|v| v.codec == VideoCodecConfig::Hevc).unwrap_or(false);
+        let mut ftyp = Buf::new();
+        ftyp.atom(b"ftyp", |b| {
+            b.fourcc(b"isom").u32(0x200);
+            for brand in [b"isom", b"iso5", b"iso6", b"mp41", if is_hevc { b"hvc1" } else { b"avc1" }] {
+                b.fourcc(brand);
+            }
+        });
+
+        let moov = self.build_init_moov()?;
+
+        self.out.write_all(&ftyp.0)?;
+        self.out.write_all(&moov)?;
+        self.pos += (ftyp.0.len() + moov.len()) as u64;
+        self.out.flush()?;
+        self.header_written = true;
+        Ok(())
+    }
+
+    fn build_init_moov(&self) -> Result<Vec<u8>> {
+        let now = mp4_now();
+        let mut tracks: Vec<Vec<u8>> = Vec::new();
+        let mut track_ids: Vec<u32> = Vec::new();
+        let mut next_track_id = 1u32;
+
+        if let Some(cfg) = &self.video {
+            let params = self.params.as_ref().context("no parameter sets recorded for video track")?;
+            let stsd = match (cfg.codec, params) {
+                (VideoCodecConfig::H264, CodecParams::H264 { sps, pps }) => build_avc1(cfg, sps, pps),
+                (VideoCodecConfig::Hevc, CodecParams::Hevc { vps, sps, pps }) => build_hvc1(cfg, vps, sps, pps),
+                _ => bail!("codec parameter sets do not match the video track codec"),
+            };
+            let trak = build_init_trak(&InitTrakParams {
+                track_id: next_track_id,
+                now,
+                timescale: VIDEO_TIMESCALE,
+                handler: b"vide",
+                handler_name: "VideoHandler",
+                dims: Some((cfg.width, cfg.height)),
+                stsd_entry: stsd,
+                is_video: true,
+            });
+            tracks.push(trak);
+            track_ids.push(next_track_id);
+            next_track_id += 1;
+        }
+
+        for cfg in &self.audio {
+            let stsd = build_mp4a(cfg);
+            let trak = build_init_trak(&InitTrakParams {
+                track_id: next_track_id,
+                now,
+                timescale: cfg.sample_rate,
+                handler: b"soun",
+                handler_name: "SoundHandler",
+                dims: None,
+                stsd_entry: stsd,
+                is_video: false,
+            });
+            tracks.push(trak);
+            track_ids.push(next_track_id);
+            next_track_id += 1;
+        }
+
+        if tracks.is_empty() {
+            bail!("no tracks configured");
+        }
+
+        let mut moov = Buf::new();
+        moov.atom(b"moov", |b| {
+            b.full_atom(b"mvhd", 0, 0, |b| {
+                b.u32(now as u32).u32(now as u32);
+                b.u32(MOVIE_TIMESCALE).u32(0); // duration = 0 in progressive fMP4
+                b.u32(0x0001_0000).u16(0x0100).zeros(10);
+                unity_matrix(b);
+                b.zeros(24);
+                b.u32(next_track_id);
+            });
+            for trak in &tracks {
+                b.bytes(trak);
+            }
+            b.atom(b"mvex", |b| {
+                for &tid in &track_ids {
+                    b.full_atom(b"trex", 0, 0, |b| {
+                        b.u32(tid); // track_ID
+                        b.u32(1);   // default_sample_description_index = 1
+                        b.u32(0);   // default_sample_duration = 0
+                        b.u32(0);   // default_sample_size = 0
+                        b.u32(0);   // default_sample_flags = 0
+                    });
+                }
+            });
+        });
+
+        Ok(moov.into_vec())
+    }
+
+    fn flush_fragment(&mut self, next_video_pts: Option<u64>) -> Result<()> {
+        if !self.header_written {
+            self.write_header()?;
+        }
+
+        let has_video = !self.buffered_video.is_empty();
+        let has_audio = self.buffered_audio.iter().any(|a| !a.is_empty());
+        if !has_video && !has_audio {
+            return Ok(());
+        }
+
+        let moof_offset = self.pos;
+        let mut moof = Buf::new();
+
+        // (track_index_in_mdat_payload, patch_offset_in_moof)
+        let mut patches: Vec<(usize, usize)> = Vec::new();
+        let mut payload_lengths: Vec<usize> = Vec::new();
+
+        let seq = self.sequence_number;
+        self.sequence_number += 1;
+
+        moof.atom(b"moof", |b| {
+            b.full_atom(b"mfhd", 0, 0, |b| {
+                b.u32(seq);
+            });
+
+            if has_video {
+                let vid_track_id = 1u32;
+                let base_time = self.buffered_video[0].pts_ticks;
+                let sample_count = self.buffered_video.len() as u32;
+
+                b.atom(b"traf", |b| {
+                    // tfhd: flag 0x020000 = default-base-is-moof
+                    b.full_atom(b"tfhd", 0, 0x020000, |b| {
+                        b.u32(vid_track_id);
+                    });
+                    // tfdt: version 1, 64-bit baseMediaDecodeTime
+                    b.full_atom(b"tfdt", 1, 0, |b| {
+                        b.u64(base_time);
+                    });
+                    // trun: flags 0x000701 = data-offset | sample-duration | sample-size | sample-flags
+                    b.full_atom(b"trun", 0, 0x000701, |b| {
+                        b.u32(sample_count);
+                        let patch_offset = b.0.len();
+                        b.i32(0); // placeholder for data_offset
+                        patches.push((payload_lengths.len(), patch_offset));
+
+                        let n = self.buffered_video.len();
+                        let fallback_delta = (VIDEO_TIMESCALE as f64 / self.video.as_ref().unwrap().fps.max(1.0)).round() as u32;
+
+                        for i in 0..n {
+                            let s = &self.buffered_video[i];
+                            let dur = if i + 1 < n {
+                                self.buffered_video[i + 1].pts_ticks.saturating_sub(s.pts_ticks)
+                            } else if let Some(next_pts) = next_video_pts {
+                                next_pts.saturating_sub(s.pts_ticks)
+                            } else if let (Some(end_pts), Some(first)) = (self.video_end_pts, self.first_video_pts) {
+                                let end_ticks = duration_to_ticks(end_pts.saturating_sub(first), VIDEO_TIMESCALE);
+                                end_ticks.saturating_sub(s.pts_ticks).max(1)
+                            } else {
+                                fallback_delta as u64
+                            };
+                            let duration = dur.clamp(1, u32::MAX as u64) as u32;
+                            let size = s.data.len() as u32;
+                            // 0x0200_0000: I-frame / keyframe (depends on none)
+                            // 0x0101_0000: P-frame / non-keyframe (depends on others, non-sync)
+                            let flags = if s.keyframe { 0x0200_0000 } else { 0x0101_0000 };
+
+                            b.u32(duration);
+                            b.u32(size);
+                            b.u32(flags);
+                        }
+                    });
+                });
+
+                let vid_bytes: usize = self.buffered_video.iter().map(|s| s.data.len()).sum();
+                payload_lengths.push(vid_bytes);
+            }
+
+            for (idx, samples) in self.buffered_audio.iter().enumerate() {
+                if samples.is_empty() {
+                    continue;
+                }
+                let audio_track_id = (if self.video.is_some() { 2 } else { 1 }) + idx as u32;
+                let base_time = samples[0].pts_ticks;
+                let sample_count = samples.len() as u32;
+                let sample_duration = self.audio[idx].samples_per_frame;
+
+                b.atom(b"traf", |b| {
+                    b.full_atom(b"tfhd", 0, 0x020000, |b| {
+                        b.u32(audio_track_id);
+                    });
+                    b.full_atom(b"tfdt", 1, 0, |b| {
+                        b.u64(base_time);
+                    });
+                    // trun: flags 0x000301 = data-offset | sample-duration | sample-size
+                    b.full_atom(b"trun", 0, 0x000301, |b| {
+                        b.u32(sample_count);
+                        let patch_offset = b.0.len();
+                        b.i32(0); // placeholder for data_offset
+                        patches.push((payload_lengths.len(), patch_offset));
+
+                        for s in samples {
+                            b.u32(sample_duration);
+                            b.u32(s.data.len() as u32);
+                        }
+                    });
+                });
+
+                let aud_bytes: usize = samples.iter().map(|s| s.data.len()).sum();
+                payload_lengths.push(aud_bytes);
+            }
+        });
+
+        // Patch each track's data_offset relative to start of moof
+        let moof_len = moof.0.len() as u32;
+        let mdat_hdr_len = 8u32;
+        let mut track_offset = moof_len + mdat_hdr_len;
+
+        for (track_idx, patch_offset) in patches {
+            let offset_bytes = (track_offset as i32).to_be_bytes();
+            moof.0[patch_offset..patch_offset + 4].copy_from_slice(&offset_bytes);
+            track_offset += payload_lengths[track_idx] as u32;
+        }
+
+        let mdat_payload_len = track_offset - (moof_len + mdat_hdr_len);
+        let mut mdat_hdr = Buf::new();
+        mdat_hdr.u32(mdat_hdr_len + mdat_payload_len).fourcc(b"mdat");
+
+        // Write fragment to disk
+        self.out.write_all(&moof.0)?;
+        self.out.write_all(&mdat_hdr.0)?;
+
+        if has_video {
+            for s in &self.buffered_video {
+                self.out.write_all(&s.data)?;
+            }
+        }
+        for samples in &self.buffered_audio {
+            for s in samples {
+                self.out.write_all(&s.data)?;
+            }
+        }
+
+        self.pos += (moof.0.len() + mdat_hdr.0.len() + mdat_payload_len as usize) as u64;
+        self.out.flush()?;
+
+        // Record seek entry for keyframe in video track
+        if has_video && let Some(key_sample) = self.buffered_video.iter().find(|s| s.keyframe) {
+            self.seek_entries.push(SeekEntry {
+                time: key_sample.pts_ticks,
+                moof_offset,
+            });
+        }
+
+        self.buffered_video.clear();
+        for a in &mut self.buffered_audio {
+            a.clear();
+        }
+        self.fragment_start_video_pts = None;
+        self.fragment_start_audio_pts = None;
+
         Ok(())
     }
 
@@ -287,133 +566,70 @@ impl<W: Write + Seek> Mp4Writer<W> {
 
     /// Number of video samples pushed so far.
     pub fn video_samples(&self) -> usize {
-        self.video.as_ref().map(|(t, _)| t.samples.len()).unwrap_or(0)
+        self.video_samples_total
     }
 
-    /// Number of audio samples (MP3 frames) pushed so far on track 0.
+    /// Number of audio samples (MP3 frames / AAC frames) pushed so far on track 0.
     pub fn audio_samples(&self) -> usize {
         self.audio_track_samples(0)
     }
 
     /// Number of audio samples pushed so far on audio track `index`.
     pub fn audio_track_samples(&self, index: usize) -> usize {
-        self.audio.get(index).map(|(t, _)| t.samples.len()).unwrap_or(0)
+        self.audio_samples_total.get(index).copied().unwrap_or(0)
     }
 
-    /// Writes the remaining chunks and the `moov` box, then flushes the writer.
+    /// Writes remaining buffered samples, optional `mfra` index, and flushes the writer.
     pub fn finalize(mut self) -> Result<()> {
-        if let Some((track, _)) = self.video.as_mut() {
-            Self::flush_chunk(&mut self.out, &mut self.pos, track)?;
+        if !self.header_written {
+            if self.video.is_some() && self.params.is_none() {
+                bail!("no samples were written");
+            }
+            self.write_header()?;
         }
-        for (track, _) in &mut self.audio {
-            Self::flush_chunk(&mut self.out, &mut self.pos, track)?;
-        }
-        // Patch mdat largesize.
-        let mdat_size = self.pos - self.mdat_start;
-        self.out.seek(SeekFrom::Start(self.mdat_start + 8))?;
-        self.out.write_all(&mdat_size.to_be_bytes())?;
-        self.out.seek(SeekFrom::Start(self.pos))?;
 
-        let moov = self.build_moov()?;
-        self.out.write_all(&moov)?;
-        self.pos += moov.len() as u64;
+        self.flush_fragment(None)?;
+
+        // Build mfra random access box if we have indexed video fragments
+        if !self.seek_entries.is_empty() {
+            let mfra = self.build_mfra();
+            self.out.write_all(&mfra)?;
+            self.pos += mfra.len() as u64;
+        }
+
         self.out.flush()?;
         self.finalized = true;
         Ok(())
     }
 
-    fn build_moov(&self) -> Result<Vec<u8>> {
-        let now = mp4_now();
-        let mut tracks: Vec<(Vec<u8>, u64)> = Vec::new(); // (trak box, duration in movie ticks)
-        let mut next_track_id = 1u32;
-
-        if let Some((track, cfg)) = &self.video {
-            if track.samples.is_empty() {
-                bail!("video track has no samples");
-            }
-            let params = self.params.as_ref().context("no parameter sets recorded for video track")?;
-            let fallback = (track.timescale as f64 / cfg.fps.max(1.0)).round() as u32;
-            let mut deltas = track.deltas(fallback);
-            if let (Some(end_pts), Some(first), Some(last)) = (self.video_end_pts, track.first_pts, track.samples.last()) {
-                let end_ticks = duration_to_ticks(end_pts.saturating_sub(first), track.timescale);
-                if end_ticks > last.pts
-                    && let Some(d) = deltas.last_mut()
-                {
-                    *d = (end_ticks - last.pts).clamp(1, u32::MAX as u64) as u32;
+    fn build_mfra(&self) -> Vec<u8> {
+        let mut b = Buf::new();
+        b.atom(b"mfra", |b| {
+            b.full_atom(b"tfra", 1, 0, |b| {
+                b.u32(1); // track_id = 1 (video)
+                b.u32(0); // lengths (sample_num, trun_num, traf_num all 0 = 1 byte each)
+                b.u32(self.seek_entries.len() as u32);
+                for e in &self.seek_entries {
+                    b.u64(e.time);
+                    b.u64(e.moof_offset);
+                    b.u8(1); // traf_number
+                    b.u8(1); // trun_number
+                    b.u8(1); // sample_delta / sample_number
                 }
-            }
-            let dur_ticks = track.duration_ticks(*deltas.last().unwrap());
-            let movie_dur = rescale(dur_ticks, track.timescale, MOVIE_TIMESCALE);
-            let stsd = match (cfg.codec, params) {
-                (VideoCodecConfig::H264, CodecParams::H264 { sps, pps }) => build_avc1(cfg, sps, pps),
-                (VideoCodecConfig::Hevc, CodecParams::Hevc { vps, sps, pps }) => build_hvc1(cfg, vps, sps, pps),
-                _ => bail!("codec parameter sets do not match the video track codec"),
-            };
-            let trak = build_trak(&TrakParams {
-                track_id: next_track_id,
-                now,
-                track,
-                deltas: &deltas,
-                movie_duration: movie_dur,
-                handler: b"vide",
-                handler_name: "VideoHandler",
-                dims: Some((cfg.width, cfg.height)),
-                stsd_entry: stsd,
-                is_video: true,
             });
-            tracks.push((trak, movie_dur));
-            next_track_id += 1;
-        }
-        for (track, cfg) in &self.audio {
-            if track.samples.is_empty() {
-                continue;
-            }
-            let deltas = track.deltas(cfg.samples_per_frame);
-            let dur_ticks = track.duration_ticks(cfg.samples_per_frame);
-            let movie_dur = rescale(dur_ticks, track.timescale, MOVIE_TIMESCALE);
-            let stsd = build_mp4a(cfg);
-            let trak = build_trak(&TrakParams {
-                track_id: next_track_id,
-                now,
-                track,
-                deltas: &deltas,
-                movie_duration: movie_dur,
-                handler: b"soun",
-                handler_name: "SoundHandler",
-                dims: None,
-                stsd_entry: stsd,
-                is_video: false,
+            let mfra_len = b.0.len() + 16; // 16 bytes for mfro box
+            b.full_atom(b"mfro", 0, 0, |b| {
+                b.u32(mfra_len as u32);
             });
-            tracks.push((trak, movie_dur));
-            next_track_id += 1;
-        }
-        if tracks.is_empty() {
-            bail!("no samples were written");
-        }
-        let movie_duration = tracks.iter().map(|t| t.1).max().unwrap_or(0);
-
-        let mut moov = Buf::new();
-        moov.atom(b"moov", |b| {
-            b.full_atom(b"mvhd", 0, 0, |b| {
-                b.u32(now as u32).u32(now as u32);
-                b.u32(MOVIE_TIMESCALE).u32(movie_duration.min(u32::MAX as u64) as u32);
-                b.u32(0x0001_0000).u16(0x0100).zeros(10);
-                unity_matrix(b);
-                b.zeros(24);
-                b.u32(next_track_id);
-            });
-            for (trak, _) in &tracks {
-                b.bytes(trak);
-            }
         });
-        Ok(moov.into_vec())
+        b.into_vec()
     }
 }
 
 impl<W: Write + Seek> Drop for Mp4Writer<W> {
     fn drop(&mut self) {
         if !self.finalized {
-            log::warn!("Mp4Writer dropped without finalize(); file will lack a moov box");
+            log::info!("Mp4Writer dropped without finalize(); fMP4 fragments on disk remain valid and playable");
         }
     }
 }
@@ -422,16 +638,10 @@ fn duration_to_ticks(d: Duration, timescale: u32) -> u64 {
     (d.as_nanos() * timescale as u128 / 1_000_000_000) as u64
 }
 
-fn rescale(v: u64, from: u32, to: u32) -> u64 {
-    (v as u128 * to as u128 / from as u128) as u64
-}
-
-struct TrakParams<'a> {
+struct InitTrakParams<'a> {
     track_id: u32,
     now: u64,
-    track: &'a Track,
-    deltas: &'a [u32],
-    movie_duration: u64,
+    timescale: u32,
     handler: &'a [u8; 4],
     handler_name: &'a str,
     dims: Option<(u32, u32)>,
@@ -439,15 +649,12 @@ struct TrakParams<'a> {
     is_video: bool,
 }
 
-fn build_trak(p: &TrakParams<'_>) -> Vec<u8> {
-    let track = p.track;
-    let now = p.now;
-    let media_duration = track.duration_ticks(*p.deltas.last().unwrap_or(&0));
+fn build_init_trak(p: &InitTrakParams<'_>) -> Vec<u8> {
     let mut b = Buf::new();
     b.atom(b"trak", |b| {
         b.full_atom(b"tkhd", 0, 0x3, |b| {
-            b.u32(now as u32).u32(now as u32).u32(p.track_id).u32(0);
-            b.u32(p.movie_duration.min(u32::MAX as u64) as u32);
+            b.u32(p.now as u32).u32(p.now as u32).u32(p.track_id).u32(0);
+            b.u32(0); // duration = 0 in fMP4 init
             b.zeros(8);
             b.u16(0).u16(0);
             b.u16(if p.is_video { 0 } else { 0x0100 }).u16(0);
@@ -457,9 +664,9 @@ fn build_trak(p: &TrakParams<'_>) -> Vec<u8> {
         });
         b.atom(b"mdia", |b| {
             b.full_atom(b"mdhd", 0, 0, |b| {
-                b.u32(now as u32).u32(now as u32);
-                b.u32(track.timescale).u32(media_duration.min(u32::MAX as u64) as u32);
-                b.u16(0x55C4).u16(0); // language 'und'
+                b.u32(p.now as u32).u32(p.now as u32);
+                b.u32(p.timescale).u32(0); // duration = 0 in fMP4 init
+                b.u16(0x55C4).u16(0);      // language 'und'
             });
             b.full_atom(b"hdlr", 0, 0, |b| {
                 b.u32(0).fourcc(p.handler).zeros(12);
@@ -485,94 +692,24 @@ fn build_trak(p: &TrakParams<'_>) -> Vec<u8> {
                     b.full_atom(b"stsd", 0, 0, |b| {
                         b.u32(1).bytes(&p.stsd_entry);
                     });
-                    build_stts(b, p.deltas);
-                    if p.is_video {
-                        build_stss(b, track);
-                    }
-                    build_stsc(b, track);
-                    build_stsz(b, track);
-                    build_stco(b, track);
+                    // Empty sample tables for fMP4
+                    b.full_atom(b"stts", 0, 0, |b| {
+                        b.u32(0);
+                    });
+                    b.full_atom(b"stsc", 0, 0, |b| {
+                        b.u32(0);
+                    });
+                    b.full_atom(b"stsz", 0, 0, |b| {
+                        b.u32(0).u32(0);
+                    });
+                    b.full_atom(b"stco", 0, 0, |b| {
+                        b.u32(0);
+                    });
                 });
             });
         });
     });
     b.into_vec()
-}
-
-fn build_stts(b: &mut Buf, deltas: &[u32]) {
-    let mut runs: Vec<(u32, u32)> = Vec::new();
-    for &d in deltas {
-        match runs.last_mut() {
-            Some((count, delta)) if *delta == d => *count += 1,
-            _ => runs.push((1, d)),
-        }
-    }
-    b.full_atom(b"stts", 0, 0, |b| {
-        b.u32(runs.len() as u32);
-        for (count, delta) in runs {
-            b.u32(count).u32(delta);
-        }
-    });
-}
-
-fn build_stss(b: &mut Buf, track: &Track) {
-    let keys: Vec<u32> = track
-        .samples
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.keyframe)
-        .map(|(i, _)| i as u32 + 1)
-        .collect();
-    b.full_atom(b"stss", 0, 0, |b| {
-        b.u32(keys.len() as u32);
-        for k in keys {
-            b.u32(k);
-        }
-    });
-}
-
-fn build_stsc(b: &mut Buf, track: &Track) {
-    let mut runs: Vec<(u32, u32)> = Vec::new(); // (first_chunk, samples_per_chunk)
-    for (i, c) in track.chunks.iter().enumerate() {
-        match runs.last() {
-            Some(&(_, n)) if n == c.sample_count => {}
-            _ => runs.push((i as u32 + 1, c.sample_count)),
-        }
-    }
-    b.full_atom(b"stsc", 0, 0, |b| {
-        b.u32(runs.len() as u32);
-        for (first, n) in runs {
-            b.u32(first).u32(n).u32(1);
-        }
-    });
-}
-
-fn build_stsz(b: &mut Buf, track: &Track) {
-    b.full_atom(b"stsz", 0, 0, |b| {
-        b.u32(0).u32(track.samples.len() as u32);
-        for s in &track.samples {
-            b.u32(s.size);
-        }
-    });
-}
-
-fn build_stco(b: &mut Buf, track: &Track) {
-    let needs_64 = track.chunks.iter().any(|c| c.offset > u32::MAX as u64);
-    if needs_64 {
-        b.full_atom(b"co64", 0, 0, |b| {
-            b.u32(track.chunks.len() as u32);
-            for c in &track.chunks {
-                b.u64(c.offset);
-            }
-        });
-    } else {
-        b.full_atom(b"stco", 0, 0, |b| {
-            b.u32(track.chunks.len() as u32);
-            for c in &track.chunks {
-                b.u32(c.offset as u32);
-            }
-        });
-    }
 }
 
 /// The VisualSampleEntry fields shared by `avc1` and `hvc1`.

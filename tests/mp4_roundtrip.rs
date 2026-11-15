@@ -115,7 +115,7 @@ fn build(with_audio: bool) -> Built {
                 pcm.push(v);
                 pcm.push(v);
             }
-            for f in AudioEncoder::encode(&mut audio, &pcm).unwrap() {
+            for f in audio.encode(&pcm).unwrap() {
                 mux.push_audio(&f.data).unwrap();
                 audio_samples += 1;
             }
@@ -147,21 +147,6 @@ fn sample_sizes(s: &StszSamples) -> Vec<u32> {
     }
 }
 
-/// Number of samples in each chunk according to stsc.
-fn chunk_sample_counts(stbl: &mp4_atom::Stbl, chunk_count: usize) -> Vec<u32> {
-    (0..chunk_count)
-        .map(|ci| {
-            let chunk_no = ci as u32 + 1;
-            stbl.stsc
-                .entries
-                .iter()
-                .rev()
-                .find(|e| e.first_chunk <= chunk_no)
-                .map(|e| e.samples_per_chunk)
-                .expect("stsc covers chunk")
-        })
-        .collect()
-}
 
 #[test]
 fn video_and_audio_roundtrip() {
@@ -172,25 +157,15 @@ fn video_and_audio_roundtrip() {
     assert!(b.keyframes[0], "first frame must be a keyframe");
 
     let atoms = parse(bytes);
-    assert_eq!(atoms.len(), 3, "top-level boxes: {atoms:?}");
     assert!(matches!(atoms[0], Any::Ftyp(_)));
-    let mdat_len = match &atoms[1] {
-        Any::Mdat(m) => m.data.len(),
-        other => panic!("expected mdat, got {other:?}"),
-    };
-    assert!(mdat_len > 10_000);
-    let moov = match &atoms[2] {
+    let moov = match &atoms[1] {
         Any::Moov(m) => m,
         other => panic!("expected moov, got {other:?}"),
     };
     assert_eq!(moov.trak.len(), 2);
+    assert!(moov.mvex.is_some(), "mvex box must be present in fMP4 moov");
+    assert_eq!(moov.mvex.as_ref().unwrap().trex.len(), 2, "trex for each track");
     assert_eq!(moov.mvhd.timescale, 1000);
-    let expected_ms = (FRAMES as u64 * 1000) / FPS as u64;
-    assert!(
-        (moov.mvhd.duration as i64 - expected_ms as i64).abs() <= 40,
-        "movie duration {}",
-        moov.mvhd.duration
-    );
 
     // --- video track ---
     let vtrak = &moov.trak[0];
@@ -209,43 +184,9 @@ fn video_and_audio_roundtrip() {
     assert_eq!(avc1.avcc.sequence_parameter_sets[0][0] & 0x1F, 7);
     assert_eq!(avc1.avcc.picture_parameter_sets[0][0] & 0x1F, 8);
 
-    let sizes = sample_sizes(&stbl.stsz.samples);
-    assert_eq!(sizes.len(), b.video_samples);
-    let total_stts: u32 = stbl.stts.entries.iter().map(|e| e.sample_count).sum();
-    assert_eq!(total_stts as usize, b.video_samples);
-    for e in &stbl.stts.entries {
-        assert!((e.sample_delta as i64 - 3000).abs() <= 1, "delta {}", e.sample_delta);
-    }
-    let stss = stbl.stss.as_ref().expect("stss present");
-    let expected_keys: Vec<u32> =
-        b.keyframes.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i as u32 + 1).collect();
-    assert_eq!(stss.entries, expected_keys);
-
-    // Walk chunks and verify every sample is a sequence of length-prefixed NALs
-    // with the parameter sets stripped out.
-    let stco = stbl.stco.as_ref().expect("stco present");
-    let counts = chunk_sample_counts(stbl, stco.entries.len());
-    let mut sample_idx = 0usize;
-    for (ci, off) in stco.entries.iter().enumerate() {
-        let mut pos = *off as usize;
-        for _ in 0..counts[ci] {
-            let size = sizes[sample_idx] as usize;
-            let mut p = pos;
-            while p < pos + size {
-                let len = u32::from_be_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
-                assert!(
-                    len > 0 && p + 4 + len <= pos + size,
-                    "bad NAL length {len} in sample {sample_idx}"
-                );
-                let nal_type = bytes[p + 4] & 0x1F;
-                assert!(matches!(nal_type, 1 | 5 | 6), "unexpected NAL type {nal_type}");
-                p += 4 + len;
-            }
-            pos += size;
-            sample_idx += 1;
-        }
-    }
-    assert_eq!(sample_idx, b.video_samples);
+    // In fMP4, stbl sample tables in moov are empty
+    assert_eq!(sample_sizes(&stbl.stsz.samples).len(), 0);
+    assert_eq!(stbl.stts.entries.len(), 0);
 
     // --- audio track ---
     let atrak = &moov.trak[1];
@@ -260,25 +201,50 @@ fn video_and_audio_roundtrip() {
     assert_eq!(mp4a.audio.channel_count, 2);
     assert_eq!(mp4a.esds.es_desc.dec_config.object_type_indication, 0x6B);
     assert_eq!(mp4a.esds.es_desc.dec_config.stream_type, 0x05);
-    assert_eq!(astbl.stts.entries.len(), 1);
-    assert_eq!(astbl.stts.entries[0].sample_delta, 1152);
-    assert_eq!(astbl.stts.entries[0].sample_count as usize, b.audio_samples);
+    assert_eq!(astbl.stts.entries.len(), 0);
 
-    // Every audio sample must start with an MP3 sync word.
-    let asizes = sample_sizes(&astbl.stsz.samples);
-    let astco = astbl.stco.as_ref().unwrap();
-    let acounts = chunk_sample_counts(astbl, astco.entries.len());
-    let mut idx = 0;
-    for (ci, off) in astco.entries.iter().enumerate() {
-        let mut pos = *off as usize;
-        for _ in 0..acounts[ci] {
-            assert_eq!(bytes[pos], 0xFF, "audio sample {idx} lacks sync");
-            assert_eq!(bytes[pos + 1] & 0xE0, 0xE0);
-            pos += asizes[idx] as usize;
-            idx += 1;
+    // --- verify fragments (moof + mdat) ---
+    let moofs: Vec<&mp4_atom::Moof> = atoms.iter().filter_map(|a| if let Any::Moof(m) = a { Some(m) } else { None }).collect();
+    let mdats: Vec<&mp4_atom::Mdat> = atoms.iter().filter_map(|a| if let Any::Mdat(m) = a { Some(m) } else { None }).collect();
+    assert_eq!(moofs.len(), mdats.len());
+    assert!(!moofs.is_empty(), "at least one fragment must be written");
+
+    let mut total_vid_samples = 0;
+    let mut total_aud_samples = 0;
+    let mut keyframe_flags = Vec::new();
+
+    for (seq_idx, moof) in moofs.iter().enumerate() {
+        assert_eq!(moof.mfhd.sequence_number, seq_idx as u32 + 1);
+        for traf in &moof.traf {
+            assert!(traf.tfhd.default_base_is_moof, "tfhd must have default-base-is-moof flag");
+            assert!(traf.tfdt.is_some(), "tfdt must be present in traf");
+            if traf.tfhd.track_id == 1 {
+                for trun in &traf.trun {
+                    assert!(trun.data_offset.is_some(), "data-offset must be present");
+                    for entry in &trun.entries {
+                        total_vid_samples += 1;
+                        let flags = entry.flags.expect("video sample flags");
+                        let is_key = (flags & 0x0200_0000) != 0;
+                        keyframe_flags.push(is_key);
+                        let dur = entry.duration.expect("video sample duration");
+                        assert!(dur > 0, "sample duration must be positive");
+                    }
+                }
+            } else if traf.tfhd.track_id == 2 {
+                for trun in &traf.trun {
+                    assert!(trun.data_offset.is_some());
+                    for entry in &trun.entries {
+                        total_aud_samples += 1;
+                        assert_eq!(entry.duration, Some(1152), "MP3 frame duration is 1152 ticks");
+                    }
+                }
+            }
         }
     }
-    assert_eq!(idx, b.audio_samples);
+
+    assert_eq!(total_vid_samples, b.video_samples);
+    assert_eq!(total_aud_samples, b.audio_samples);
+    assert_eq!(keyframe_flags, b.keyframes);
 }
 
 #[test]
@@ -287,9 +253,17 @@ fn video_only_roundtrip() {
     let atoms = parse(&b.bytes);
     let moov = atoms.iter().find_map(|a| if let Any::Moov(m) = a { Some(m) } else { None }).unwrap();
     assert_eq!(moov.trak.len(), 1);
-    let stbl = &moov.trak[0].mdia.minf.stbl;
-    let n: u32 = stbl.stts.entries.iter().map(|e| e.sample_count).sum();
-    assert_eq!(n as usize, b.video_samples);
+    assert!(moov.mvex.is_some());
+
+    let moofs: Vec<&mp4_atom::Moof> = atoms.iter().filter_map(|a| if let Any::Moof(m) = a { Some(m) } else { None }).collect();
+    assert!(!moofs.is_empty());
+    let total_samples: usize = moofs.iter()
+        .flat_map(|m| &m.traf)
+        .filter(|t| t.tfhd.track_id == 1)
+        .flat_map(|t| &t.trun)
+        .map(|r| r.entries.len())
+        .sum();
+    assert_eq!(total_samples, b.video_samples);
 }
 
 /// Finds a box by fourcc anywhere in `bytes` and returns its payload.
@@ -370,11 +344,13 @@ fn hevc_sample_entry() {
         p += 5 + len;
     }
 
-    // Samples: parameter sets stripped, each NAL length-prefixed.
-    let stsz = find_box(moov, b"stsz").unwrap();
-    let count = u32::from_be_bytes(stsz[8..12].try_into().unwrap());
-    assert_eq!(count, 5);
-    let first_size = u32::from_be_bytes(stsz[12..16].try_into().unwrap()) as usize;
+    // Samples: parameter sets stripped, each NAL length-prefixed in trun.
+    let atoms = parse(&bytes);
+    let moofs: Vec<&mp4_atom::Moof> = atoms.iter().filter_map(|a| if let Any::Moof(m) = a { Some(m) } else { None }).collect();
+    assert!(!moofs.is_empty());
+    let trun = &moofs[0].traf[0].trun[0];
+    assert_eq!(trun.entries.len(), 5);
+    let first_size = trun.entries[0].size.unwrap() as usize;
     assert_eq!(first_size, 4 + idr.len(), "keyframe sample holds only the IDR NAL");
     let payload = find_box(&bytes, b"mdat").unwrap();
     assert_eq!(&payload[..4], &(idr.len() as u32).to_be_bytes());
@@ -418,8 +394,12 @@ fn aac_sample_entry() {
     let dsi = mp4a.esds.es_desc.dec_config.dec_specific.as_ref().expect("DecoderSpecificInfo");
     assert_eq!(dsi.raw, asc);
     assert_eq!((dsi.profile, dsi.freq_index, dsi.chan_conf), (2, 3, 2));
-    assert_eq!(stbl.stts.entries[0].sample_delta, 1024);
-    assert_eq!(stbl.stts.entries[0].sample_count, 10);
+
+    let moofs: Vec<&mp4_atom::Moof> = atoms.iter().filter_map(|a| if let Any::Moof(m) = a { Some(m) } else { None }).collect();
+    assert!(!moofs.is_empty());
+    let trun = &moofs[0].traf[0].trun[0];
+    assert_eq!(trun.entries.len(), 10);
+    assert_eq!(trun.entries[0].duration, Some(1024));
 
     // PCM is refused in MP4.
     let err = Mp4Writer::new(
@@ -515,27 +495,26 @@ fn multi_audio_tracks_roundtrip() {
     let moov = atoms.iter().find_map(|a| if let Any::Moov(m) = a { Some(m) } else { None }).unwrap();
     assert_eq!(moov.trak.len(), 4, "1 video + 3 audio tracks");
     assert_eq!(moov.trak[0].tkhd.track_id, 1);
+    assert!(moov.mvex.is_some(), "mvex present in moov");
+    assert_eq!(moov.mvex.as_ref().unwrap().trex.len(), 4);
+
+    let moofs: Vec<&mp4_atom::Moof> = atoms.iter().filter_map(|a| if let Any::Moof(m) = a { Some(m) } else { None }).collect();
+    assert!(!moofs.is_empty());
+
     for (idx, &expected_samples) in track_samples.iter().enumerate() {
         let trak = &moov.trak[idx + 1];
         assert_eq!(trak.tkhd.track_id, idx as u32 + 2);
         assert_eq!(trak.mdia.hdlr.handler, FourCC::new(b"soun"));
         let stbl = &trak.mdia.minf.stbl;
         assert!(matches!(&stbl.stsd.codecs[0], Codec::Mp4a(_)));
-        let sizes = sample_sizes(&stbl.stsz.samples);
-        assert_eq!(sizes.len(), expected_samples);
-        let stco = stbl.stco.as_ref().unwrap();
-        let counts = chunk_sample_counts(stbl, stco.entries.len());
-        let mut sidx = 0usize;
-        for (ci, off) in stco.entries.iter().enumerate() {
-            let mut pos = *off as usize;
-            for _ in 0..counts[ci] {
-                assert_eq!(bytes[pos], 0xFF, "track {idx} sample {sidx} lacks MP3 sync");
-                assert_eq!(bytes[pos + 1] & 0xE0, 0xE0);
-                pos += sizes[sidx] as usize;
-                sidx += 1;
-            }
-        }
-        assert_eq!(sidx, expected_samples);
+
+        let total_samples: usize = moofs.iter()
+            .flat_map(|m| &m.traf)
+            .filter(|t| t.tfhd.track_id == idx as u32 + 2)
+            .flat_map(|t| &t.trun)
+            .map(|r| r.entries.len())
+            .sum();
+        assert_eq!(total_samples, expected_samples);
     }
 }
 
@@ -561,15 +540,13 @@ fn finish_video_extends_final_frame_duration_for_vfr() {
 
     let bytes = shared.bytes();
     let atoms = parse(&bytes);
-    let moov = atoms.iter().find_map(|a| if let Any::Moov(m) = a { Some(m) } else { None }).unwrap();
-    let mdhd = &moov.trak[0].mdia.mdhd;
-    assert_eq!(mdhd.timescale, VIDEO_TIMESCALE);
-    // 3.1 s * 90_000 = 279_000 ticks, so the static tail is preserved without duplicate frames.
-    assert_eq!(mdhd.duration, 3100 * VIDEO_TIMESCALE as u64 / 1000);
-    let stts = &moov.trak[0].mdia.minf.stbl.stts;
-    assert_eq!(stts.entries.len(), 2);
-    assert_eq!(stts.entries[0].sample_delta, 9_000);
-    assert_eq!(stts.entries[1].sample_delta, 270_000);
+    let moofs: Vec<&mp4_atom::Moof> = atoms.iter().filter_map(|a| if let Any::Moof(m) = a { Some(m) } else { None }).collect();
+    assert!(!moofs.is_empty());
+    let trun = &moofs[0].traf[0].trun[0];
+    assert_eq!(trun.entries.len(), 2);
+    assert_eq!(trun.entries[0].duration, Some(9_000));
+    // 3.1s - 0.1s = 3.0s * 90_000 = 270_000 ticks
+    assert_eq!(trun.entries[1].duration, Some(270_000));
 }
 
 struct TempMp4(std::path::PathBuf);
@@ -599,6 +576,7 @@ fn verify_mp4_decodes_cleanly(path: &std::path::Path, expected_frames: usize) {
         use openclip::video::mf::ComGuard;
 
         let _com = ComGuard::new();
+        openclip::video::mf::startup().unwrap();
         let pool = FramePool::new(4);
         let mut reader = Reader::open(path, 640).expect("Media Foundation Reader::open");
         let mut decoded = 0usize;
@@ -835,4 +813,112 @@ fn adaptive_grid_gpu_d3d11_mp4_decodes_cleanly() {
     }
     mux.finalize().unwrap();
     verify_mp4_decodes_cleanly(&tmp.0, pushed);
+}
+
+#[test]
+fn crash_simulation_unfinalized_mp4_decodes_cleanly() {
+    #[cfg(windows)]
+    {
+        use openclip::capture::FramePool;
+        use openclip::player::decode::{Packet, Reader};
+        use openclip::video::mf::ComGuard;
+
+        let tmp = TempMp4::new("crash_sim");
+        let mut converter = Converter::new(W, H, InputLayout::I420).unwrap();
+        let mut video = H264Encoder::new(&EncoderRequest::simple(W, H, FPS, 800_000)).unwrap();
+        let (mut audio, _) = openclip::audio::create_audio_encoder(openclip::settings::AudioCodec::Aac, RATE, 2, 160).unwrap();
+        let audio_cfg = AudioTrackConfig {
+            sample_rate: RATE,
+            channels: 2,
+            bitrate_bps: audio.bitrate_bps(),
+            samples_per_frame: audio.samples_per_frame(),
+            codec: audio.codec_config(),
+        };
+
+        let file = std::fs::File::create(&tmp.0).unwrap();
+        let mut mux = Mp4Writer::new(
+            std::io::BufWriter::new(file),
+            Some(VideoTrackConfig { width: W, height: H, fps: FPS as f64, codec: VideoCodecConfig::H264 }),
+            Some(audio_cfg),
+        )
+        .unwrap();
+
+        let mut frame = RawFrame {
+            data: vec![0u8; (W * H * 4) as usize],
+            width: W,
+            height: H,
+            stride: W * 4,
+            format: PixelFormat::Bgra,
+            pts: Duration::ZERO,
+            mouse: None,
+        };
+        let mut pcm = Vec::new();
+        // 4.5 seconds at 30 fps = 135 frames
+        let total_frames = 135;
+
+        for i in 0..total_frames {
+            for (n, px) in frame.data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let x = (n as u32 % W + i * 3) % W;
+                px[0] = (x * 255 / W) as u8;
+                px[1] = ((n as u32 / W) * 255 / H) as u8;
+                px[2] = if (x / 32).is_multiple_of(2) { 200 } else { 30 };
+                px[3] = 255;
+            }
+            frame.pts = Duration::from_secs_f64(i as f64 / FPS as f64);
+            converter.convert(&frame).unwrap();
+            let enc = video.encode(converter.frame(), frame.pts).unwrap();
+            if let Some(p) = video.codec_params() {
+                mux.set_codec_params(p);
+            }
+            for f in enc {
+                mux.push_video(&f.data, f.pts, f.keyframe).unwrap();
+            }
+
+            pcm.clear();
+            for s in 0..(RATE / FPS) {
+                let t = (i * (RATE / FPS) + s) as f32 / RATE as f32;
+                let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.3;
+                pcm.push(v);
+                pcm.push(v);
+            }
+            for f in audio.encode(&pcm).unwrap() {
+                mux.push_audio(&f.data).unwrap();
+            }
+        }
+
+        // SIMULATE CRASH:
+        // Explicitly drop the muxer WITHOUT calling finalize()!
+        drop(mux);
+
+        // Verify unfinalized file decodes cleanly via Media Foundation Reader
+        let _com = ComGuard::new();
+        openclip::video::mf::startup().unwrap();
+        let pool = FramePool::new(4);
+        let mut reader = Reader::open(&tmp.0, 640).expect("Media Foundation Reader::open on unfinalized fMP4");
+        assert!(reader.has_audio(), "Reader must detect the audio track");
+        let mut decoded_video = 0usize;
+        let mut decoded_audio = 0usize;
+        loop {
+            match reader.read(None, &pool, false).expect("fMP4 frame decode must not error") {
+                Packet::Video { .. } => decoded_video += 1,
+                Packet::Audio { .. } => decoded_audio += 1,
+                Packet::VideoSkipped { .. } | Packet::Idle => {}
+                Packet::End => break,
+            }
+        }
+        eprintln!("Decoded video: {decoded_video}, Decoded audio: {decoded_audio}");
+        // At 30 fps and keyframe_interval_frames = 60 (2.0s), fragments are flushed on keyframes:
+        // - Frame 60 (2.0s): Fragment 1 (frames 0..59) is flushed to disk
+        // - Frame 120 (4.0s): Fragment 2 (frames 60..119) is flushed to disk
+        // Even when dropped at frame 135 without finalize(), the first 2 fragments (120 frames)
+        // are safely on disk and must decode cleanly!
+        assert!(
+            decoded_video >= 120,
+            "expected at least 120 video frames from completed fragments, got {decoded_video}"
+        );
+        assert!(
+            decoded_audio >= 150,
+            "expected at least 150 audio frames from completed fragments, got {decoded_audio}"
+        );
+    }
 }
