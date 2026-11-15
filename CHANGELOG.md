@@ -4,6 +4,54 @@ All notable changes to OpenClip in this fork compared to the original project ([
 
 ---
 
+## [0.3.1] — 2026-11-15
+
+### English
+
+#### Fixed
+- **System Audio Stutter Elimination (WASAPI Loopback)**:
+  - Filtered transient, non-critical CPAL `ErrorKind::Xrun` (buffer underrun/overrun) events without triggering stream reconnect loops.
+  - Configured explicit loopback hardware buffer (`BufferSize::Fixed(~96 ms)`) and tuned mixer threshold (`GAP_THRESHOLD = 150 ms`, `MAX_LEAD = 500 ms`) with diagnostic audio telemetry.
+- **Uninterrupted Video Recording During Screenshots**:
+  - Decoupled interactive screenshot tool (`SnippingTool`) from recorder finite-state machine (`State`).
+  - Taking a screenshot (`Ctrl+Alt+Q` or camera button in toolbar/minibar) during an active recording no longer cancels or stops the video session.
+- **Windows System Tray Integration**:
+  - Added background system tray icon with dedicated Win32 message loop (`openclip-tray`).
+  - Native context menu with Open, Start/Stop Recording, and Clean Exit options, plus reliable direct window restore (`ShowWindow` / `SetForegroundWindow`).
+- **Screenshot Editor Improvements**:
+  - Synchronous repositioning of all vector annotations when dragging crop frame.
+  - Accurate font layout hit-testing for text annotations at any size (up to 96 pt), preventing clicks from falling through to crop selection.
+  - Full snapshot-based Undo/Redo support (`Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z`) with dedicated Redo button in editor toolbar.
+- **Recording Drop Safety**:
+  - Guaranteed `encode_thread.join()` in `impl Drop for Recorder` upon application exit, ensuring MP4 index and pending video frames are flushed safely to disk.
+- **UI Settings Layout**:
+  - Fixed visual text clipping/overlapping on "Sound feedback" label in General $\rightarrow$ Hotkey settings via clean two-row layout.
+
+---
+
+### Русский
+
+#### Исправлено
+- **Устранение заикания системного звука (WASAPI loopback)**:
+  - Игнорирование переходных некритичных событий CPAL `ErrorKind::Xrun` (underrun/overrun) без ухода в циклическую петлю переподключения потока.
+  - Явный аппаратный буфер захвата loopback (`BufferSize::Fixed(~96 мс)`) и смягчение порогов микшера (`GAP_THRESHOLD = 150 мс`, `MAX_LEAD = 500 мс`) с подробной диагностической телеметрией.
+- **Создание скриншотов во время активной записи видео**:
+  - Полное разделение инструмента скриншотов (`SnippingTool`) и конечного автомата записи (`State`).
+  - Создание скриншотов (`Ctrl+Alt+Q` или кнопка камеры в панели/мини-баре) прямо во время активной записи видео больше не прерывает и не останавливает процесс видеозаписи.
+- **Интеграция с системным треем Windows**:
+  - Сворачивание приложения в системный трей в независимом Win32-потоке (`openclip-tray`).
+  - Нативное контекстное меню («Открыть», «Начать / Остановить запись», «Выход») и надежное прямое пробуждение окна из свернутого состояния (`ShowWindow` / `SetForegroundWindow`).
+- **Улучшения редактора скриншотов**:
+  - Синхронное перемещение всех векторных аннотаций при перетаскивании рамки выделения.
+  - Точный расчёт границ и hit-testing для текстовых аннотаций любого размера (включая крупный шрифт до 96), устраняющий проваливание клика в рамку кадрирования.
+  - Полноценная поддержка снимкового Undo/Redo (`Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z`) с кнопкой Redo на панели инструментов.
+- **Безопасное завершение записи в `Drop`**:
+  - Гарантированное ожидание завершения потока кодирования (`encode_thread.join()`) в деструкторе `Drop for Recorder` при закрытии программы во время записи, обеспечивающее целостность MP4-контейнера.
+- **Компоновка настроек интерфейса**:
+  - Устранено наложение и обрезание текста подписи «Звуковой сигнал» в карточке настроек «Общие» → «Горячая клавиша» за счёт перехода на двухстрочную раскладку.
+
+---
+
 ## [0.3.0] — 2026-11-15
 
 ### English
