@@ -475,10 +475,10 @@ strings! {
         "Un recorder de ecran de sine stătător: fără ffmpeg, fără pachete de codecuri.",
         "Самодостаточная программа записи экрана: без ffmpeg и наборов кодеков.",
         "Самодостатня програма запису екрана: без ffmpeg та сторонніх кодек-паків.";
-    ABOUT_FORK_NOTICE => "Based on OpenClip (catalingrigoriev285/openclip), Apache 2.0 License. Modified fork (v0.2.0).",
-        "Bazat pe OpenClip (catalingrigoriev285/openclip), licența Apache 2.0. Versiune modificată (v0.2.0).",
-        "Основано на OpenClip (catalingrigoriev285/openclip), лицензия Apache 2.0. Доработанная версия (v0.2.0).",
-        "Базується на OpenClip (catalingrigoriev285/openclip), ліцензія Apache 2.0. Доопрацьована версія (v0.2.0).";
+    ABOUT_FORK_NOTICE => "Based on OpenClip (catalingrigoriev285/openclip), Apache 2.0 License. Modified fork (v{0}).",
+        "Bazat pe OpenClip (catalingrigoriev285/openclip), licența Apache 2.0. Versiune modificată (v{0}).",
+        "Основано на OpenClip (catalingrigoriev285/openclip), лицензия Apache 2.0. Доработанная версия (v{0}).",
+        "Базується на OpenClip (catalingrigoriev285/openclip), ліцензія Apache 2.0. Доопрацьована версія (v{0}).";
     ABOUT_VIDEO => "Video: H.264 via bundled OpenH264, plus hardware H.264 / HEVC (NVENC, AMF, Quick Sync) through Windows Media Foundation",
         "Video: H.264 prin OpenH264 inclus, plus H.264 / HEVC hardware (NVENC, AMF, Quick Sync) prin Windows Media Foundation",
         "Видео: H.264 через встроенный OpenH264, а также аппаратные H.264 / HEVC (NVENC, AMF, Quick Sync) через Windows Media Foundation",

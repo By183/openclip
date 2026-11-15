@@ -2569,7 +2569,7 @@ impl App {
                 ui.label(secondary(t!(ABOUT_AUDIO)));
             });
             card.custom(|ui| {
-                ui.label(RichText::new(t!(ABOUT_FORK_NOTICE)).color(LABEL).small());
+                ui.label(RichText::new(t!(ABOUT_FORK_NOTICE, env!("CARGO_PKG_VERSION"))).color(LABEL).small());
                 ui.label(secondary(t!(ABOUT_LICENSE)).small());
             });
             card.row_inline("", |ui| {
