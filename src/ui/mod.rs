@@ -390,7 +390,9 @@ impl App {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(handle) = cc.window_handle() {
                 if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                    Some(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _))
+                    let hwnd = windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _);
+                    crate::hotkey::set_main_hwnd(hwnd.0 as isize);
+                    Some(hwnd)
                 } else {
                     None
                 }
@@ -398,6 +400,12 @@ impl App {
                 None
             }
         };
+        #[cfg(windows)]
+        if raw_main_hwnd.is_none()
+            && let Some(hwnd) = tray::find_main_hwnd()
+        {
+            crate::hotkey::set_main_hwnd(hwnd.0 as isize);
+        }
         apply_theme(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
         let monitors = list_monitors().unwrap_or_default();

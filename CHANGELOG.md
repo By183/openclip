@@ -4,6 +4,28 @@ All notable changes to OpenClip in this fork compared to the original project ([
 
 ---
 
+## [0.3.2] — 2026-11-17
+
+### English
+
+#### Fixed
+- **Global Hotkeys Under DWM Fullscreen Occlusion (`Ctrl+Alt+R`, `Ctrl+Alt+Q`)**:
+  - Fixed an issue where global hotkeys did not trigger recording or screenshots when the OpenClip window remained open on the desktop behind a fullscreen or borderless game.
+  - Windows DWM suppresses standard `WM_PAINT` / `RDW_INTERNALPAINT` redraw messages for completely occluded windows, causing `winit`'s event loop to withhold `WindowEvent::RedrawRequested` and suspend `App::tick_logic()`.
+  - Cached the native Win32 window handle (`HWND`) from `cc.window_handle()` at startup and delivered an explicit `PostMessageW(WM_PAINT)` directly to the window message queue on hotkey triggers, ensuring `winit` and `eframe` immediately process hotkeys and state transitions regardless of DWM occlusion.
+
+---
+
+### Русский
+
+#### Исправлено
+- **Работа глобальных горячих клавиш при перекрытии окна игрой (DWM Occlusion)**:
+  - Исправлен баг, из-за которого горячие клавиши (`Ctrl+Alt+R` и `Ctrl+Alt+Q`) не запускали запись или скриншот, когда окно OpenClip оставалось открытым на рабочем столе позади полноэкранных игр.
+  - Диспетчер окон Windows (DWM) подавляет стандартные вызовы перерисовки `WM_PAINT` / `RDW_INTERNALPAINT` для окон с нулевой видимой областью, из-за чего цикл событий `winit` не генерировал `RedrawRequested`, а метод `App::tick_logic()` не вызывался.
+  - Реализовано прямое кэширование нативного Win32 `HWND` из `cc.window_handle()` при старте приложения и прямая отправка сообщения перерисовки `PostMessageW(WM_PAINT)` в очередь окна при срабатывании хоткея, гарантируя мгновенную обработку клавиш и переключение состояний рекордера даже при полном перекрытии окна игрой.
+
+---
+
 ## [0.3.1] — 2026-11-15
 
 ### English

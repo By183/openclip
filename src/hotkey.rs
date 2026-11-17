@@ -10,7 +10,7 @@
 
 use std::fmt;
 pub mod egui_map;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -508,57 +508,26 @@ impl HotkeyAtomicState {
 }
 
 #[cfg(windows)]
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+#[cfg(windows)]
+pub fn set_main_hwnd(hwnd: isize) {
+    MAIN_HWND.store(hwnd, Ordering::Release);
+}
+
+#[cfg(not(windows))]
+pub fn set_main_hwnd(_hwnd: isize) {}
+
+#[cfg(windows)]
 pub fn wake_main_window() {
-    use windows::core::BOOL;
-    use windows::Win32::Foundation::{HWND, LPARAM};
-    use windows::Win32::Graphics::Gdi::{
-        RedrawWindow, RDW_ALLCHILDREN, RDW_INTERNALPAINT, RDW_INVALIDATE, RDW_UPDATENOW,
-    };
-    use windows::Win32::System::Threading::GetCurrentProcessId;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, PostMessageW, WM_NULL,
-    };
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_PAINT};
 
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let (pid, window_pid) = unsafe {
-            let pid = GetCurrentProcessId();
-            let mut window_pid = 0u32;
-            GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
-            (pid, window_pid)
-        };
-        if window_pid == pid {
-            let mut title = [0u16; 256];
-            let len = unsafe { GetWindowTextW(hwnd, &mut title) };
-            let text = String::from_utf16_lossy(&title[..len as usize]);
-            if text == "openclip" {
-                unsafe {
-                    let ptr = lparam.0 as *mut Option<HWND>;
-                    *ptr = Some(hwnd);
-                }
-                return BOOL(0);
-            }
-        }
-        BOOL(1)
-    }
-
-    let mut found: Option<HWND> = None;
-    unsafe {
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut found as *mut _ as isize));
-    }
-    if let Some(hwnd) = found {
+    let raw = MAIN_HWND.load(Ordering::Acquire);
+    if raw != 0 {
+        let hwnd = HWND(raw as *mut std::ffi::c_void);
         unsafe {
-            let _ = RedrawWindow(
-                Some(hwnd),
-                None,
-                None,
-                RDW_INVALIDATE | RDW_INTERNALPAINT | RDW_ALLCHILDREN | RDW_UPDATENOW,
-            );
-            let _ = PostMessageW(
-                Some(hwnd),
-                WM_NULL,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
+            let _ = PostMessageW(Some(hwnd), WM_PAINT, WPARAM(0), LPARAM(0));
         }
     }
 }
